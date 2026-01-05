@@ -1,0 +1,102 @@
+name: SBOM
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: sbom-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  attestations: write # Required for attestation upload
+  contents: write # Required for release asset upload
+  id-token: write # Required for Sigstore signing
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify build artifacts
+        run: |
+          ls -la dist/
+          test -f dist/hpke_http-*.whl
+          test -f dist/hpke_http-*.tar.gz
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0.21.0
+        with:
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Validate SBOM
+        run: |
+          jq empty sbom.spdx.json
+          echo "SBOM contains $(jq '.packages | length' sbom.spdx.json) packages"
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v3.0.0
+        with:
+          subject-path: dist/*
+          sbom-path: sbom.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3.1.0
+        with:
+          subject-path: dist/*
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 30
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: dist
+          path: dist/
+          retention-days: 30
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          files: |
+            sbom.spdx.json
+            dist/*
+
+      - name: Generate job summary
+        if: always()
+        run: |
+          echo "## SBOM Generation Summary" >> $GITHUB_STEP_SUMMARY
+          if [ -f sbom.spdx.json ]; then
+            echo "- **Format:** SPDX JSON" >> $GITHUB_STEP_SUMMARY
+            echo "- **Packages:** $(jq '.packages | length' sbom.spdx.json)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Build artifacts:** $(ls -1 dist/ 2>/dev/null | wc -l | tr -d ' ')" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status:** SBOM generation failed" >> $GITHUB_STEP_SUMMARY
+          fi
