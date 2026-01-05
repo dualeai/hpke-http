@@ -3,8 +3,8 @@ name = "hpke_http"
 version = "0.1.0"
 description = "End-to-end encryption for HTTP APIs"
 readme = "README.md"
-license = { text = "Apache-2.0" }
-requires-python = ">=3.14" # Python 3.14t free-threaded (no-GIL)
+license = "Apache-2.0"
+requires-python = ">=3.10"
 dependencies = [
     # Shared libs are explicitly not included in the deps, they are installed separatly, see "make install-libs"
     "cryptography~=46.0",
@@ -45,14 +45,6 @@ Documentation = "https://github.com/dualeai/hpke-http#readme"
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
-
-# Redirect build artifacts to /tmp for Docker bind mount compatibility (source is read-only)
-# Use unique path per lib to prevent cross-contamination during sequential builds
-[tool.distutils.egg_info]
-egg_base = "/tmp/hpke_http"
-
-[tool.distutils.build]
-build_base = "/tmp/hpke_http"
 
 [tool.setuptools.packages.find]
 where = ["src"]

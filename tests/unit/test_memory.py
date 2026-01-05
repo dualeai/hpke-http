@@ -12,12 +12,15 @@ import gc
 import secrets
 import tracemalloc
 from collections.abc import Callable
+from typing import TypeVar
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
+
+T = TypeVar("T")
 
 # Memory bounds (conservative to account for OpenSSL internals)
 MAX_CONTEXT_MEMORY = 100 * 1024  # 100KB per context (includes OpenSSL state)
@@ -35,7 +38,7 @@ def generate_keypair() -> tuple[bytes, bytes]:
     return sk.private_bytes_raw(), sk.public_key().public_bytes_raw()
 
 
-def measure_allocation[T](func: Callable[[], T]) -> tuple[int, T]:
+def measure_allocation(func: Callable[[], T]) -> tuple[int, T]:
     """Measure memory allocated by a function call."""
     gc.collect()
     tracemalloc.start()
@@ -193,7 +196,10 @@ class TestMemoryPressure:
         assert len(ciphertext) == payload_size + 16
 
     def test_many_small_operations_stable(self) -> None:
-        """Memory stays stable across many small operations."""
+        """Memory stays stable across many small operations.
+
+        Uses net allocation after GC to avoid Python version variance in peak measurements.
+        """
         sk_r, pk_r = generate_keypair()
         psk = make_psk()
         plaintext = secrets.token_bytes(64)
@@ -201,25 +207,30 @@ class TestMemoryPressure:
         sender_ctx = setup_sender_psk(pk_r, b"info", psk, b"tenant")
         recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"info", psk, b"tenant")
 
-        # Run 1000 operations
+        # Warmup phase - let allocator/GC stabilize
+        for i in range(100):
+            ct = sender_ctx.seal(f"warmup-{i}".encode(), plaintext)
+            pt = recipient_ctx.open(f"warmup-{i}".encode(), ct)
+            assert pt == plaintext
+        gc.collect()
+
+        # Measure net allocation over many operations
         tracemalloc.start()
-        peak_early = 0
-        peak_late = 0
+        snapshot1 = tracemalloc.take_snapshot()
 
         for i in range(1000):
             ct = sender_ctx.seal(f"aad-{i}".encode(), plaintext)
             pt = recipient_ctx.open(f"aad-{i}".encode(), ct)
             assert pt == plaintext
 
-            # Sample memory periodically
-            if i == 100:
-                _, peak_early = tracemalloc.get_traced_memory()
-            if i == 900:
-                _, peak_late = tracemalloc.get_traced_memory()
-
+        gc.collect()  # Force GC before final measurement
+        snapshot2 = tracemalloc.take_snapshot()
         tracemalloc.stop()
 
-        # Peak memory shouldn't grow significantly between early and late samples
-        # Allow 50% growth for GC timing variations
-        growth = (peak_late - peak_early) / peak_early if peak_early > 0 else 0.0
-        assert growth < 0.5, f"Memory grew {growth * 100:.0f}% between op 100 and 900, possible leak"
+        # Check net allocation (not peak) - should be minimal after GC
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        net_allocated = sum(stat.size_diff for stat in diff)
+
+        # Net allocation after 1000 roundtrips should be < 100KB
+        # (sequence counters increment but don't allocate much)
+        assert net_allocated < 100 * 1024, f"Net allocation {net_allocated} bytes after 1000 ops, possible leak"

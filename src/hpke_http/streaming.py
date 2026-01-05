@@ -15,6 +15,8 @@ Plaintext structure (encrypted):
 Reference: RFC-065 §6
 """
 
+from __future__ import annotations
+
 import json
 import secrets
 from dataclasses import dataclass, field

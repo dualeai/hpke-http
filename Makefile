@@ -1,8 +1,9 @@
 # Misc
 name ?= hpke_http
+python_version ?= 3.10  # Lowest compatible version (see pyproject.toml requires-python)
 
 install:
-	uv venv --python 3.14 --allow-existing
+	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
 
 install-deps:

@@ -164,4 +164,10 @@ async def granian_server(
         yield (host, port, pk)
     finally:
         proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            # Force kill if terminate doesn't work
+            proc.kill()
+            proc.wait()  # No timeout after SIGKILL
+        proc = None

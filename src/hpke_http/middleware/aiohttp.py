@@ -21,10 +21,11 @@ import time
 import types
 from collections.abc import AsyncIterator
 from http import HTTPStatus
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from typing_extensions import Self
 
 from hpke_http.constants import (
     DISCOVERY_CACHE_MAX_AGE,
