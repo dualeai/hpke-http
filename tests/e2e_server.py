@@ -1,0 +1,106 @@
+"""E2E test server for granian.
+
+This module is loaded by granian via `tests.e2e_server:app`.
+Reads configuration from environment variables set by the test fixtures.
+"""
+
+import json
+import os
+from collections.abc import AsyncGenerator
+from typing import Any
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
+
+from hpke_http.constants import KemId
+from hpke_http.middleware.fastapi import EncryptedSSEResponse, HPKEMiddleware
+
+
+async def health(_request: Request) -> JSONResponse:
+    """Health check endpoint (plaintext, no encryption)."""
+    return JSONResponse({"status": "ok"})
+
+
+async def echo(request: Request) -> JSONResponse:
+    """Echo endpoint - returns the decrypted body."""
+    body = await request.body()
+    return JSONResponse(
+        {
+            "path": request.url.path,
+            "method": request.method,
+            "echo": body.decode("utf-8", errors="replace"),
+        }
+    )
+
+
+async def stream(request: Request) -> EncryptedSSEResponse | StreamingResponse:
+    """SSE streaming endpoint with encrypted events."""
+    # Read and discard body (required by HPKE middleware)
+    await request.body()
+
+    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
+        """Generate SSE events: 3 progress + 1 complete."""
+        for i in range(1, 4):
+            yield ("progress", {"step": i, "total": 3})
+        yield ("complete", {"result": "success"})
+
+    # Get HPKE context from scope (set by middleware)
+    ctx = request.scope.get("hpke_context")
+    if ctx:
+        return EncryptedSSEResponse(ctx, event_generator())
+
+    # Fallback: plaintext SSE (shouldn't happen in E2E tests)
+    async def plaintext_sse() -> AsyncGenerator[bytes]:
+        async for event_type, data in event_generator():
+            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+    return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
+
+
+def _create_app() -> HPKEMiddleware:
+    """Create ASGI app wrapped with HPKEMiddleware.
+
+    Reads configuration from environment variables:
+    - TEST_HPKE_PRIVATE_KEY: Hex-encoded X25519 private key
+    - TEST_PSK: Hex-encoded pre-shared key
+    - TEST_PSK_ID: Hex-encoded PSK ID
+    """
+    # Read config from environment
+    private_key_hex = os.environ.get("TEST_HPKE_PRIVATE_KEY", "")
+    psk_hex = os.environ.get("TEST_PSK", "")
+    psk_id_hex = os.environ.get("TEST_PSK_ID", "")
+
+    if not private_key_hex:
+        raise ValueError("TEST_HPKE_PRIVATE_KEY environment variable required")
+
+    private_key = bytes.fromhex(private_key_hex)
+    psk = bytes.fromhex(psk_hex) if psk_hex else b""
+    psk_id = bytes.fromhex(psk_id_hex) if psk_id_hex else b""
+
+    # Create base Starlette app
+    routes = [
+        Route("/health", health, methods=["GET"]),
+        Route("/echo", echo, methods=["POST"]),
+        Route("/stream", stream, methods=["POST"]),
+    ]
+    starlette_app = Starlette(routes=routes)
+
+    # PSK resolver callback
+    async def psk_resolver(_scope: dict[str, Any]) -> tuple[bytes, bytes]:
+        """Return PSK and PSK ID for request."""
+        return (psk, psk_id)
+
+    # Wrap with HPKE middleware
+    return HPKEMiddleware(
+        app=starlette_app,
+        private_keys={KemId.DHKEM_X25519_HKDF_SHA256: private_key},
+        psk_resolver=psk_resolver,
+    )
+
+
+# Module-level app instance for granian
+# Only create app if env vars are set (granian will set them, pytest won't)
+_private_key_hex = os.environ.get("TEST_HPKE_PRIVATE_KEY", "")
+app = _create_app() if _private_key_hex else None
