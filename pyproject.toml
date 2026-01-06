@@ -16,7 +16,7 @@ dev = [
     "hypothesis~=6.148",         # Property-based fuzz testing
     "pyright~=1.1",
     "pytest-asyncio~=0.24",
-    "pytest-cov~=6.0",
+    "pytest-cov~=7.0",
     "pytest-mock~=3.14",
     "pytest-xdist[psutil]~=3.8",
     "pytest~=8.3",
@@ -71,6 +71,12 @@ markers = [
     "vectors: RFC 9180 test vector validation (slow, 74MB JSON)",
     "fuzz: Property-based fuzz tests using Hypothesis",
 ]
+
+# Subprocess coverage for granian E2E tests (pytest-cov 7.x)
+[tool.coverage.run]
+patch = ["subprocess", "fork", "_exit"]
+parallel = true
+sigterm = true
 
 # NOTE: Rules for static testing are standard across all the monorepo, those rules are strict and must be followed, in any exception case please discuss with the team, in the meantime, if it fails, fix the issue, NEVER turn off the linter.
 
