@@ -227,8 +227,7 @@ class HPKEMiddleware:
             more_body = message.get("more_body", False)
             encryptor = state.encryptor
             if encryptor is None:  # Should never happen when is_sse=True
-                await send(message)
-                return
+                raise CryptoError("SSE encryption state corrupted: encryptor is None")
 
             # Add to buffer (decode UTF-8, replace invalid chars)
             if body:
