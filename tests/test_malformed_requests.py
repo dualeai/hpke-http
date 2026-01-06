@@ -1,0 +1,146 @@
+"""E2E tests for malformed request handling with real granian server.
+
+Tests that the server properly rejects invalid/malformed requests.
+Uses raw aiohttp (not HPKEClientSession) to send intentionally broken requests.
+"""
+
+import aiohttp
+import pytest
+
+from hpke_http.constants import HEADER_HPKE_ENC, HEADER_HPKE_ENCODING
+from hpke_http.envelope import encode_envelope
+from hpke_http.headers import b64url_encode
+from hpke_http.hpke import setup_sender_psk
+
+
+class TestMalformedRequests:
+    """Test server handling of malformed HPKE requests.
+
+    Uses real granian server with raw aiohttp to send intentionally invalid requests.
+    HPKEClientSession would prevent these malformed requests, so we bypass it.
+    """
+
+    @pytest.mark.parametrize(
+        ("enc_header", "body", "expected_status", "description"),
+        [
+            ("not-valid-base64!!!", b"some body", 400, "invalid base64 in enc header"),
+            ("dGVzdA==", b"short", 400, "truncated envelope body"),
+        ],
+    )
+    async def test_malformed_hpke_request(
+        self,
+        granian_server: tuple[str, int, bytes],
+        enc_header: str,
+        body: bytes,
+        expected_status: int,
+        description: str,
+    ) -> None:
+        """Malformed HPKE request handling: {description}."""
+        host, port, _ = granian_server
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{host}:{port}/echo",
+                headers={
+                    "X-HPKE-Enc": enc_header,
+                    "Content-Type": "application/octet-stream",
+                },
+                data=body,
+            ) as resp:
+                assert resp.status == expected_status, f"Failed for {description}"
+
+    async def test_plaintext_request_passes_through(
+        self,
+        granian_server: tuple[str, int, bytes],
+    ) -> None:
+        """Plaintext request without X-HPKE-Enc header passes through."""
+        host, port, _ = granian_server
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{host}:{port}/echo",
+                json={"test": "plaintext"},
+            ) as resp:
+                assert resp.status == 200
+
+    async def test_health_endpoint_always_plaintext(
+        self,
+        granian_server: tuple[str, int, bytes],
+    ) -> None:
+        """Health endpoint works without encryption."""
+        host, port, _ = granian_server
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://{host}:{port}/health") as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "ok"
+
+
+def _encrypt_request(
+    body: bytes,
+    pk_r: bytes,
+    psk: bytes,
+    psk_id: bytes,
+) -> tuple[bytes, str]:
+    """Encrypt request body for testing.
+
+    Returns:
+        Tuple of (encrypted_envelope, enc_header_value)
+    """
+    ctx = setup_sender_psk(
+        pk_r=pk_r,
+        info=psk_id,
+        psk=psk,
+        psk_id=psk_id,
+    )
+    ciphertext = ctx.seal(aad=b"", plaintext=body)
+    envelope = encode_envelope(ciphertext)
+    enc_header = b64url_encode(ctx.enc)
+    return (envelope, enc_header)
+
+
+class TestMalformedCompressionHeaders:
+    """Test server handling of invalid compression headers.
+
+    Tests X-HPKE-Encoding header edge cases with properly encrypted requests.
+    Only 'zstd' (lowercase) triggers decompression; other values are ignored.
+    """
+
+    @pytest.mark.parametrize(
+        ("encoding_value", "expected_status", "description"),
+        [
+            ("gzip", 200, "invalid encoding ignored"),
+            ("zstd", 400, "zstd with uncompressed body fails"),
+            ("", 200, "empty header treated as identity"),
+            ("ZSTD", 200, "uppercase ignored (case-sensitive)"),
+            ("deflate", 200, "deflate ignored"),
+            ("br", 200, "brotli ignored"),
+        ],
+    )
+    async def test_encoding_header_handling(
+        self,
+        granian_server: tuple[str, int, bytes],
+        test_psk: bytes,
+        test_psk_id: bytes,
+        encoding_value: str,
+        expected_status: int,
+        description: str,
+    ) -> None:
+        """X-HPKE-Encoding header handling: {description}."""
+        host, port, pk = granian_server
+        body = b'{"test": "compression header test"}'
+
+        encrypted_body, enc_header = _encrypt_request(body, pk, test_psk, test_psk_id)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{host}:{port}/echo",
+                headers={
+                    HEADER_HPKE_ENC: enc_header,
+                    HEADER_HPKE_ENCODING: encoding_value,
+                    "Content-Type": "application/octet-stream",
+                },
+                data=encrypted_body,
+            ) as resp:
+                assert resp.status == expected_status, f"Failed for {description}"

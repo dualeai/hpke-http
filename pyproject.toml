@@ -1,0 +1,139 @@
+[project]
+name = "hpke_http"
+version = "0.1.0"
+description = "End-to-end encryption for HTTP APIs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    # Shared libs are explicitly not included in the deps, they are installed separatly, see "make install-libs"
+    "cryptography~=46.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "granian~=2.0",              # Rust ASGI server for E2E tests
+    "hypothesis~=6.148",         # Property-based fuzz testing
+    "pyright~=1.1",
+    "pytest-asyncio~=0.24",
+    "pytest-cov~=7.0",
+    "pytest-mock~=3.14",
+    "pytest-xdist[psutil]~=3.8",
+    "pytest~=8.3",
+    "ruff~=0.7",
+    "typing_extensions~=4.12",   # assert_type for API contract tests (Python 3.10)
+    "vulture~=2.14",
+]
+# For downstream services using testing fixtures
+testing = [
+    "pytest-asyncio~=0.24",
+    "pytest~=8.3",
+]
+# FastAPI middleware (optional for server-side)
+fastapi = [
+    "starlette~=0.50",  # Upgraded from ~=0.41 for security fixes
+]
+# aiohttp client (optional for client-side)
+aiohttp = [
+    "aiohttp~=3.13",  # Upgraded from ~=3.11 for security fixes
+]
+# Zstd compression (optional, RFC 8878)
+zstd = [
+    "backports.zstd>=1.0; python_version<'3.14'",
+]
+
+[project.urls]
+Homepage = "https://github.com/dualeai/hpke-http"
+Documentation = "https://github.com/dualeai/hpke-http#readme"
+
+[build-system]
+requires = ["setuptools>=78.1.1"]  # Pinned for CVE-2025-47273
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hpke_http*"]
+
+[tool.setuptools.package-data]
+hpke_http = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "--cov=hpke_http",            # Package name
+    "--cov-report=term-missing", # Show missing lines in terminal
+    "--cov-report=html",         # Generate HTML report
+    "--cov-fail-under=80",       # Require 80% minimum coverage
+    "--tb=short",                # Short traceback format
+    "-v",                        # Verbose output, easier LLM debugging
+    "--strict-markers",          # Ensure all markers are registered
+    "-n",                        # Run tests in parallel
+    "auto",                      # Use all available CPUs
+]
+markers = [
+    "vectors: RFC 9180 test vector validation (slow, 74MB JSON)",
+    "fuzz: Property-based fuzz tests using Hypothesis",
+]
+
+# Subprocess coverage for granian E2E tests (pytest-cov 7.x)
+[tool.coverage.run]
+patch = ["subprocess", "fork", "_exit"]
+parallel = true
+sigterm = true
+
+# NOTE: Rules for static testing are standard across all the monorepo, those rules are strict and must be followed, in any exception case please discuss with the team, in the meantime, if it fails, fix the issue, NEVER turn off the linter.
+
+[tool.pyright]
+typeCheckingMode = "strict"
+venv = ".venv"
+venvPath = "."
+exclude = [".venv", "vulture_whitelist.py"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "A",     # flake8-builtins
+    "ARG",   # flake8-unused-arguments
+    "ASYNC", # flake8-async
+    "B",     # flake8-bugbear
+    "BLE",   # flake8-blind-except
+    "DTZ",   # flake8-datetimez
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "FAST",  # FastAPI
+    "FBT",   # flake8-boolean-trap
+    "I",     # isort
+    "N",     # pep8-naming
+    "PERF",  # Perflint
+    "PIE",   # flake8-pie
+    "PL",    # Pylint
+    "PYI",   # flake8-pyi
+    "Q",     # flake8-quotes
+    "RET",   # flake8-return
+    "RUF",   # Ruff-specific
+    "S",     # flake8-bandit (security)
+    "SIM",   # flake8-simplify
+    "SLF",   # flake8-self
+    "T20",   # flake8-print
+    "TID",   # flake8-tidy-imports
+    "UP",    # pyupgrade
+    "W",     # pycodestyle warnings
+]
+ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use secrets)
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["PLR2004", "S101", "S603", "ASYNC109", "ASYNC220", "SIM117", "F841", "RUF059", "PLC0415"]  # Tests: magic values, assert, subprocess, async patterns, nested with, unused vars, local imports
+"tests/**/test_rfc9180*.py" = ["SLF001"]  # Vector tests need internal state access
+"tests/**/test_fuzz.py" = ["SLF001"]  # Fuzz tests need internal state access for overflow testing
+"tests/**/test_aiohttp_client.py" = ["SLF001"]  # Unit tests for private parsing methods
+"tests/**/test_streaming_errors.py" = ["SLF001"]  # Error tests need internal cipher access
+"src/**/streaming.py" = ["PLW0603", "PLC0415"]  # Optional zstd: module caching requires global, lazy import for optional deps
+
+[tool.vulture]
+exclude = [".venv/"]  # Exclude deps
+paths = ["src", "tests", "vulture_whitelist.py"]  # Include whitelist
+min_confidence = 80  # Ignore crap detections
+sort_by_size = true  # Most impactful issues first
