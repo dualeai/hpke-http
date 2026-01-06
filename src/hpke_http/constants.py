@@ -160,6 +160,13 @@ HEADER_HPKE_STREAM: Final[str] = "X-HPKE-Stream"
 """Header containing encrypted SSE session parameters."""
 
 # =============================================================================
+# ASGI Scope Keys
+# =============================================================================
+
+SCOPE_HPKE_CONTEXT: Final[str] = "hpke_context"
+"""ASGI scope key for storing HPKE recipient context after request decryption."""
+
+# =============================================================================
 # SSE Streaming Constants
 # =============================================================================
 
@@ -171,6 +178,16 @@ SSE_COUNTER_SIZE: Final[int] = 4
 
 SSE_MAX_COUNTER: Final[int] = 2**32 - 1
 """Maximum counter value (4 billion events per session)."""
+
+SSE_MAX_EVENT_SIZE: Final[int] = 64 * 1024 * 1024
+"""Default maximum buffered SSE event size (64MB).
+
+This is a DoS protection limit for incomplete events without proper \\n\\n boundaries.
+Can be overridden via HPKEMiddleware's max_sse_event_size parameter.
+
+Note: SSE is text-only (UTF-8). Binary data (images, documents) must be
+base64-encoded, which adds ~33% overhead. A 48MB file becomes ~64MB in base64.
+"""
 
 # Export label for deriving SSE session key from HPKE context
 SSE_SESSION_KEY_LABEL: Final[bytes] = b"sse-session-key"

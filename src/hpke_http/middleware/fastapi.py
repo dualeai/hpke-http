@@ -3,11 +3,12 @@ FastAPI/Starlette ASGI middleware for transparent HPKE encryption.
 
 Provides:
 - Automatic request body decryption
+- Automatic SSE response encryption (transparent - no code changes needed)
 - Built-in key discovery endpoint (/.well-known/hpke-keys)
-- SSE response encryption wrapper (transparent pass-through)
 
 Usage:
     from hpke_http.middleware.fastapi import HPKEMiddleware
+    from starlette.responses import StreamingResponse
 
     app = FastAPI()
     app.add_middleware(
@@ -16,10 +17,22 @@ Usage:
         psk_resolver=get_api_key_from_request,
     )
 
+    @app.post("/chat")
+    async def chat(request: Request):
+        data = await request.json()  # Decrypted by middleware
+
+        async def generate():
+            yield b"event: progress\\ndata: {}\\n\\n"
+            yield b"event: done\\ndata: {}\\n\\n"
+
+        # Just use StreamingResponse - encryption is automatic!
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
 Reference: RFC-065 §4.3, §5.3
 """
 
 import json
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -32,6 +45,8 @@ from hpke_http.constants import (
     HEADER_HPKE_ENC,
     HEADER_HPKE_STREAM,
     KDF_ID,
+    SCOPE_HPKE_CONTEXT,
+    SSE_MAX_EVENT_SIZE,
     KemId,
 )
 from hpke_http.envelope import decode_envelope
@@ -41,7 +56,6 @@ from hpke_http.hpke import setup_recipient_psk
 from hpke_http.streaming import SSEEncryptor, create_session_from_context
 
 __all__ = [
-    "EncryptedSSEResponse",
     "HPKEMiddleware",
 ]
 
@@ -60,14 +74,15 @@ Returns:
 
 class HPKEMiddleware:
     """
-    Pure ASGI middleware for HPKE request decryption.
+    Pure ASGI middleware for transparent HPKE encryption.
 
     Features:
     - Decrypts request bodies encrypted with HPKE PSK mode
+    - Auto-encrypts SSE responses when request was encrypted
     - Auto-registers /.well-known/hpke-keys discovery endpoint
-    - Stores recipient context in scope for SSE response encryption
 
-    Note: SSE response encryption requires using EncryptedSSEResponse.
+    SSE encryption is fully transparent - just use normal StreamingResponse
+    with media_type="text/event-stream" and encryption happens automatically.
     """
 
     def __init__(
@@ -76,6 +91,7 @@ class HPKEMiddleware:
         private_keys: dict[KemId, bytes],
         psk_resolver: PSKResolver,
         discovery_path: str = DISCOVERY_PATH,
+        max_sse_event_size: int = SSE_MAX_EVENT_SIZE,
     ) -> None:
         """
         Initialize HPKE middleware.
@@ -85,11 +101,15 @@ class HPKEMiddleware:
             private_keys: Private keys by KEM ID (e.g., {KemId.DHKEM_X25519_HKDF_SHA256: sk})
             psk_resolver: Async callback to get (psk, psk_id) from request scope
             discovery_path: Path for key discovery endpoint
+            max_sse_event_size: Maximum SSE event buffer size in bytes (default 64MB).
+                This is a DoS protection for malformed events without proper \\n\\n boundaries.
+                SSE is text-only; binary data must be base64-encoded (+33% overhead).
         """
         self.app = app
         self.private_keys = private_keys
         self.psk_resolver = psk_resolver
         self.discovery_path = discovery_path
+        self.max_sse_event_size = max_sse_event_size
 
         # Derive public keys for discovery endpoint
         self._public_keys: dict[KemId, bytes] = {}
@@ -124,13 +144,152 @@ class HPKEMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Decrypt request
+        # Decrypt request AND wrap send for response encryption
         try:
             decrypted_receive = await self._create_decrypted_receive(scope, receive, enc_header)
-            await self.app(scope, decrypted_receive, send)
+            encrypting_send = self._create_encrypting_send(scope, send)
+            await self.app(scope, decrypted_receive, encrypting_send)
         except CryptoError:
             # Don't expose internal error details to clients
             await self._send_error(send, 400, "Request decryption failed")
+
+    def _create_encrypting_send(  # noqa: PLR0915
+        self,
+        scope: dict[str, Any],
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> Callable[[dict[str, Any]], Awaitable[None]]:
+        """Create send wrapper that auto-encrypts SSE responses."""
+        # Per-request state (closure)
+        state: dict[str, Any] = {
+            "is_sse": False,
+            "encryptor": None,
+            "buffer": "",
+        }
+
+        # WHATWG-compliant event boundary: two consecutive line endings
+        # Handles \n\n, \r\r, \r\n\r\n, and mixed combinations
+        event_boundary = re.compile(r"(?:\r\n|\r(?!\n)|\n)(?:\r\n|\r(?!\n)|\n)")
+
+        async def encrypting_send(message: dict[str, Any]) -> None:
+            msg_type = message["type"]
+
+            if msg_type == "http.response.start":
+                await _handle_response_start(message)
+            elif msg_type == "http.response.body":
+                await _handle_response_body(message)
+            else:
+                await send(message)
+
+        async def _handle_response_start(message: dict[str, Any]) -> None:
+            """Handle response start - detect SSE and set up encryption."""
+            headers = message.get("headers", [])
+            content_type = next(
+                (v for n, v in headers if n.lower() == b"content-type"),
+                None,
+            )
+
+            # Enable encryption if SSE + HPKE context exists
+            ctx = scope.get(SCOPE_HPKE_CONTEXT)
+            if ctx and content_type and b"text/event-stream" in content_type:
+                state["is_sse"] = True
+                session = create_session_from_context(ctx)
+                state["encryptor"] = SSEEncryptor(session)
+
+                # Add X-HPKE-Stream header
+                session_params = session.serialize()
+                new_headers = [
+                    *headers,
+                    (HEADER_HPKE_STREAM.encode(), b64url_encode(session_params).encode()),
+                ]
+                message = {**message, "headers": new_headers}
+
+            await send(message)
+
+        async def _handle_response_body(message: dict[str, Any]) -> None:
+            """Handle response body - buffer and encrypt SSE events."""
+            if not state["is_sse"]:
+                await send(message)
+                return
+
+            body = message.get("body", b"")
+            more_body = message.get("more_body", False)
+            encryptor: SSEEncryptor = state["encryptor"]
+
+            # Add to buffer (decode UTF-8, replace invalid chars)
+            if body:
+                decoded = body.decode("utf-8", errors="replace")
+                # Enforce buffer size limit to prevent DoS
+                if len(state["buffer"]) + len(decoded) > self.max_sse_event_size:
+                    # Force flush oversized buffer as partial event
+                    if state["buffer"]:
+                        encrypted = encryptor.encrypt(state["buffer"])
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": encrypted.encode(),
+                                "more_body": True,
+                            }
+                        )
+                    state["buffer"] = decoded[-self.max_sse_event_size :]  # Keep tail
+                else:
+                    state["buffer"] += decoded
+
+            # Extract and encrypt complete events
+            sent_any = await _extract_and_send_events(encryptor, more_body=more_body)
+
+            # Handle end of stream
+            if not more_body:
+                await _handle_end_of_stream(encryptor, sent_any=sent_any)
+
+        async def _extract_and_send_events(encryptor: SSEEncryptor, *, more_body: bool) -> bool:
+            """Extract complete events from buffer and send encrypted."""
+            sent_any = False
+            while True:
+                match = event_boundary.search(state["buffer"])
+                if not match:
+                    break
+
+                # Extract complete event (including boundary)
+                event_end = match.end()
+                chunk = state["buffer"][:event_end]
+                state["buffer"] = state["buffer"][event_end:]
+
+                # Send with more_body=False only if final message AND buffer empty
+                is_final = not more_body and not state["buffer"]
+                encrypted = encryptor.encrypt(chunk)
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": encrypted.encode(),
+                        "more_body": not is_final,
+                    }
+                )
+                sent_any = True
+            return sent_any
+
+        async def _handle_end_of_stream(encryptor: SSEEncryptor, *, sent_any: bool) -> None:
+            """Handle end of stream - flush buffer or send empty body."""
+            if state["buffer"]:
+                # Flush remaining buffer (partial event)
+                encrypted = encryptor.encrypt(state["buffer"])
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": encrypted.encode(),
+                        "more_body": False,
+                    }
+                )
+            elif not sent_any:
+                # Only send final empty body if we didn't send anything this round
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b"",
+                        "more_body": False,
+                    }
+                )
+
+        return encrypting_send
 
     async def _handle_discovery(
         self,
@@ -177,6 +336,7 @@ class HPKEMiddleware:
             {
                 "type": "http.response.body",
                 "body": body,
+                "more_body": False,
             }
         )
 
@@ -216,7 +376,10 @@ class HPKEMiddleware:
             raise DecryptionError(f"Invalid envelope: {e}") from e
 
         # Get PSK from resolver
-        psk, psk_id = await self.psk_resolver(scope)
+        try:
+            psk, psk_id = await self.psk_resolver(scope)
+        except Exception as e:
+            raise DecryptionError(f"PSK resolution failed: {e}") from e
 
         # Get private key for the KEM
         kem_id = KemId(header.kem_id)
@@ -236,15 +399,19 @@ class HPKEMiddleware:
         plaintext = ctx.open(aad=b"", ciphertext=ciphertext)
 
         # Store context in scope for SSE response encryption
-        scope["hpke_context"] = ctx
+        scope[SCOPE_HPKE_CONTEXT] = ctx
 
         # Create receive wrapper that returns decrypted body
+        # After body is sent, we need to wait for actual disconnect from client
+        # NOT return http.disconnect immediately (which aborts streaming responses)
         body_sent = False
 
         async def decrypted_receive() -> dict[str, Any]:
             nonlocal body_sent
             if body_sent:
-                return {"type": "http.disconnect"}
+                # After body is delivered, wait for actual client disconnect
+                # This is called by StreamingResponse to check for client abort
+                return await receive()
             body_sent = True
             return {
                 "type": "http.request",
@@ -276,90 +443,6 @@ class HPKEMiddleware:
             {
                 "type": "http.response.body",
                 "body": body,
-            }
-        )
-
-
-class EncryptedSSEResponse:
-    """
-    Wrapper for creating encrypted SSE responses.
-
-    Transparent encryption: the generator yields raw SSE chunks (events, comments,
-    retry directives, anything) and they are encrypted as-is. The client receives
-    the exact same strings after decryption.
-
-    Usage in handler:
-        @app.post("/tasks")
-        async def create_task(request: Request):
-            ctx = request.scope.get("hpke_context")
-            if ctx:
-                return EncryptedSSEResponse(ctx, sse_generator())
-            return StreamingResponse(sse_generator(), media_type="text/event-stream")
-
-        async def sse_generator():
-            yield ":keepalive\\n\\n"
-            yield "event: progress\\ndata: {}\\n\\n"
-            yield "event: done\\ndata: {}\\n\\n"
-    """
-
-    def __init__(
-        self,
-        ctx: Any,  # RecipientContext
-        chunk_generator: Any,  # AsyncGenerator yielding raw SSE chunk strings
-    ) -> None:
-        """
-        Initialize encrypted SSE response.
-
-        Args:
-            ctx: HPKE RecipientContext from request decryption
-            chunk_generator: Async generator yielding raw SSE chunk strings
-        """
-        self.ctx = ctx
-        self.chunk_generator = chunk_generator
-
-    async def __call__(
-        self,
-        _scope: dict[str, Any],
-        _receive: Callable[[], Awaitable[dict[str, Any]]],
-        send: Callable[[dict[str, Any]], Awaitable[None]],
-    ) -> None:
-        """ASGI interface for SSE streaming."""
-        # Create streaming session from HPKE context
-        session = create_session_from_context(self.ctx)
-        encryptor = SSEEncryptor(session)
-
-        # Send headers with session parameters
-        session_params = session.serialize()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    (b"content-type", b"text/event-stream"),
-                    (b"cache-control", b"no-cache"),
-                    (b"connection", b"keep-alive"),
-                    (HEADER_HPKE_STREAM.encode(), b64url_encode(session_params).encode()),
-                ],
-            }
-        )
-
-        # Stream encrypted chunks
-        async for chunk in self.chunk_generator:
-            # Encrypt raw SSE chunk as-is
-            encrypted = encryptor.encrypt(chunk)
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": encrypted.encode(),
-                    "more_body": True,
-                }
-            )
-
-        # End stream
-        await send(
-            {
-                "type": "http.response.body",
-                "body": b"",
                 "more_body": False,
             }
         )

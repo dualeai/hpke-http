@@ -20,7 +20,8 @@ uv add git+https://github.com/duale-ai/hpke-http
 
 ```python
 from fastapi import FastAPI, Request
-from hpke_http.middleware.fastapi import HPKEMiddleware, EncryptedSSEResponse
+from fastapi.responses import StreamingResponse
+from hpke_http.middleware.fastapi import HPKEMiddleware
 from hpke_http.constants import KemId
 
 app = FastAPI()
@@ -33,18 +34,19 @@ app.add_middleware(
     HPKEMiddleware,
     private_keys={KemId.DHKEM_X25519_HKDF_SHA256: private_key},
     psk_resolver=resolve_psk,
+    # max_sse_event_size=128 * 1024 * 1024,  # Optional: 128MB for large payloads
 )
 
 @app.post("/chat")
 async def chat(request: Request):
     data = await request.json()  # Decrypted by middleware
-    ctx = request.scope["hpke_context"]
 
-    async def generate_sse():
-        yield "event: progress\ndata: {\"step\": 1}\n\n"
-        yield "event: complete\ndata: {\"result\": \"done\"}\n\n"
+    async def generate():
+        yield b"event: progress\ndata: {\"step\": 1}\n\n"
+        yield b"event: complete\ndata: {\"result\": \"done\"}\n\n"
 
-    return EncryptedSSEResponse(ctx, generate_sse())
+    # Just use StreamingResponse - encryption is automatic!
+    return StreamingResponse(generate(), media_type="text/event-stream")
 ```
 
 ### Client (aiohttp)
@@ -99,6 +101,23 @@ data: <base64url(counter_be32 || ciphertext || tag)>
 Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 ```
 
+## How SSE Auto-Encryption Works
+
+The middleware automatically encrypts SSE responses when **both** conditions are met:
+
+1. **Request was encrypted** - `SCOPE_HPKE_CONTEXT` exists in scope (from decrypted request)
+2. **Response is SSE** - `Content-Type: text/event-stream` header detected
+
+```python
+# Middleware detection logic (simplified)
+from hpke_http.constants import SCOPE_HPKE_CONTEXT
+
+if scope.get(SCOPE_HPKE_CONTEXT) and b"text/event-stream" in content_type:
+    # Auto-encrypt this streaming response
+```
+
+This is why `media_type="text/event-stream"` is required - it's the WHATWG-standard MIME type that signals "this is an SSE stream" to both browsers and the middleware.
+
 ## Pitfalls
 
 ```python
@@ -106,9 +125,9 @@ Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 HPKEClientSession(psk=b"short")                 # ❌ InvalidPSKError
 HPKEClientSession(psk=secrets.token_bytes(32))  # ✅ >= 32 bytes
 
-# Missing SSE encryption
-return StreamingResponse(generate())  # ❌ Client can't decrypt
-return EncryptedSSEResponse(ctx, generate())  # ✅
+# SSE without proper content-type (won't auto-encrypt)
+return StreamingResponse(gen())                                    # ❌ No encryption
+return StreamingResponse(gen(), media_type="text/event-stream")    # ✅ Auto-encrypted
 
 # Out-of-order decryption (multi-message context)
 recipient.open(aad, ct2)  # ❌ Expects seq=0
@@ -121,8 +140,11 @@ recipient.open(aad, ct1)  # ✅ Decrypt in order
 |----------|-------|
 | HPKE messages/context | 2^96-1 |
 | SSE events/session | 2^32-1 |
+| SSE event buffer | 64MB (configurable) |
 | PSK minimum | 32 bytes |
 | Overhead | 24 bytes |
+
+> **Note:** SSE is text-only (UTF-8). Binary data must be base64-encoded (+33% overhead).
 
 ## Security
 
