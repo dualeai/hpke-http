@@ -4,13 +4,14 @@ aiohttp client session with transparent HPKE encryption.
 Provides a drop-in replacement for aiohttp.ClientSession that automatically:
 - Fetches and caches platform public keys from discovery endpoint
 - Encrypts request bodies
-- Decrypts SSE event streams
+- Decrypts SSE event streams (transparent - yields exact server output)
 
 Usage:
     async with HPKEClientSession(base_url="https://api.example.com", psk=api_key) as session:
         async with session.post("/tasks", json=data) as response:
-            async for event_type, event_data in session.iter_sse(response):
-                print(event_type, event_data)
+            async for chunk in session.iter_sse(response):
+                # chunk is exactly what server sent (event, comment, retry, etc.)
+                print(chunk)
 
 Reference: RFC-065 §4.4, §5.2
 """
@@ -54,7 +55,7 @@ class HPKEClientSession:
     Features:
     - Automatic key discovery from /.well-known/hpke-keys
     - Request body encryption with HPKE PSK mode
-    - SSE response stream decryption
+    - SSE response stream decryption (transparent pass-through)
     - Class-level key caching with TTL
     """
 
@@ -310,22 +311,18 @@ class HPKEClientSession:
     async def iter_sse(
         self,
         response: aiohttp.ClientResponse,
-    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    ) -> AsyncIterator[str]:
         """
-        Iterate over encrypted SSE events.
+        Iterate over encrypted SSE stream, yielding decrypted chunks.
 
-        Implements WHATWG EventSource parsing:
-        - All line endings: CR, LF, CRLF
-        - Comment lines (starting with :) are ignored
-        - Field values with optional leading space after colon
-
-        Reference: https://html.spec.whatwg.org/multipage/server-sent-events.html
+        Transparent pass-through: yields the exact SSE chunks the server sent.
+        Events, comments, retry directives - everything is preserved exactly.
 
         Args:
             response: Response from an SSE endpoint
 
         Yields:
-            Tuples of (event_type, event_data)
+            Raw SSE chunks exactly as the server sent them
         """
         sender_ctx = self._response_contexts.get(response)
         if not sender_ctx:
@@ -343,10 +340,9 @@ class HPKEClientSession:
         decryptor = SSEDecryptor(session)
 
         # WHATWG event boundary: blank line (any combination of line endings)
-        # Matches: \r\n\r\n, \n\n, \r\r, \r\n\n, \n\r\n, etc.
         event_boundary = re.compile(r"(?:\r\n|\r|\n)(?:\r\n|\r|\n)")
 
-        # Parse SSE stream
+        # Parse encrypted SSE stream
         buffer = ""
         async for chunk in response.content:
             buffer += chunk.decode("utf-8")
@@ -359,24 +355,20 @@ class HPKEClientSession:
                 event_text = buffer[: match.start()]
                 buffer = buffer[match.end() :]
 
-                # Parse SSE fields per WHATWG spec
-                event_data = None
-                # Split on any line ending
+                # Extract data field from encrypted event
+                data_value = None
                 lines = re.split(r"\r\n|\r|\n", event_text)
                 for line in lines:
-                    # Skip empty lines and comments
                     if not line or line.startswith(":"):
                         continue
-                    # Parse field
                     if ":" in line:
                         key, _, value = line.partition(":")
-                        # Remove single leading space if present (per WHATWG)
                         if value.startswith(" "):
                             value = value[1:]
                         if key == "data":
-                            event_data = value
+                            data_value = value
 
-                if event_data and event_data.strip():
-                    # Decrypt event
-                    event_type, data = decryptor.decrypt_event(event_data.strip())
-                    yield (event_type, data)
+                if data_value and data_value.strip():
+                    # Decrypt to get original SSE chunk
+                    raw_chunk = decryptor.decrypt(data_value.strip())
+                    yield raw_chunk

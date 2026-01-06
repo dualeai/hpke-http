@@ -39,7 +39,12 @@ app.add_middleware(
 async def chat(request: Request):
     data = await request.json()  # Decrypted by middleware
     ctx = request.scope["hpke_context"]
-    return EncryptedSSEResponse(ctx, generate_events())
+
+    async def generate_sse():
+        yield "event: progress\ndata: {\"step\": 1}\n\n"
+        yield "event: complete\ndata: {\"result\": \"done\"}\n\n"
+
+    return EncryptedSSEResponse(ctx, generate_sse())
 ```
 
 ### Client (aiohttp)
@@ -53,8 +58,8 @@ async with HPKEClientSession(
     psk_id=tenant_id,
 ) as session:
     resp = await session.post("/chat", json={"prompt": "Hello"})
-    async for event_type, data in session.iter_sse(resp):
-        print(f"{event_type}: {data}")
+    async for chunk in session.iter_sse(resp):
+        print(chunk)  # Raw SSE: "event: progress\ndata: {...}\n\n"
 ```
 
 ## Documentation
@@ -91,7 +96,7 @@ Overhead: 24 bytes (8B header + 16B tag)
 ```text
 event: enc
 data: <base64url(counter_be32 || ciphertext || tag)>
-Decrypted: {"t": "event_type", "d": {...}}
+Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 ```
 
 ## Pitfalls
@@ -132,7 +137,7 @@ uv add "hpke-http[aiohttp] @ git+https://github.com/duale-ai/hpke-http"  # Clien
 
 # Local development
 make install      # Setup venv
-make test         # Run tests (906 tests, 92% coverage)
+make test         # Run tests (1215 tests, 94% coverage)
 make test-fuzz    # Property-based fuzz tests
 make lint         # Format and lint
 ```

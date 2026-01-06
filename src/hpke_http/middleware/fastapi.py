@@ -4,7 +4,7 @@ FastAPI/Starlette ASGI middleware for transparent HPKE encryption.
 Provides:
 - Automatic request body decryption
 - Built-in key discovery endpoint (/.well-known/hpke-keys)
-- SSE response encryption wrapper
+- SSE response encryption wrapper (transparent pass-through)
 
 Usage:
     from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -284,29 +284,38 @@ class EncryptedSSEResponse:
     """
     Wrapper for creating encrypted SSE responses.
 
+    Transparent encryption: the generator yields raw SSE chunks (events, comments,
+    retry directives, anything) and they are encrypted as-is. The client receives
+    the exact same strings after decryption.
+
     Usage in handler:
         @app.post("/tasks")
         async def create_task(request: Request):
             ctx = request.scope.get("hpke_context")
             if ctx:
-                return EncryptedSSEResponse(ctx, event_generator())
-            return StreamingResponse(event_generator(), media_type="text/event-stream")
+                return EncryptedSSEResponse(ctx, sse_generator())
+            return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+        async def sse_generator():
+            yield ":keepalive\\n\\n"
+            yield "event: progress\\ndata: {}\\n\\n"
+            yield "event: done\\ndata: {}\\n\\n"
     """
 
     def __init__(
         self,
         ctx: Any,  # RecipientContext
-        event_generator: Any,  # AsyncGenerator yielding (event_type, data) tuples
+        chunk_generator: Any,  # AsyncGenerator yielding raw SSE chunk strings
     ) -> None:
         """
         Initialize encrypted SSE response.
 
         Args:
             ctx: HPKE RecipientContext from request decryption
-            event_generator: Async generator yielding (event_type, data) tuples
+            chunk_generator: Async generator yielding raw SSE chunk strings
         """
         self.ctx = ctx
-        self.event_generator = event_generator
+        self.chunk_generator = chunk_generator
 
     async def __call__(
         self,
@@ -334,15 +343,14 @@ class EncryptedSSEResponse:
             }
         )
 
-        # Stream encrypted events
-        event_id = 0
-        async for event_type, data in self.event_generator:
-            event_id += 1
-            encrypted_event = encryptor.encrypt_event(event_type, data, event_id)
+        # Stream encrypted chunks
+        async for chunk in self.chunk_generator:
+            # Encrypt raw SSE chunk as-is
+            encrypted = encryptor.encrypt(chunk)
             await send(
                 {
                     "type": "http.response.body",
-                    "body": encrypted_event.encode(),
+                    "body": encrypted.encode(),
                     "more_body": True,
                 }
             )

@@ -11,6 +11,8 @@ Uses granian (Rust ASGI server) started as subprocess.
 Fixtures are shared via conftest.py.
 """
 
+import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -18,6 +20,37 @@ import aiohttp
 import pytest
 
 from hpke_http.middleware.aiohttp import HPKEClientSession
+
+
+def parse_sse_chunk(chunk: str) -> tuple[str | None, dict[str, Any] | None]:
+    """Parse a raw SSE chunk into (event_type, data).
+
+    Args:
+        chunk: Raw SSE chunk string (e.g., "event: progress\\ndata: {...}\\n\\n")
+
+    Returns:
+        Tuple of (event_type, parsed_data) or (None, None) for comments
+    """
+    event_type = None
+    data = None
+
+    for line in re.split(r"\r\n|\r|\n", chunk):
+        if not line or line.startswith(":"):
+            continue
+        if ":" in line:
+            key, _, value = line.partition(":")
+            if value.startswith(" "):
+                value = value[1:]
+            if key == "event":
+                event_type = value
+            elif key == "data":
+                try:
+                    data = json.loads(value)
+                except json.JSONDecodeError:
+                    data = {"raw": value}
+
+    return (event_type, data)
+
 
 # === Fixtures ===
 
@@ -160,24 +193,25 @@ class TestSSEEncryption:
 
     async def test_sse_stream_roundtrip(self, hpke_client: HPKEClientSession) -> None:
         """SSE events are encrypted end-to-end."""
-        events: list[tuple[str, dict[str, Any]]] = []
-
         resp = await hpke_client.post("/stream", json={"start": True})
         assert resp.status == 200
-        async for event_type, event_data in hpke_client.iter_sse(resp):
-            events.append((event_type, event_data))
+        events = [parse_sse_chunk(chunk) async for chunk in hpke_client.iter_sse(resp)]
 
         # Should have 4 events: 3 progress + 1 complete
         assert len(events) == 4
 
         # Verify progress events
         for i in range(3):
-            assert events[i][0] == "progress"
-            assert events[i][1]["step"] == i + 1
+            event_type, event_data = events[i]
+            assert event_type == "progress"
+            assert event_data is not None
+            assert event_data["step"] == i + 1
 
         # Verify complete event
-        assert events[3][0] == "complete"
-        assert events[3][1]["result"] == "success"
+        event_type, event_data = events[3]
+        assert event_type == "complete"
+        assert event_data is not None
+        assert event_data["result"] == "success"
 
     async def test_sse_counter_monotonicity(self, hpke_client: HPKEClientSession) -> None:
         """SSE events have monotonically increasing counters."""
@@ -185,7 +219,7 @@ class TestSSEEncryption:
 
         resp = await hpke_client.post("/stream", json={"start": True})
         assert resp.status == 200
-        async for _event_type, _event_data in hpke_client.iter_sse(resp):
+        async for _chunk in hpke_client.iter_sse(resp):
             event_count += 1
 
         # Verify all events were processed (counter worked correctly)
@@ -195,13 +229,11 @@ class TestSSEEncryption:
         """SSE events with delays between them work correctly."""
         import time
 
-        events: list[tuple[str, dict[str, Any]]] = []
         start = time.monotonic()
 
         resp = await hpke_client.post("/stream-delayed", json={"start": True})
         assert resp.status == 200
-        async for event_type, event_data in hpke_client.iter_sse(resp):
-            events.append((event_type, event_data))
+        events = [parse_sse_chunk(chunk) async for chunk in hpke_client.iter_sse(resp)]
 
         elapsed = time.monotonic() - start
 
@@ -210,12 +242,16 @@ class TestSSEEncryption:
 
         # Verify tick events
         for i in range(5):
-            assert events[i][0] == "tick"
-            assert events[i][1]["count"] == i
+            event_type, event_data = events[i]
+            assert event_type == "tick"
+            assert event_data is not None
+            assert event_data["count"] == i
 
         # Verify done event
-        assert events[5][0] == "done"
-        assert events[5][1]["total"] == 5
+        event_type, event_data = events[5]
+        assert event_type == "done"
+        assert event_data is not None
+        assert event_data["total"] == 5
 
         # Should have taken at least 400ms (5 events * 100ms delay)
         # Allow some slack for test timing
@@ -223,42 +259,43 @@ class TestSSEEncryption:
 
     async def test_sse_large_payload_stream(self, hpke_client: HPKEClientSession) -> None:
         """SSE events with ~10KB payloads work correctly."""
-        events: list[tuple[str, dict[str, Any]]] = []
-
         resp = await hpke_client.post("/stream-large", json={"start": True})
         assert resp.status == 200
-        async for event_type, event_data in hpke_client.iter_sse(resp):
-            events.append((event_type, event_data))
+        events = [parse_sse_chunk(chunk) async for chunk in hpke_client.iter_sse(resp)]
 
         # Should have 4 events: 3 large + 1 complete
         assert len(events) == 4
 
         # Verify large events have ~10KB data
         for i in range(3):
-            assert events[i][0] == "large"
-            assert events[i][1]["index"] == i
-            assert len(events[i][1]["data"]) == 10000
+            event_type, event_data = events[i]
+            assert event_type == "large"
+            assert event_data is not None
+            assert event_data["index"] == i
+            assert len(event_data["data"]) == 10000
 
         # Verify complete event
-        assert events[3][0] == "complete"
+        event_type, _event_data = events[3]
+        assert event_type == "complete"
 
     async def test_sse_many_events_stream(self, hpke_client: HPKEClientSession) -> None:
         """SSE stream with 50+ events works correctly."""
-        events: list[tuple[str, dict[str, Any]]] = []
-
         resp = await hpke_client.post("/stream-many", json={"start": True})
         assert resp.status == 200
-        async for event_type, event_data in hpke_client.iter_sse(resp):
-            events.append((event_type, event_data))
+        events = [parse_sse_chunk(chunk) async for chunk in hpke_client.iter_sse(resp)]
 
         # Should have 51 events: 50 event + 1 complete
         assert len(events) == 51
 
         # Verify sequential events
         for i in range(50):
-            assert events[i][0] == "event"
-            assert events[i][1]["index"] == i
+            event_type, event_data = events[i]
+            assert event_type == "event"
+            assert event_data is not None
+            assert event_data["index"] == i
 
         # Verify complete event
-        assert events[50][0] == "complete"
-        assert events[50][1]["count"] == 50
+        event_type, event_data = events[50]
+        assert event_type == "complete"
+        assert event_data is not None
+        assert event_data["count"] == 50

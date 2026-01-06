@@ -40,21 +40,21 @@ async def stream(request: Request) -> EncryptedSSEResponse | StreamingResponse:
     # Read and discard body (required by HPKE middleware)
     await request.body()
 
-    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
-        """Generate SSE events: 3 progress + 1 complete."""
+    async def sse_generator() -> AsyncGenerator[str]:
+        """Generate SSE chunks: 3 progress + 1 complete."""
         for i in range(1, 4):
-            yield ("progress", {"step": i, "total": 3})
-        yield ("complete", {"result": "success"})
+            yield f"event: progress\ndata: {json.dumps({'step': i, 'total': 3})}\n\n"
+        yield f"event: complete\ndata: {json.dumps({'result': 'success'})}\n\n"
 
     # Get HPKE context from scope (set by middleware)
     ctx = request.scope.get("hpke_context")
     if ctx:
-        return EncryptedSSEResponse(ctx, event_generator())
+        return EncryptedSSEResponse(ctx, sse_generator())
 
     # Fallback: plaintext SSE (shouldn't happen in E2E tests)
     async def plaintext_sse() -> AsyncGenerator[bytes]:
-        async for event_type, data in event_generator():
-            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+        async for chunk in sse_generator():
+            yield chunk.encode()
 
     return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
 
@@ -65,20 +65,20 @@ async def stream_delayed(request: Request) -> EncryptedSSEResponse | StreamingRe
 
     await request.body()
 
-    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
+    async def sse_generator() -> AsyncGenerator[str]:
         """Generate events with 100ms delays between them."""
         for i in range(5):
-            yield ("tick", {"count": i})
+            yield f"event: tick\ndata: {json.dumps({'count': i})}\n\n"
             await asyncio.sleep(0.1)  # 100ms delay
-        yield ("done", {"total": 5})
+        yield f"event: done\ndata: {json.dumps({'total': 5})}\n\n"
 
     ctx = request.scope.get("hpke_context")
     if ctx:
-        return EncryptedSSEResponse(ctx, event_generator())
+        return EncryptedSSEResponse(ctx, sse_generator())
 
     async def plaintext_sse() -> AsyncGenerator[bytes]:
-        async for event_type, data in event_generator():
-            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+        async for chunk in sse_generator():
+            yield chunk.encode()
 
     return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
 
@@ -87,20 +87,20 @@ async def stream_large(request: Request) -> EncryptedSSEResponse | StreamingResp
     """SSE endpoint with large payload events."""
     await request.body()
 
-    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
+    async def sse_generator() -> AsyncGenerator[str]:
         """Generate events with ~10KB payloads."""
         for i in range(3):
             large_payload = {"index": i, "data": "x" * 10000}  # ~10KB
-            yield ("large", large_payload)
-        yield ("complete", {"sizes": [10000, 10000, 10000]})
+            yield f"event: large\ndata: {json.dumps(large_payload)}\n\n"
+        yield f"event: complete\ndata: {json.dumps({'sizes': [10000, 10000, 10000]})}\n\n"
 
     ctx = request.scope.get("hpke_context")
     if ctx:
-        return EncryptedSSEResponse(ctx, event_generator())
+        return EncryptedSSEResponse(ctx, sse_generator())
 
     async def plaintext_sse() -> AsyncGenerator[bytes]:
-        async for event_type, data in event_generator():
-            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+        async for chunk in sse_generator():
+            yield chunk.encode()
 
     return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
 
@@ -109,19 +109,19 @@ async def stream_many(request: Request) -> EncryptedSSEResponse | StreamingRespo
     """SSE endpoint with 50+ events."""
     await request.body()
 
-    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
+    async def sse_generator() -> AsyncGenerator[str]:
         """Generate 50 events."""
         for i in range(50):
-            yield ("event", {"index": i})
-        yield ("complete", {"count": 50})
+            yield f"event: event\ndata: {json.dumps({'index': i})}\n\n"
+        yield f"event: complete\ndata: {json.dumps({'count': 50})}\n\n"
 
     ctx = request.scope.get("hpke_context")
     if ctx:
-        return EncryptedSSEResponse(ctx, event_generator())
+        return EncryptedSSEResponse(ctx, sse_generator())
 
     async def plaintext_sse() -> AsyncGenerator[bytes]:
-        async for event_type, data in event_generator():
-            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+        async for chunk in sse_generator():
+            yield chunk.encode()
 
     return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
 

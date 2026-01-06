@@ -336,57 +336,27 @@ class TestFuzzSSE:
 
     @staticmethod
     def _extract_data_field(sse: str) -> str:
-        """Extract data field from SSE event."""
+        """Extract data field from encrypted SSE output."""
         for line in sse.split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found in SSE event")
 
-    @given(event_type=st.text(min_size=1, max_size=100, alphabet=st.characters(blacklist_categories=["Cc", "Cs"])))
+    @given(chunk=st.text(min_size=0, max_size=1000, alphabet=st.characters(blacklist_categories=["Cs"])))
     @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
-    def test_roundtrip_any_event_type(self, event_type: str) -> None:
-        """Any event type roundtrips correctly."""
+    def test_roundtrip_any_chunk(self, chunk: str) -> None:
+        """Any raw chunk roundtrips correctly."""
         from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
 
         session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
-        sse_event = encryptor.encrypt_event(event_type, {"test": 1})
-        data = self._extract_data_field(sse_event)
-        dec_type, dec_data = decryptor.decrypt_event(data)
+        encrypted = encryptor.encrypt(chunk)
+        data = self._extract_data_field(encrypted)
+        decrypted = decryptor.decrypt(data)
 
-        assert dec_type == event_type
-        assert dec_data == {"test": 1}
-
-    @given(
-        data=st.dictionaries(
-            keys=st.text(min_size=1, max_size=20, alphabet=st.characters(blacklist_categories=["Cc", "Cs"])),
-            values=st.one_of(
-                st.text(max_size=100),
-                st.integers(),
-                st.floats(allow_nan=False, allow_infinity=False),
-                st.booleans(),
-                st.none(),
-            ),
-            max_size=10,
-        )
-    )
-    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
-    def test_roundtrip_any_json_data(self, data: dict[str, object]) -> None:
-        """Any JSON-serializable data roundtrips correctly."""
-        from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
-
-        session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
-
-        sse_event = encryptor.encrypt_event("test", data)
-        data_field = self._extract_data_field(sse_event)
-        dec_type, dec_data = decryptor.decrypt_event(data_field)
-
-        assert dec_type == "test"
-        assert dec_data == data
+        assert decrypted == chunk
 
     @given(event_count=st.integers(min_value=1, max_value=50))
     @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
@@ -402,9 +372,9 @@ class TestFuzzSSE:
             assert encryptor.counter == i + 1
             assert decryptor.expected_counter == i + 1
 
-            sse_event = encryptor.encrypt_event("test", {"i": i})
-            data = self._extract_data_field(sse_event)
-            decryptor.decrypt_event(data)
+            encrypted = encryptor.encrypt(f"event: test\ndata: {i}\n\n")
+            data = self._extract_data_field(encrypted)
+            decryptor.decrypt(data)
 
         assert encryptor.counter == event_count + 1
         assert decryptor.expected_counter == event_count + 1
@@ -426,8 +396,8 @@ class TestFuzzSSE:
         encryptor1 = SSEEncryptor(session1)
         encryptor2 = SSEEncryptor(session2)
 
-        sse1 = encryptor1.encrypt_event("test", {"data": "same"})
-        sse2 = encryptor2.encrypt_event("test", {"data": "same"})
+        sse1 = encryptor1.encrypt("event: test\ndata: same\n\n")
+        sse2 = encryptor2.encrypt("event: test\ndata: same\n\n")
 
         data1 = self._extract_data_field(sse1)
         data2 = self._extract_data_field(sse2)

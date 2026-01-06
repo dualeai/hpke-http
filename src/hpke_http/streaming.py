@@ -1,28 +1,24 @@
 """
 SSE (Server-Sent Events) streaming encryption.
 
-Provides encrypted SSE format that remains WHATWG-compliant while
-hiding event types and data from MITM attackers.
+Transparent encryption layer for SSE streams. Server sends normal SSE,
+client receives normal SSE - encryption is invisible to application code.
 
-Wire format per event:
-    id: {seq}
+Wire format:
     event: enc
     data: <base64url(counter_be32 || ciphertext)>
 
-Plaintext structure (encrypted):
-    {"t": "event_type", "d": {data}}
+The ciphertext contains the raw SSE chunk exactly as the server sent it.
+Perfect fidelity: comments, retry, id, events - everything preserved.
 
 Reference: RFC-065 §6
 """
 
 from __future__ import annotations
 
-import json
-import re
 import secrets
 import threading
 from dataclasses import dataclass, field
-from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
@@ -122,10 +118,13 @@ def create_session_from_context(ctx: HPKEContext) -> StreamingSession:
 @dataclass
 class SSEEncryptor:
     """
-    Server-side SSE event encryptor.
+    Server-side SSE encryptor.
 
-    Encrypts events with monotonic counter for replay protection.
+    Encrypts raw SSE chunks with monotonic counter for replay protection.
     Thread-safe: uses a lock to protect counter operations.
+
+    The encryption is transparent - any valid SSE chunk (events, comments,
+    retry directives) is encrypted as-is and will be decrypted identically.
     """
 
     session: StreamingSession
@@ -144,22 +143,16 @@ class SSEEncryptor:
         """
         return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
 
-    def encrypt_event(
-        self,
-        event_type: str,
-        data: dict[str, Any],
-        event_id: int | None = None,
-    ) -> str:
+    def encrypt(self, chunk: str) -> str:
         """
-        Encrypt an SSE event.
+        Encrypt a raw SSE chunk.
 
         Args:
-            event_type: Original event type (e.g., "task_progress")
-            data: Event data payload
-            event_id: Optional SSE event ID for reconnection
+            chunk: Raw SSE chunk exactly as server would send it.
+                   Can be event, comment, retry directive, or any valid SSE.
 
         Returns:
-            WHATWG-compliant SSE event string
+            Encrypted SSE event string (event: enc, data: <encrypted>)
 
         Raises:
             SessionExpiredError: If counter exhausted
@@ -168,8 +161,8 @@ class SSEEncryptor:
             if self.counter > SSE_MAX_COUNTER:
                 raise SessionExpiredError("SSE session counter exhausted")
 
-            # Build plaintext: {"t": type, "d": data}
-            plaintext = json.dumps({"t": event_type, "d": data}, separators=(",", ":")).encode()
+            # Encrypt raw chunk as-is (UTF-8 bytes)
+            plaintext = chunk.encode("utf-8")
 
             # Encrypt with counter nonce
             nonce = self._compute_nonce(self.counter)
@@ -179,26 +172,20 @@ class SSEEncryptor:
             payload = self.counter.to_bytes(SSE_COUNTER_SIZE, "big") + ciphertext
             encoded = b64url_encode(payload)
 
-            # Increment counter for next event
+            # Increment counter for next chunk
             self.counter += 1
 
-        # Format as SSE (outside lock - no shared state modified)
-        lines: list[str] = []
-        if event_id is not None:
-            lines.append(f"id: {event_id}")
-        lines.append("event: enc")
-        lines.append(f"data: {encoded}")
-        lines.append("")  # Empty line = event boundary
-
-        return "\n".join(lines) + "\n"
+        # Format as encrypted SSE event
+        return f"event: enc\ndata: {encoded}\n\n"
 
 
 @dataclass
 class SSEDecryptor:
     """
-    Client-side SSE event decryptor.
+    Client-side SSE decryptor.
 
-    Validates counter monotonicity for replay protection.
+    Decrypts SSE chunks and validates counter monotonicity for replay protection.
+    Returns the exact raw SSE chunk the server originally sent.
     """
 
     session: StreamingSession
@@ -212,15 +199,15 @@ class SSEDecryptor:
         """Compute 12-byte nonce from salt and counter."""
         return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
 
-    def decrypt_event(self, sse_data: str) -> tuple[str, dict[str, Any]]:
+    def decrypt(self, sse_data: str) -> str:
         """
-        Decrypt an SSE event data field.
+        Decrypt an SSE data field to recover the original chunk.
 
         Args:
             sse_data: base64url-encoded payload from SSE data field
 
         Returns:
-            Tuple of (event_type, data)
+            Original raw SSE chunk exactly as server sent it
 
         Raises:
             ReplayAttackError: If counter is out of order
@@ -248,57 +235,10 @@ class SSEDecryptor:
         try:
             plaintext = self._cipher.decrypt(nonce, ciphertext, associated_data=None)
         except Exception as e:
-            raise DecryptionError("SSE event decryption failed") from e
+            raise DecryptionError("SSE decryption failed") from e
 
         # Increment expected counter
         self.expected_counter += 1
 
-        # Parse event structure
-        try:
-            event = json.loads(plaintext)
-            return (event["t"], event["d"])
-        except (json.JSONDecodeError, KeyError) as e:
-            raise DecryptionError("Invalid SSE event structure") from e
-
-
-def parse_sse_event(raw_event: str) -> dict[str, str]:
-    """
-    Parse raw SSE event into components per WHATWG EventSource spec.
-
-    Handles:
-    - All line endings: CR (\\r), LF (\\n), CRLF (\\r\\n)
-    - Comment lines (starting with :)
-    - Field values with single leading space removed
-    - Lines without colons (empty value)
-
-    Reference: https://html.spec.whatwg.org/multipage/server-sent-events.html
-
-    Args:
-        raw_event: Raw SSE event text
-
-    Returns:
-        Dict with 'id', 'event', 'data', 'retry' keys (if present)
-    """
-    result: dict[str, str] = {}
-    # Split on any line ending: CRLF, LF, or CR
-    lines = re.split(r"\r\n|\r|\n", raw_event.strip())
-
-    for line in lines:
-        # Skip empty lines
-        if not line:
-            continue
-        # Skip comment lines (start with :)
-        if line.startswith(":"):
-            continue
-        # Parse field
-        if ":" in line:
-            key, _, value = line.partition(":")
-            # Remove single leading space if present (per WHATWG spec)
-            if value.startswith(" "):
-                value = value[1:]
-            result[key] = value
-        else:
-            # Line without colon: field name with empty value
-            result[line] = ""
-
-    return result
+        # Return raw chunk as string
+        return plaintext.decode("utf-8")
