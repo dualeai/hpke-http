@@ -34,6 +34,7 @@ Reference: RFC-065 §4.3, §5.3
 import json
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -58,6 +59,21 @@ from hpke_http.streaming import SSEEncryptor, create_session_from_context
 __all__ = [
     "HPKEMiddleware",
 ]
+
+
+@dataclass
+class SSEEncryptionState:
+    """Per-request state for SSE response encryption."""
+
+    is_sse: bool = False
+    """Whether the response is an SSE stream requiring encryption."""
+
+    encryptor: SSEEncryptor | None = None
+    """SSE encryptor instance, set when SSE response detected."""
+
+    buffer: str = field(default="")
+    """Buffer for incomplete SSE events awaiting boundary detection."""
+
 
 # Type alias for PSK resolver callback
 PSKResolver = Callable[[dict[str, Any]], Awaitable[tuple[bytes, bytes]]]
@@ -160,11 +176,7 @@ class HPKEMiddleware:
     ) -> Callable[[dict[str, Any]], Awaitable[None]]:
         """Create send wrapper that auto-encrypts SSE responses."""
         # Per-request state (closure)
-        state: dict[str, Any] = {
-            "is_sse": False,
-            "encryptor": None,
-            "buffer": "",
-        }
+        state = SSEEncryptionState()
 
         # WHATWG-compliant event boundary: two consecutive line endings
         # Handles \n\n, \r\r, \r\n\r\n, and mixed combinations
@@ -191,9 +203,9 @@ class HPKEMiddleware:
             # Enable encryption if SSE + HPKE context exists
             ctx = scope.get(SCOPE_HPKE_CONTEXT)
             if ctx and content_type and b"text/event-stream" in content_type:
-                state["is_sse"] = True
+                state.is_sse = True
                 session = create_session_from_context(ctx)
-                state["encryptor"] = SSEEncryptor(session)
+                state.encryptor = SSEEncryptor(session)
 
                 # Add X-HPKE-Stream header
                 session_params = session.serialize()
@@ -207,22 +219,25 @@ class HPKEMiddleware:
 
         async def _handle_response_body(message: dict[str, Any]) -> None:
             """Handle response body - buffer and encrypt SSE events."""
-            if not state["is_sse"]:
+            if not state.is_sse:
                 await send(message)
                 return
 
             body = message.get("body", b"")
             more_body = message.get("more_body", False)
-            encryptor: SSEEncryptor = state["encryptor"]
+            encryptor = state.encryptor
+            if encryptor is None:  # Should never happen when is_sse=True
+                await send(message)
+                return
 
             # Add to buffer (decode UTF-8, replace invalid chars)
             if body:
                 decoded = body.decode("utf-8", errors="replace")
                 # Enforce buffer size limit to prevent DoS
-                if len(state["buffer"]) + len(decoded) > self.max_sse_event_size:
+                if len(state.buffer) + len(decoded) > self.max_sse_event_size:
                     # Force flush oversized buffer as partial event
-                    if state["buffer"]:
-                        encrypted = encryptor.encrypt(state["buffer"])
+                    if state.buffer:
+                        encrypted = encryptor.encrypt(state.buffer)
                         await send(
                             {
                                 "type": "http.response.body",
@@ -230,9 +245,9 @@ class HPKEMiddleware:
                                 "more_body": True,
                             }
                         )
-                    state["buffer"] = decoded[-self.max_sse_event_size :]  # Keep tail
+                    state.buffer = decoded[-self.max_sse_event_size :]  # Keep tail
                 else:
-                    state["buffer"] += decoded
+                    state.buffer += decoded
 
             # Extract and encrypt complete events
             sent_any = await _extract_and_send_events(encryptor, more_body=more_body)
@@ -245,17 +260,17 @@ class HPKEMiddleware:
             """Extract complete events from buffer and send encrypted."""
             sent_any = False
             while True:
-                match = event_boundary.search(state["buffer"])
+                match = event_boundary.search(state.buffer)
                 if not match:
                     break
 
                 # Extract complete event (including boundary)
                 event_end = match.end()
-                chunk = state["buffer"][:event_end]
-                state["buffer"] = state["buffer"][event_end:]
+                chunk = state.buffer[:event_end]
+                state.buffer = state.buffer[event_end:]
 
                 # Send with more_body=False only if final message AND buffer empty
-                is_final = not more_body and not state["buffer"]
+                is_final = not more_body and not state.buffer
                 encrypted = encryptor.encrypt(chunk)
                 await send(
                     {
@@ -269,9 +284,9 @@ class HPKEMiddleware:
 
         async def _handle_end_of_stream(encryptor: SSEEncryptor, *, sent_any: bool) -> None:
             """Handle end of stream - flush buffer or send empty body."""
-            if state["buffer"]:
+            if state.buffer:
                 # Flush remaining buffer (partial event)
-                encrypted = encryptor.encrypt(state["buffer"])
+                encrypted = encryptor.encrypt(state.buffer)
                 await send(
                     {
                         "type": "http.response.body",
