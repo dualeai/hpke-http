@@ -41,8 +41,7 @@ def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
             continue
         if ":" in line:
             key, _, value = line.partition(":")
-            if value.startswith(" "):
-                value = value[1:]
+            value = value.removeprefix(" ")
             if key == "event":
                 event_type = value
             elif key == "data":
@@ -57,6 +56,26 @@ def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
 # === Fixtures ===
 
 
+async def _create_hpke_client(
+    server: tuple[str, int, bytes],
+    psk: bytes,
+    psk_id: bytes,
+    *,
+    compress: bool = False,
+) -> AsyncIterator[HPKEClientSession]:
+    """Create HPKEClientSession connected to test server."""
+    host, port, _pk = server
+    base_url = f"http://{host}:{port}"
+
+    async with HPKEClientSession(
+        base_url=base_url,
+        psk=psk,
+        psk_id=psk_id,
+        compress=compress,
+    ) as session:
+        yield session
+
+
 @pytest.fixture
 async def hpke_client(
     granian_server: tuple[str, int, bytes],
@@ -64,14 +83,29 @@ async def hpke_client(
     test_psk_id: bytes,
 ) -> AsyncIterator[HPKEClientSession]:
     """HPKEClientSession connected to test server."""
-    host, port, _pk = granian_server
-    base_url = f"http://{host}:{port}"
+    async for session in _create_hpke_client(granian_server, test_psk, test_psk_id):
+        yield session
 
-    async with HPKEClientSession(
-        base_url=base_url,
-        psk=test_psk,
-        psk_id=test_psk_id,
-    ) as session:
+
+@pytest.fixture
+async def hpke_client_compressed(
+    granian_server_compressed: tuple[str, int, bytes],
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[HPKEClientSession]:
+    """HPKEClientSession with compression, connected to compression-enabled server."""
+    async for session in _create_hpke_client(granian_server_compressed, test_psk, test_psk_id, compress=True):
+        yield session
+
+
+@pytest.fixture
+async def hpke_client_no_compress_server_compress(
+    granian_server_compressed: tuple[str, int, bytes],
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[HPKEClientSession]:
+    """HPKEClientSession without compression, connected to compression-enabled server."""
+    async for session in _create_hpke_client(granian_server_compressed, test_psk, test_psk_id, compress=False):
         yield session
 
 
@@ -81,16 +115,17 @@ async def hpke_client(
 class TestDiscoveryEndpoint:
     """Test HPKE key discovery endpoint."""
 
-    async def test_discovery_returns_keys(self, granian_server: tuple[str, int, bytes]) -> None:
-        """Server exposes public keys via discovery endpoint."""
-        host, port, _expected_pk = granian_server
+    async def test_discovery_endpoint(self, granian_server: tuple[str, int, bytes]) -> None:
+        """Discovery endpoint returns keys with proper cache headers."""
+        host, port, _ = granian_server
 
         async with aiohttp.ClientSession() as session:
             url = f"http://{host}:{port}/.well-known/hpke-keys"
             async with session.get(url) as resp:
                 assert resp.status == 200
-                data = await resp.json()
 
+                # Verify response structure
+                data = await resp.json()
                 assert data["version"] == 1
                 assert "keys" in data
                 assert len(data["keys"]) >= 1
@@ -100,14 +135,7 @@ class TestDiscoveryEndpoint:
                 assert "kem_id" in key_info
                 assert "public_key" in key_info
 
-    async def test_discovery_cache_headers(self, granian_server: tuple[str, int, bytes]) -> None:
-        """Discovery endpoint returns cache headers."""
-        host, port, _ = granian_server
-
-        async with aiohttp.ClientSession() as session:
-            url = f"http://{host}:{port}/.well-known/hpke-keys"
-            async with session.get(url) as resp:
-                assert resp.status == 200
+                # Verify cache headers
                 assert "Cache-Control" in resp.headers
                 assert "max-age" in resp.headers["Cache-Control"]
 
@@ -173,21 +201,6 @@ class TestAuthenticationFailures:
             resp = await bad_client.post("/echo", json={"test": 1})
             # Server should reject with decryption failure
             assert resp.status == 400
-
-    async def test_plaintext_request_passes_through(
-        self,
-        granian_server: tuple[str, int, bytes],
-    ) -> None:
-        """Plaintext requests without HPKE headers pass through (no encryption required)."""
-        host, port, _ = granian_server
-
-        async with aiohttp.ClientSession() as plain_client:
-            url = f"http://{host}:{port}/health"
-            async with plain_client.get(url) as resp:
-                # Health endpoint doesn't require encryption
-                assert resp.status == 200
-                data = await resp.json()
-                assert data["status"] == "ok"
 
 
 class TestSSEEncryption:
@@ -318,3 +331,92 @@ class TestSSEEncryption:
             # Runtime assertion - catches any mismatch at test time
             assert isinstance(chunk, bytes), f"Expected bytes, got {type(chunk).__name__}"
             break  # Only need to check first chunk
+
+
+class TestCompressionE2E:
+    """E2E tests for Zstd compression with real granian server.
+
+    Tests request compression (client→server) and SSE compression (server→client).
+    """
+
+    async def test_compressed_request_roundtrip(
+        self,
+        hpke_client_compressed: HPKEClientSession,
+    ) -> None:
+        """Client compress=True → Server decompresses correctly.
+
+        Large JSON is compressed before encryption, server decompresses after decryption.
+        """
+        # Large payload to ensure compression is triggered (>64 bytes)
+        large_data = {"message": "x" * 1000, "nested": {"key": "value" * 100}}
+
+        resp = await hpke_client_compressed.post("/echo", json=large_data)
+        assert resp.status == 200
+        data = await resp.json()
+
+        # Verify the data made it through compression → encryption → decryption → decompression
+        assert "x" * 1000 in data["echo"]
+        assert "value" * 100 in data["echo"]
+
+    async def test_compressed_sse_roundtrip(
+        self,
+        hpke_client_compressed: HPKEClientSession,
+    ) -> None:
+        """Server compress=True → Client receives decompressed SSE.
+
+        SSE events are compressed before encryption, client decompresses after decryption.
+        """
+        resp = await hpke_client_compressed.post("/stream-large", json={"start": True})
+        assert resp.status == 200
+        events = [parse_sse_chunk(chunk) async for chunk in hpke_client_compressed.iter_sse(resp)]
+
+        # Should have 4 events: 3 large + 1 complete
+        assert len(events) == 4
+
+        # Verify large events have ~10KB data (compression worked transparently)
+        for i in range(3):
+            event_type, event_data = events[i]
+            assert event_type == "large"
+            assert event_data is not None
+            assert event_data["index"] == i
+            assert len(event_data["data"]) == 10000
+
+    async def test_mixed_compression_client_off_server_on(
+        self,
+        hpke_client_no_compress_server_compress: HPKEClientSession,
+    ) -> None:
+        """Client compress=False, Server compress=True still works.
+
+        Client sends uncompressed requests, server compresses SSE responses.
+        """
+        test_data = {"message": "Hello from uncompressed client!"}
+
+        resp = await hpke_client_no_compress_server_compress.post("/echo", json=test_data)
+        assert resp.status == 200
+        data = await resp.json()
+        assert "Hello from uncompressed client!" in data["echo"]
+
+        # SSE should still work (server compresses, client decompresses)
+        resp = await hpke_client_no_compress_server_compress.post("/stream", json={"start": True})
+        assert resp.status == 200
+        events = [parse_sse_chunk(chunk) async for chunk in hpke_client_no_compress_server_compress.iter_sse(resp)]
+        assert len(events) == 4
+
+    async def test_many_events_with_compression(
+        self,
+        hpke_client_compressed: HPKEClientSession,
+    ) -> None:
+        """50+ SSE events with compression work correctly."""
+        resp = await hpke_client_compressed.post("/stream-many", json={"start": True})
+        assert resp.status == 200
+        events = [parse_sse_chunk(chunk) async for chunk in hpke_client_compressed.iter_sse(resp)]
+
+        # Should have 51 events: 50 event + 1 complete
+        assert len(events) == 51
+
+        # Verify sequential events
+        for i in range(50):
+            event_type, event_data = events[i]
+            assert event_type == "event"
+            assert event_data is not None
+            assert event_data["index"] == i

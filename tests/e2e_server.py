@@ -100,11 +100,13 @@ def _create_app() -> HPKEMiddleware:
     - TEST_HPKE_PRIVATE_KEY: Hex-encoded X25519 private key
     - TEST_PSK: Hex-encoded pre-shared key
     - TEST_PSK_ID: Hex-encoded PSK ID
+    - TEST_COMPRESS: Enable Zstd compression for SSE responses ("true"/"false")
     """
     # Read config from environment
     private_key_hex = os.environ.get("TEST_HPKE_PRIVATE_KEY", "")
     psk_hex = os.environ.get("TEST_PSK", "")
     psk_id_hex = os.environ.get("TEST_PSK_ID", "")
+    compress_enabled = os.environ.get("TEST_COMPRESS", "").lower() == "true"
 
     if not private_key_hex:
         raise ValueError("TEST_HPKE_PRIVATE_KEY environment variable required")
@@ -134,6 +136,7 @@ def _create_app() -> HPKEMiddleware:
         app=starlette_app,
         private_keys={KemId.DHKEM_X25519_HKDF_SHA256: private_key},
         psk_resolver=psk_resolver,
+        compress=compress_enabled,
     )
 
 

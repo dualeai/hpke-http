@@ -114,13 +114,20 @@ async def wait_for_server(host: str, port: int, timeout: float = 10.0) -> None:
 TEST_SERVER_MODULE = "tests.e2e_server:app"
 
 
-@pytest.fixture
-async def granian_server(
+async def _start_granian_server(
     platform_keypair: tuple[bytes, bytes],
     test_psk: bytes,
     test_psk_id: bytes,
+    *,
+    compress: bool = False,
 ) -> AsyncIterator[tuple[str, int, bytes]]:
     """Start granian server with HPKE middleware.
+
+    Args:
+        platform_keypair: (private_key, public_key) tuple
+        test_psk: Pre-shared key
+        test_psk_id: Pre-shared key ID
+        compress: Enable Zstd compression for SSE responses
 
     Yields:
         Tuple of (host, port, public_key)
@@ -136,6 +143,8 @@ async def granian_server(
         "TEST_PSK": test_psk.hex(),
         "TEST_PSK_ID": test_psk_id.hex(),
     }
+    if compress:
+        env["TEST_COMPRESS"] = "true"
 
     proc = subprocess.Popen(
         [
@@ -167,7 +176,27 @@ async def granian_server(
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            # Force kill if terminate doesn't work
             proc.kill()
-            proc.wait()  # No timeout after SIGKILL
-        proc = None
+            proc.wait()
+
+
+@pytest.fixture
+async def granian_server(
+    platform_keypair: tuple[bytes, bytes],
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[tuple[str, int, bytes]]:
+    """Start granian server with HPKE middleware."""
+    async for result in _start_granian_server(platform_keypair, test_psk, test_psk_id):
+        yield result
+
+
+@pytest.fixture
+async def granian_server_compressed(
+    platform_keypair: tuple[bytes, bytes],
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[tuple[str, int, bytes]]:
+    """Start granian server with HPKE middleware and compression enabled."""
+    async for result in _start_granian_server(platform_keypair, test_psk, test_psk_id, compress=True):
+        yield result

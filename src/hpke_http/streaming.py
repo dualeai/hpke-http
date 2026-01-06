@@ -17,8 +17,10 @@ Reference: RFC-065 §6
 from __future__ import annotations
 
 import secrets
+import sys
 import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
@@ -28,16 +30,55 @@ from hpke_http.constants import (
     SSE_MAX_COUNTER,
     SSE_SESSION_KEY_LABEL,
     SSE_SESSION_SALT_SIZE,
+    ZSTD_COMPRESSION_LEVEL,
+    ZSTD_MIN_SIZE,
+    SSEEncodingId,
 )
 from hpke_http.exceptions import DecryptionError, ReplayAttackError, SessionExpiredError
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import HPKEContext
+
+# Cached zstd module (PEP 784 pattern)
+_zstd_module: Any = None
+
+
+def import_zstd() -> Any:
+    """Import zstd module (PEP 784 pattern, cached).
+
+    Uses Python 3.14+ native compression.zstd, or backports.zstd for earlier versions.
+
+    Returns:
+        The zstd module
+
+    Raises:
+        ImportError: If backports.zstd is not installed on Python < 3.14
+    """
+    global _zstd_module
+    if _zstd_module is not None:
+        return _zstd_module
+
+    if sys.version_info >= (3, 14):
+        from compression import zstd  # type: ignore[import-not-found]
+
+        _zstd_module = zstd
+    else:
+        try:
+            from backports import zstd  # type: ignore[import-not-found]
+
+            _zstd_module = zstd  # type: ignore[reportUnknownVariableType]
+        except ImportError as e:
+            raise ImportError(
+                "Zstd compression requires 'backports.zstd' package. Install with: pip install hpke-http[zstd]"
+            ) from e
+    return _zstd_module  # type: ignore[return-value]
+
 
 __all__ = [
     "SSEDecryptor",
     "SSEEncryptor",
     "StreamingSession",
     "create_session_from_context",
+    "import_zstd",
 ]
 
 
@@ -125,15 +166,23 @@ class SSEEncryptor:
 
     The encryption is transparent - any valid SSE chunk (events, comments,
     retry directives) is encrypted as-is and will be decrypted identically.
+
+    Optional compression (RFC 8878 Zstd) can be enabled via compress=True.
+    Compressed chunks are prefixed with encoding ID for client detection.
     """
 
     session: StreamingSession
     counter: int = field(default=1)  # Start at 1 (0 reserved)
+    compress: bool = False  # Enable Zstd compression
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
     _lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)
+    _compressor: Any = field(init=False, repr=False, default=None)  # Reused per session
 
     def __post_init__(self) -> None:
         self._cipher = ChaCha20Poly1305(self.session.session_key)
+        if self.compress:
+            zstd = import_zstd()
+            self._compressor = zstd.ZstdCompressor(level=ZSTD_COMPRESSION_LEVEL)
 
     def _compute_nonce(self, counter: int) -> bytes:
         """
@@ -165,9 +214,18 @@ class SSEEncryptor:
             if self.counter > SSE_MAX_COUNTER:
                 raise SessionExpiredError("SSE session counter exhausted")
 
+            # Build payload: encoding_id (1B) || data
+            # Compress if enabled and chunk is large enough
+            if self._compressor is not None and len(chunk) >= ZSTD_MIN_SIZE:
+                zstd = import_zstd()
+                compressed = self._compressor.compress(chunk, mode=zstd.ZstdCompressor.FLUSH_BLOCK)
+                data = bytes([SSEEncodingId.ZSTD]) + compressed
+            else:
+                data = bytes([SSEEncodingId.IDENTITY]) + chunk
+
             # Encrypt with counter nonce
             nonce = self._compute_nonce(self.counter)
-            ciphertext = self._cipher.encrypt(nonce, chunk, associated_data=None)
+            ciphertext = self._cipher.encrypt(nonce, data, associated_data=None)
 
             # Wire format: counter_be32 || ciphertext
             payload = self.counter.to_bytes(SSE_COUNTER_SIZE, "big") + ciphertext
@@ -187,11 +245,14 @@ class SSEDecryptor:
 
     Decrypts SSE chunks and validates counter monotonicity for replay protection.
     Returns the exact raw SSE chunk the server originally sent.
+
+    Automatically handles decompression based on encoding ID prefix.
     """
 
     session: StreamingSession
     expected_counter: int = field(default=1)  # Expect counter starting at 1
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
+    _decompressor: Any = field(init=False, repr=False, default=None)  # Lazy init, reused
 
     def __post_init__(self) -> None:
         self._cipher = ChaCha20Poly1305(self.session.session_key)
@@ -199,6 +260,13 @@ class SSEDecryptor:
     def _compute_nonce(self, counter: int) -> bytes:
         """Compute 12-byte nonce from salt and counter."""
         return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
+
+    def _get_decompressor(self) -> Any:
+        """Get or create decompressor (lazy, reused per session)."""
+        if self._decompressor is None:
+            zstd = import_zstd()
+            self._decompressor = zstd.ZstdDecompressor()
+        return self._decompressor
 
     def decrypt(self, sse_data: str) -> bytes:
         """
@@ -212,7 +280,7 @@ class SSEDecryptor:
 
         Raises:
             ReplayAttackError: If counter is out of order
-            DecryptionError: If decryption fails
+            DecryptionError: If decryption fails or unknown encoding
         """
         # Decode payload
         try:
@@ -234,9 +302,26 @@ class SSEDecryptor:
         # Decrypt
         nonce = self._compute_nonce(counter)
         try:
-            plaintext = self._cipher.decrypt(nonce, ciphertext, associated_data=None)
+            data = self._cipher.decrypt(nonce, ciphertext, associated_data=None)
         except Exception as e:
             raise DecryptionError("SSE decryption failed") from e
+
+        # Parse encoding_id and decompress if needed
+        if len(data) < 1:
+            raise DecryptionError("Decrypted payload too short (missing encoding ID)")
+
+        encoding_id = data[0]
+        encoded_payload = data[1:]
+
+        if encoding_id == SSEEncodingId.ZSTD:
+            try:
+                plaintext = self._get_decompressor().decompress(encoded_payload)
+            except Exception as e:
+                raise DecryptionError("Zstd decompression failed") from e
+        elif encoding_id == SSEEncodingId.IDENTITY:
+            plaintext = encoded_payload
+        else:
+            raise DecryptionError(f"Unknown encoding: 0x{encoding_id:02x}")
 
         # Increment expected counter
         self.expected_counter += 1

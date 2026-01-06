@@ -159,6 +159,9 @@ HEADER_HPKE_ENC: Final[str] = "X-HPKE-Enc"
 HEADER_HPKE_STREAM: Final[str] = "X-HPKE-Stream"
 """Header containing encrypted SSE session parameters."""
 
+HEADER_HPKE_ENCODING: Final[str] = "X-HPKE-Encoding"
+"""Header specifying compression algorithm for request body (RFC 8878)."""
+
 # =============================================================================
 # ASGI Scope Keys
 # =============================================================================
@@ -201,3 +204,29 @@ DISCOVERY_PATH: Final[str] = "/.well-known/hpke-keys"
 
 DISCOVERY_CACHE_MAX_AGE: Final[int] = 86400
 """Default cache max-age for discovery response (24 hours)."""
+
+# =============================================================================
+# Compression Constants (RFC 8878 - Zstandard)
+# =============================================================================
+
+
+class SSEEncodingId(IntEnum):
+    """Encoding algorithm identifiers for SSE payloads.
+
+    First byte of decrypted SSE payload indicates compression algorithm.
+    Extensible for future algorithms (brotli, etc.).
+    """
+
+    IDENTITY = 0x00
+    """No compression - raw plaintext."""
+    ZSTD = 0x01
+    """Zstandard compression (RFC 8878)."""
+    # Reserved for future:
+    # BROTLI = 0x02  # Brotli (RFC 7932)
+
+
+ZSTD_COMPRESSION_LEVEL: Final[int] = 3
+"""Zstd compression level (1-22). Level 3 = fast compression."""
+
+ZSTD_MIN_SIZE: Final[int] = 64
+"""Minimum payload size for compression. Smaller payloads skip compression."""

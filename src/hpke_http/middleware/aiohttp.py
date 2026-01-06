@@ -34,14 +34,17 @@ from hpke_http.constants import (
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
+    HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
+    ZSTD_COMPRESSION_LEVEL,
+    ZSTD_MIN_SIZE,
     KemId,
 )
 from hpke_http.envelope import encode_envelope
 from hpke_http.exceptions import DecryptionError, KeyDiscoveryError
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import SenderContext, setup_sender_psk
-from hpke_http.streaming import SSEDecryptor, StreamingSession
+from hpke_http.streaming import SSEDecryptor, StreamingSession, import_zstd
 
 __all__ = [
     "HPKEClientSession",
@@ -69,6 +72,8 @@ class HPKEClientSession:
         psk: bytes,
         psk_id: bytes | None = None,
         discovery_url: str | None = None,
+        *,
+        compress: bool = False,
         **aiohttp_kwargs: Any,
     ) -> None:
         """
@@ -79,12 +84,16 @@ class HPKEClientSession:
             psk: Pre-shared key (API key as bytes)
             psk_id: Pre-shared key identifier (defaults to psk)
             discovery_url: Override discovery endpoint URL (for testing)
+            compress: Enable Zstd compression for request bodies (RFC 8878).
+                When enabled, requests >= 64 bytes are compressed before encryption.
+                Server must have backports.zstd installed (Python < 3.14).
             **aiohttp_kwargs: Additional arguments passed to aiohttp.ClientSession
         """
         self.base_url = base_url.rstrip("/")
         self.psk = psk
         self.psk_id = psk_id or psk
         self.discovery_url = discovery_url or urljoin(self.base_url, DISCOVERY_PATH)
+        self.compress = compress
 
         self._session: aiohttp.ClientSession | None = None
         self._aiohttp_kwargs = aiohttp_kwargs
@@ -189,12 +198,12 @@ class HPKEClientSession:
     async def _encrypt_request(
         self,
         body: bytes,
-    ) -> tuple[bytes, str, SenderContext]:
+    ) -> tuple[bytes, str, SenderContext, bool]:
         """
         Encrypt request body with HPKE.
 
         Returns:
-            Tuple of (encrypted_body, enc_header_value, sender_context)
+            Tuple of (encrypted_body, enc_header_value, sender_context, was_compressed)
         """
         keys = await self._ensure_keys()
 
@@ -202,6 +211,13 @@ class HPKEClientSession:
         pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
         if not pk_r:
             raise KeyDiscoveryError("No X25519 key available from platform")
+
+        # Compress if enabled and body is large enough
+        was_compressed = False
+        if self.compress and len(body) >= ZSTD_MIN_SIZE:
+            zstd = import_zstd()
+            body = zstd.compress(body, level=ZSTD_COMPRESSION_LEVEL)
+            was_compressed = True
 
         # Set up sender context
         ctx = setup_sender_psk(
@@ -220,7 +236,7 @@ class HPKEClientSession:
         # Encode enc for header
         enc_header = b64url_encode(ctx.enc)
 
-        return (envelope, enc_header, ctx)
+        return (envelope, enc_header, ctx, was_compressed)
 
     async def request(
         self,
@@ -262,9 +278,11 @@ class HPKEClientSession:
         headers = dict(kwargs.pop("headers", {}))
         sender_ctx: SenderContext | None = None
         if body:
-            encrypted_body, enc_header, ctx = await self._encrypt_request(body)
+            encrypted_body, enc_header, ctx, was_compressed = await self._encrypt_request(body)
             headers[HEADER_HPKE_ENC] = enc_header
             headers["Content-Type"] = "application/octet-stream"
+            if was_compressed:
+                headers[HEADER_HPKE_ENCODING] = "zstd"
             sender_ctx = ctx
             kwargs["data"] = encrypted_body
 

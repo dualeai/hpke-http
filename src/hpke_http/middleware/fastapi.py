@@ -44,6 +44,7 @@ from hpke_http.constants import (
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
+    HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
     KDF_ID,
     SCOPE_HPKE_CONTEXT,
@@ -54,7 +55,7 @@ from hpke_http.envelope import decode_envelope
 from hpke_http.exceptions import CryptoError, DecryptionError, EnvelopeError
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import setup_recipient_psk
-from hpke_http.streaming import SSEEncryptor, create_session_from_context
+from hpke_http.streaming import SSEEncryptor, create_session_from_context, import_zstd
 
 __all__ = [
     "HPKEMiddleware",
@@ -108,6 +109,8 @@ class HPKEMiddleware:
         psk_resolver: PSKResolver,
         discovery_path: str = DISCOVERY_PATH,
         max_sse_event_size: int = SSE_MAX_EVENT_SIZE,
+        *,
+        compress: bool = False,
     ) -> None:
         """
         Initialize HPKE middleware.
@@ -120,12 +123,16 @@ class HPKEMiddleware:
             max_sse_event_size: Maximum SSE event buffer size in bytes (default 64MB).
                 This is a DoS protection for malformed events without proper \\n\\n boundaries.
                 SSE is text-only; binary data must be base64-encoded (+33% overhead).
+            compress: Enable Zstd compression for SSE responses (RFC 8878).
+                When enabled, SSE chunks >= 64 bytes are compressed before encryption.
+                Client must have backports.zstd installed (Python < 3.14).
         """
         self.app = app
         self.private_keys = private_keys
         self.psk_resolver = psk_resolver
         self.discovery_path = discovery_path
         self.max_sse_event_size = max_sse_event_size
+        self.compress = compress
 
         # Derive public keys for discovery endpoint
         self._public_keys: dict[KemId, bytes] = {}
@@ -205,7 +212,7 @@ class HPKEMiddleware:
             if ctx and content_type and b"text/event-stream" in content_type:
                 state.is_sse = True
                 session = create_session_from_context(ctx)
-                state.encryptor = SSEEncryptor(session)
+                state.encryptor = SSEEncryptor(session, compress=self.compress)
 
                 # Add X-HPKE-Stream header
                 session_params = session.serialize()
@@ -412,6 +419,18 @@ class HPKEMiddleware:
         )
 
         plaintext = ctx.open(aad=b"", ciphertext=ciphertext)
+
+        # Decompress if X-HPKE-Encoding header indicates compression
+        headers = dict(scope.get("headers", []))
+        encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
+        if encoding_header == b"zstd":
+            try:
+                zstd = import_zstd()
+                plaintext = zstd.decompress(plaintext)
+            except ImportError as e:
+                raise DecryptionError(f"Zstd decompression unavailable: {e}") from e
+            except Exception as e:
+                raise DecryptionError(f"Zstd decompression failed: {e}") from e
 
         # Store context in scope for SSE response encryption
         scope[SCOPE_HPKE_CONTEXT] = ctx

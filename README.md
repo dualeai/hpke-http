@@ -34,6 +34,7 @@ app.add_middleware(
     HPKEMiddleware,
     private_keys={KemId.DHKEM_X25519_HKDF_SHA256: private_key},
     psk_resolver=resolve_psk,
+    # compress=True,  # Optional: Zstd compression for SSE responses
     # max_sse_event_size=128 * 1024 * 1024,  # Optional: 128MB for large payloads
 )
 
@@ -58,6 +59,7 @@ async with HPKEClientSession(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
+    # compress=True,    # Optional: Zstd compression for requests
 ) as session:
     resp = await session.post("/chat", json={"prompt": "Hello"})
     async for chunk in session.iter_sse(resp):
@@ -71,6 +73,7 @@ async with HPKEClientSession(
 - [RFC 7748 - X25519](https://datatracker.ietf.org/doc/rfc7748/)
 - [RFC 5869 - HKDF](https://datatracker.ietf.org/doc/rfc5869/)
 - [RFC 8439 - ChaCha20-Poly1305](https://datatracker.ietf.org/doc/rfc8439/)
+- [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (optional compression)
 
 ## Cipher Suite
 
@@ -119,6 +122,42 @@ if scope.get(SCOPE_HPKE_CONTEXT) and b"text/event-stream" in content_type:
 
 This is why `media_type="text/event-stream"` is required - it's the WHATWG-standard MIME type that signals "this is an SSE stream" to both browsers and the middleware.
 
+## Compression (Optional)
+
+Zstd compression reduces bandwidth by **40-95%** for JSON/text. Events <64B are sent uncompressed automatically.
+
+```python
+HPKEMiddleware(..., compress=True)      # Server: compress SSE responses
+HPKEClientSession(..., compress=True)   # Client: compress requests
+```
+
+### Design
+
+| Choice | Rationale |
+|--------|-----------|
+| **Compress-then-encrypt** | Encrypted data is incompressible |
+| **Zstd (RFC 8878)** | Best ratio/speed. Python 3.14 native. |
+| **64B threshold** | Smaller payloads skip compression |
+| **Per-chunk** | Each SSE event independent for streaming |
+
+### Expected Savings
+
+| Data Type | Savings |
+|-----------|---------|
+| Large JSON (>1KB) | 80-95% |
+| Medium JSON (200B-1KB) | 40-70% |
+| HTML/XML | 70-85% |
+| Logs, code | 40-60% |
+| Small events (64-200B) | 0-20% |
+| Base64, random | 0-25% |
+
+### Wire Format
+
+```text
+Plaintext:  encoding_id (1B) || compressed_data
+Encoding:   0x00 = identity, 0x01 = zstd
+```
+
 ## Pitfalls
 
 ```python
@@ -155,12 +194,13 @@ Uses OpenSSL constant-time implementations via `cryptography` library.
 
 ```bash
 # Install with extras
-uv add "hpke-http[fastapi] @ git+https://github.com/duale-ai/hpke-http"  # Server
-uv add "hpke-http[aiohttp] @ git+https://github.com/duale-ai/hpke-http"  # Client
+uv add "hpke-http[fastapi] @ git+https://github.com/duale-ai/hpke-http"        # Server
+uv add "hpke-http[aiohttp] @ git+https://github.com/duale-ai/hpke-http"        # Client
+uv add "hpke-http[fastapi,zstd] @ git+https://github.com/duale-ai/hpke-http"   # Server + compression
 
 # Local development
 make install      # Setup venv
-make test         # Run tests (1215 tests, 94% coverage)
+make test         # Run tests (1273 tests, 93% coverage)
 make test-fuzz    # Property-based fuzz tests
 make lint         # Format and lint
 ```

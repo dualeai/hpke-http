@@ -37,6 +37,10 @@ fastapi = [
 aiohttp = [
     "aiohttp~=3.13",  # Upgraded from ~=3.11 for security fixes
 ]
+# Zstd compression (optional, RFC 8878)
+zstd = [
+    "backports.zstd>=1.0; python_version<'3.14'",
+]
 
 [project.urls]
 Homepage = "https://github.com/dualeai/hpke-http"
@@ -126,6 +130,7 @@ ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use se
 "tests/**/test_fuzz.py" = ["SLF001"]  # Fuzz tests need internal state access for overflow testing
 "tests/**/test_aiohttp_client.py" = ["SLF001"]  # Unit tests for private parsing methods
 "tests/**/test_streaming_errors.py" = ["SLF001"]  # Error tests need internal cipher access
+"src/**/streaming.py" = ["PLW0603", "PLC0415"]  # Optional zstd: module caching requires global, lazy import for optional deps
 
 [tool.vulture]
 exclude = [".venv/"]  # Exclude deps
