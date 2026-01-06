@@ -311,7 +311,7 @@ class HPKEClientSession:
     async def iter_sse(
         self,
         response: aiohttp.ClientResponse,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[bytes]:
         """
         Iterate over encrypted SSE stream, yielding decrypted chunks.
 
@@ -322,7 +322,7 @@ class HPKEClientSession:
             response: Response from an SSE endpoint
 
         Yields:
-            Raw SSE chunks exactly as the server sent them
+            Raw SSE chunks as bytes exactly as the server sent them
         """
         sender_ctx = self._response_contexts.get(response)
         if not sender_ctx:

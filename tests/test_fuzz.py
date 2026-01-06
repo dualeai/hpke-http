@@ -335,16 +335,16 @@ class TestFuzzSSE:
     """Property-based tests for SSE streaming encryption."""
 
     @staticmethod
-    def _extract_data_field(sse: str) -> str:
+    def _extract_data_field(sse: bytes) -> str:
         """Extract data field from encrypted SSE output."""
-        for line in sse.split("\n"):
+        for line in sse.decode("ascii").split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found in SSE event")
 
-    @given(chunk=st.text(min_size=0, max_size=1000, alphabet=st.characters(blacklist_categories=["Cs"])))
+    @given(chunk=st.binary(min_size=0, max_size=1000))
     @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
-    def test_roundtrip_any_chunk(self, chunk: str) -> None:
+    def test_roundtrip_any_chunk(self, chunk: bytes) -> None:
         """Any raw chunk roundtrips correctly."""
         from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
 
@@ -372,7 +372,7 @@ class TestFuzzSSE:
             assert encryptor.counter == i + 1
             assert decryptor.expected_counter == i + 1
 
-            encrypted = encryptor.encrypt(f"event: test\ndata: {i}\n\n")
+            encrypted = encryptor.encrypt(f"event: test\ndata: {i}\n\n".encode())
             data = self._extract_data_field(encrypted)
             decryptor.decrypt(data)
 
@@ -396,8 +396,8 @@ class TestFuzzSSE:
         encryptor1 = SSEEncryptor(session1)
         encryptor2 = SSEEncryptor(session2)
 
-        sse1 = encryptor1.encrypt("event: test\ndata: same\n\n")
-        sse2 = encryptor2.encrypt("event: test\ndata: same\n\n")
+        sse1 = encryptor1.encrypt(b"event: test\ndata: same\n\n")
+        sse2 = encryptor2.encrypt(b"event: test\ndata: same\n\n")
 
         data1 = self._extract_data_field(sse1)
         data2 = self._extract_data_field(sse2)

@@ -25,9 +25,9 @@ class TestDecryptionErrors:
         )
 
     @staticmethod
-    def _extract_data_field(sse: str) -> str:
+    def _extract_data_field(sse: bytes) -> str:
         """Extract data field from encrypted SSE output."""
-        for line in sse.split("\n"):
+        for line in sse.decode("ascii").split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found")
@@ -59,7 +59,7 @@ class TestDecryptionErrors:
         decryptor = SSEDecryptor(session)
 
         # Encrypt valid chunk
-        encrypted = encryptor.encrypt("event: test\ndata: {}\n\n")
+        encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
         encoded = self._extract_data_field(encrypted)
 
         # Decode, corrupt, re-encode
@@ -80,7 +80,7 @@ class TestDecryptionErrors:
         encryptor = SSEEncryptor(session1)
         decryptor = SSEDecryptor(session2)
 
-        encrypted = encryptor.encrypt("event: test\ndata: {}\n\n")
+        encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
         encoded = self._extract_data_field(encrypted)
 
         with pytest.raises(DecryptionError, match="decryption failed"):
@@ -94,7 +94,7 @@ class TestDecryptionErrors:
         encryptor = SSEEncryptor(session1)
         decryptor = SSEDecryptor(session2)
 
-        encrypted = encryptor.encrypt("event: test\ndata: {}\n\n")
+        encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
         encoded = self._extract_data_field(encrypted)
 
         with pytest.raises(DecryptionError, match="decryption failed"):
@@ -108,9 +108,9 @@ class TestReplayOrderErrors:
         """Create a test session."""
         return StreamingSession(session_key=b"0" * 32, session_salt=b"salt")
 
-    def _extract_data(self, sse_event: str) -> str:
-        """Extract data field from SSE event string."""
-        for line in sse_event.split("\n"):
+    def _extract_data(self, sse_event: bytes) -> str:
+        """Extract data field from SSE event bytes."""
+        for line in sse_event.decode("ascii").split("\n"):
             if line.startswith("data:"):
                 return line.split(": ", 1)[1]
         raise ValueError("No data field found")
@@ -121,7 +121,7 @@ class TestReplayOrderErrors:
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
-        encrypted = encryptor.encrypt("event: test\ndata: {}\n\n")
+        encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
         data = self._extract_data(encrypted)
 
         # First decryption succeeds
@@ -141,8 +141,8 @@ class TestReplayOrderErrors:
         decryptor = SSEDecryptor(session)
 
         # Generate events 1 and 2
-        _event1 = encryptor.encrypt("event: first\n\n")
-        event2 = encryptor.encrypt("event: second\n\n")
+        _event1 = encryptor.encrypt(b"event: first\n\n")
+        event2 = encryptor.encrypt(b"event: second\n\n")
         data2 = self._extract_data(event2)
 
         # Try to decrypt event 2 first (expecting 1)
@@ -159,9 +159,9 @@ class TestReplayOrderErrors:
         decryptor = SSEDecryptor(session)
 
         # Generate events 1, 2, 3
-        event1 = encryptor.encrypt("event: one\n\n")
-        _event2 = encryptor.encrypt("event: two\n\n")
-        event3 = encryptor.encrypt("event: three\n\n")
+        event1 = encryptor.encrypt(b"event: one\n\n")
+        _event2 = encryptor.encrypt(b"event: two\n\n")
+        event3 = encryptor.encrypt(b"event: three\n\n")
 
         # Decrypt event 1
         decryptor.decrypt(self._extract_data(event1))
@@ -207,4 +207,4 @@ class TestCounterExhaustion:
         encryptor.counter = SSE_MAX_COUNTER + 1
 
         with pytest.raises(SessionExpiredError, match="counter exhausted"):
-            encryptor.encrypt("event: test\n\n")
+            encryptor.encrypt(b"event: test\n\n")

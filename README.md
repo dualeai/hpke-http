@@ -61,7 +61,8 @@ async with HPKEClientSession(
 ) as session:
     resp = await session.post("/chat", json={"prompt": "Hello"})
     async for chunk in session.iter_sse(resp):
-        print(chunk)  # Raw SSE: "event: progress\ndata: {...}\n\n"
+        # bytes - matches native aiohttp response.content iteration
+        print(chunk)  # b"event: progress\ndata: {...}\n\n"
 ```
 
 ## Documentation

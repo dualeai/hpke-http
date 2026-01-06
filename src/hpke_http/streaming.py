@@ -143,16 +143,20 @@ class SSEEncryptor:
         """
         return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
 
-    def encrypt(self, chunk: str) -> str:
+    # Pre-computed wire format parts (avoid repeated allocations)
+    _WIRE_PREFIX: bytes = b"event: enc\ndata: "
+    _WIRE_SUFFIX: bytes = b"\n\n"
+
+    def encrypt(self, chunk: bytes) -> bytes:
         """
         Encrypt a raw SSE chunk.
 
         Args:
-            chunk: Raw SSE chunk exactly as server would send it.
+            chunk: Raw SSE chunk as bytes, exactly as server would send it.
                    Can be event, comment, retry directive, or any valid SSE.
 
         Returns:
-            Encrypted SSE event string (event: enc, data: <encrypted>)
+            Encrypted SSE event as bytes (event: enc, data: <encrypted>)
 
         Raises:
             SessionExpiredError: If counter exhausted
@@ -161,12 +165,9 @@ class SSEEncryptor:
             if self.counter > SSE_MAX_COUNTER:
                 raise SessionExpiredError("SSE session counter exhausted")
 
-            # Encrypt raw chunk as-is (UTF-8 bytes)
-            plaintext = chunk.encode("utf-8")
-
             # Encrypt with counter nonce
             nonce = self._compute_nonce(self.counter)
-            ciphertext = self._cipher.encrypt(nonce, plaintext, associated_data=None)
+            ciphertext = self._cipher.encrypt(nonce, chunk, associated_data=None)
 
             # Wire format: counter_be32 || ciphertext
             payload = self.counter.to_bytes(SSE_COUNTER_SIZE, "big") + ciphertext
@@ -175,8 +176,8 @@ class SSEEncryptor:
             # Increment counter for next chunk
             self.counter += 1
 
-        # Format as encrypted SSE event
-        return f"event: enc\ndata: {encoded}\n\n"
+        # Format as encrypted SSE event (zero-copy concatenation)
+        return self._WIRE_PREFIX + encoded.encode("ascii") + self._WIRE_SUFFIX
 
 
 @dataclass
@@ -199,7 +200,7 @@ class SSEDecryptor:
         """Compute 12-byte nonce from salt and counter."""
         return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
 
-    def decrypt(self, sse_data: str) -> str:
+    def decrypt(self, sse_data: str) -> bytes:
         """
         Decrypt an SSE data field to recover the original chunk.
 
@@ -207,7 +208,7 @@ class SSEDecryptor:
             sse_data: base64url-encoded payload from SSE data field
 
         Returns:
-            Original raw SSE chunk exactly as server sent it
+            Original raw SSE chunk as bytes exactly as server sent it
 
         Raises:
             ReplayAttackError: If counter is out of order
@@ -240,5 +241,4 @@ class SSEDecryptor:
         # Increment expected counter
         self.expected_counter += 1
 
-        # Return raw chunk as string
-        return plaintext.decode("utf-8")
+        return plaintext

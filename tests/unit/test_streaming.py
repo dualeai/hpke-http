@@ -39,9 +39,9 @@ class TestSSEEncryption:
     """Test SSE chunk encryption/decryption."""
 
     @staticmethod
-    def _extract_data_field(sse: str) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.split("\n"):
+    def _extract_data_field(sse: bytes) -> str:
+        """Extract data field from encrypted SSE output (bytes)."""
+        for line in sse.decode("ascii").split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found in SSE event")
@@ -54,8 +54,8 @@ class TestSSEEncryption:
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
-        # Raw SSE chunk
-        original = 'event: progress\ndata: {"step": 1}\n\n'
+        # Raw SSE chunk (bytes)
+        original = b'event: progress\ndata: {"step": 1}\n\n'
 
         # Encrypt
         encrypted = encryptor.encrypt(original)
@@ -75,10 +75,10 @@ class TestSSEEncryption:
         decryptor = SSEDecryptor(session)
 
         chunks = [
-            "event: start\ndata: {}\n\n",
-            'event: progress\ndata: {"percent": 25}\n\n',
-            ":keepalive\n\n",  # Comment
-            'event: complete\ndata: {"result": "success"}\n\n',
+            b"event: start\ndata: {}\n\n",
+            b'event: progress\ndata: {"percent": 25}\n\n',
+            b":keepalive\n\n",  # Comment
+            b'event: complete\ndata: {"result": "success"}\n\n',
         ]
 
         for original in chunks:
@@ -96,8 +96,8 @@ class TestSSEEncryption:
         decryptor = SSEDecryptor(session)
 
         # Encrypt two chunks
-        enc1 = encryptor.encrypt("event: first\n\n")
-        enc2 = encryptor.encrypt("event: second\n\n")
+        enc1 = encryptor.encrypt(b"event: first\n\n")
+        enc2 = encryptor.encrypt(b"event: second\n\n")
 
         # Extract data fields
         data1 = self._extract_data_field(enc1)
@@ -119,9 +119,9 @@ class TestSSEEncryption:
         session = StreamingSession.create(key)
         encryptor = SSEEncryptor(session)
 
-        encrypted = encryptor.encrypt("event: test\ndata: {}\n\n")
+        encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
-        lines = encrypted.split("\n")
+        lines = encrypted.decode("ascii").split("\n")
         assert lines[0] == "event: enc"
         assert lines[1].startswith("data: ")
         assert lines[2] == ""  # Empty line for event boundary
@@ -131,9 +131,9 @@ class TestCounterBoundaries:
     """Test counter boundary conditions."""
 
     @staticmethod
-    def _extract_data_field(sse: str) -> str:
+    def _extract_data_field(sse: bytes) -> str:
         """Extract data field from encrypted SSE output."""
-        for line in sse.split("\n"):
+        for line in sse.decode("ascii").split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found")
@@ -147,7 +147,7 @@ class TestCounterBoundaries:
         session = StreamingSession.create(key)
         encryptor = SSEEncryptor(session)
 
-        encrypted = encryptor.encrypt("test")
+        encrypted = encryptor.encrypt(b"test")
         data = self._extract_data_field(encrypted)
         payload = b64url_decode(data)
 
@@ -164,7 +164,7 @@ class TestCounterBoundaries:
         encryptor = SSEEncryptor(session)
 
         for expected_counter in range(1, 6):
-            encrypted = encryptor.encrypt(f"chunk {expected_counter}")
+            encrypted = encryptor.encrypt(f"chunk {expected_counter}".encode())
             data = self._extract_data_field(encrypted)
             payload = b64url_decode(data)
             counter = int.from_bytes(payload[:SSE_COUNTER_SIZE], "big")
@@ -183,12 +183,12 @@ class TestCounterBoundaries:
         encryptor.counter = SSE_MAX_COUNTER
 
         # This should work (counter == max)
-        encrypted = encryptor.encrypt("at max")
-        assert "data:" in encrypted
+        encrypted = encryptor.encrypt(b"at max")
+        assert b"data:" in encrypted
 
         # Next one should fail (counter > max)
         with pytest.raises(SessionExpiredError):
-            encryptor.encrypt("over max")
+            encryptor.encrypt(b"over max")
 
 
 class TestSessionSaltRandomness:
@@ -211,9 +211,9 @@ class TestPayloadVariations:
     """Test various payload types and sizes."""
 
     @staticmethod
-    def _extract_data_field(sse: str) -> str:
+    def _extract_data_field(sse: bytes) -> str:
         """Extract data field from encrypted SSE output."""
-        for line in sse.split("\n"):
+        for line in sse.decode("ascii").split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found")
@@ -227,7 +227,7 @@ class TestPayloadVariations:
 
         # Create ~100KB chunk
         large_data = "x" * 100000
-        original = f"event: large\ndata: {large_data}\n\n"
+        original = f"event: large\ndata: {large_data}\n\n".encode()
 
         encrypted = encryptor.encrypt(original)
         data = self._extract_data_field(encrypted)
@@ -242,7 +242,7 @@ class TestPayloadVariations:
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
-        original = "event: unicode\ndata: 你好世界 🔐 مرحبا\n\n"
+        original = "event: unicode\ndata: 你好世界 🔐 مرحبا\n\n".encode()
 
         encrypted = encryptor.encrypt(original)
         data = self._extract_data_field(encrypted)
@@ -251,13 +251,13 @@ class TestPayloadVariations:
         assert decrypted == original
 
     def test_empty_chunk(self) -> None:
-        """Empty string should work."""
+        """Empty bytes should work."""
         key = b"0" * 32
         session = StreamingSession.create(key)
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
-        original = ""
+        original = b""
 
         encrypted = encryptor.encrypt(original)
         data = self._extract_data_field(encrypted)
@@ -272,7 +272,7 @@ class TestPayloadVariations:
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
-        original = ":keepalive\n\n"
+        original = b":keepalive\n\n"
 
         encrypted = encryptor.encrypt(original)
         data = self._extract_data_field(encrypted)
@@ -287,7 +287,7 @@ class TestPayloadVariations:
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
-        original = "retry: 5000\n\n"
+        original = b"retry: 5000\n\n"
 
         encrypted = encryptor.encrypt(original)
         data = self._extract_data_field(encrypted)
@@ -304,7 +304,7 @@ class TestPayloadVariations:
 
         # Note: The chunk itself has controlled line endings,
         # but the data can contain escaped special chars
-        original = 'event: special\ndata: {"msg": "line1\\nline2\\ttab"}\n\n'
+        original = b'event: special\ndata: {"msg": "line1\\nline2\\ttab"}\n\n'
 
         encrypted = encryptor.encrypt(original)
         data = self._extract_data_field(encrypted)
@@ -317,9 +317,9 @@ class TestEventVolume:
     """Test high volume of events."""
 
     @staticmethod
-    def _extract_data_field(sse: str) -> str:
+    def _extract_data_field(sse: bytes) -> str:
         """Extract data field from encrypted SSE output."""
-        for line in sse.split("\n"):
+        for line in sse.decode("ascii").split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found")
@@ -332,7 +332,7 @@ class TestEventVolume:
         decryptor = SSEDecryptor(session)
 
         for i in range(100):
-            original = f"event: item\ndata: {i}\n\n"
+            original = f"event: item\ndata: {i}\n\n".encode()
             encrypted = encryptor.encrypt(original)
             data = self._extract_data_field(encrypted)
             decrypted = decryptor.decrypt(data)
@@ -346,7 +346,7 @@ class TestEventVolume:
         decryptor = SSEDecryptor(session)
 
         for i in range(1000):
-            original = f"event: bulk\ndata: {i}\n\n"
+            original = f"event: bulk\ndata: {i}\n\n".encode()
             encrypted = encryptor.encrypt(original)
             data = self._extract_data_field(encrypted)
             decrypted = decryptor.decrypt(data)

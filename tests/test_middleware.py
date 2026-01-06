@@ -22,19 +22,20 @@ import pytest
 from hpke_http.middleware.aiohttp import HPKEClientSession
 
 
-def parse_sse_chunk(chunk: str) -> tuple[str | None, dict[str, Any] | None]:
+def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
     """Parse a raw SSE chunk into (event_type, data).
 
     Args:
-        chunk: Raw SSE chunk string (e.g., "event: progress\\ndata: {...}\\n\\n")
+        chunk: Raw SSE chunk bytes (e.g., b"event: progress\\ndata: {...}\\n\\n")
 
     Returns:
         Tuple of (event_type, parsed_data) or (None, None) for comments
     """
     event_type = None
     data = None
+    chunk_str = chunk.decode("utf-8")
 
-    for line in re.split(r"\r\n|\r|\n", chunk):
+    for line in re.split(r"\r\n|\r|\n", chunk_str):
         if not line or line.startswith(":"):
             continue
         if ":" in line:

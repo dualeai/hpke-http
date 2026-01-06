@@ -71,8 +71,8 @@ class SSEEncryptionState:
     encryptor: SSEEncryptor | None = None
     """SSE encryptor instance, set when SSE response detected."""
 
-    buffer: str = field(default="")
-    """Buffer for incomplete SSE events awaiting boundary detection."""
+    buffer: bytearray = field(default_factory=bytearray)
+    """Buffer for incomplete SSE events awaiting boundary detection (zero-copy)."""
 
 
 # Type alias for PSK resolver callback
@@ -178,9 +178,9 @@ class HPKEMiddleware:
         # Per-request state (closure)
         state = SSEEncryptionState()
 
-        # WHATWG-compliant event boundary: two consecutive line endings
+        # WHATWG-compliant event boundary: two consecutive line endings (bytes pattern)
         # Handles \n\n, \r\r, \r\n\r\n, and mixed combinations
-        event_boundary = re.compile(r"(?:\r\n|\r(?!\n)|\n)(?:\r\n|\r(?!\n)|\n)")
+        event_boundary = re.compile(rb"(?:\r\n|\r(?!\n)|\n)(?:\r\n|\r(?!\n)|\n)")
 
         async def encrypting_send(message: dict[str, Any]) -> None:
             msg_type = message["type"]
@@ -223,30 +223,31 @@ class HPKEMiddleware:
                 await send(message)
                 return
 
-            body = message.get("body", b"")
+            body: bytes = message.get("body", b"")
             more_body = message.get("more_body", False)
             encryptor = state.encryptor
             if encryptor is None:  # Should never happen when is_sse=True
                 raise CryptoError("SSE encryption state corrupted: encryptor is None")
 
-            # Add to buffer (decode UTF-8, replace invalid chars)
+            # Add to buffer (zero-copy extend)
             if body:
-                decoded = body.decode("utf-8", errors="replace")
                 # Enforce buffer size limit to prevent DoS
-                if len(state.buffer) + len(decoded) > self.max_sse_event_size:
+                if len(state.buffer) + len(body) > self.max_sse_event_size:
                     # Force flush oversized buffer as partial event
                     if state.buffer:
-                        encrypted = encryptor.encrypt(state.buffer)
+                        encrypted = encryptor.encrypt(bytes(state.buffer))
                         await send(
                             {
                                 "type": "http.response.body",
-                                "body": encrypted.encode(),
+                                "body": encrypted,
                                 "more_body": True,
                             }
                         )
-                    state.buffer = decoded[-self.max_sse_event_size :]  # Keep tail
+                        state.buffer.clear()
+                    # Keep tail that fits
+                    state.buffer.extend(body[-self.max_sse_event_size :])
                 else:
-                    state.buffer += decoded
+                    state.buffer.extend(body)
 
             # Extract and encrypt complete events
             sent_any = await _extract_and_send_events(encryptor, more_body=more_body)
@@ -265,8 +266,8 @@ class HPKEMiddleware:
 
                 # Extract complete event (including boundary)
                 event_end = match.end()
-                chunk = state.buffer[:event_end]
-                state.buffer = state.buffer[event_end:]
+                chunk = bytes(state.buffer[:event_end])
+                del state.buffer[:event_end]  # Zero-copy delete from front
 
                 # Send with more_body=False only if final message AND buffer empty
                 is_final = not more_body and not state.buffer
@@ -274,7 +275,7 @@ class HPKEMiddleware:
                 await send(
                     {
                         "type": "http.response.body",
-                        "body": encrypted.encode(),
+                        "body": encrypted,
                         "more_body": not is_final,
                     }
                 )
@@ -285,11 +286,11 @@ class HPKEMiddleware:
             """Handle end of stream - flush buffer or send empty body."""
             if state.buffer:
                 # Flush remaining buffer (partial event)
-                encrypted = encryptor.encrypt(state.buffer)
+                encrypted = encryptor.encrypt(bytes(state.buffer))
                 await send(
                     {
                         "type": "http.response.body",
-                        "body": encrypted.encode(),
+                        "body": encrypted,
                         "more_body": False,
                     }
                 )
@@ -371,17 +372,17 @@ class HPKEMiddleware:
         except Exception as e:
             raise DecryptionError(f"Invalid {HEADER_HPKE_ENC} header encoding") from e
 
-        # Collect encrypted body
-        body_chunks: list[bytes] = []
+        # Collect encrypted body (zero-copy with bytearray)
+        body_buffer = bytearray()
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
                 raise DecryptionError("Client disconnected before sending body")
-            body_chunks.append(message.get("body", b""))
+            body_buffer.extend(message.get("body", b""))
             if not message.get("more_body", False):
                 break
 
-        encrypted_body = b"".join(body_chunks)
+        encrypted_body = bytes(body_buffer)
 
         # Parse envelope
         try:

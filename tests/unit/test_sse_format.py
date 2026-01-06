@@ -13,9 +13,9 @@ class TestSSEOutputFormat:
     """Test SSEEncryptor output format compliance."""
 
     @staticmethod
-    def _extract_data_field(sse: str) -> str:
+    def _extract_data_field(sse: bytes) -> str:
         """Extract data field from encrypted SSE output."""
-        for line in sse.split("\n"):
+        for line in sse.decode("ascii").split("\n"):
             if line.startswith("data: "):
                 return line[6:]
         raise ValueError("No data field found")
@@ -26,10 +26,10 @@ class TestSSEOutputFormat:
         session = StreamingSession.create(key)
         encryptor = SSEEncryptor(session)
 
-        encrypted = encryptor.encrypt("event: test\ndata: {}\n\n")
+        encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
         # Should be: event: enc\ndata: ...\n\n
-        lines = encrypted.split("\n")
+        lines = encrypted.decode("ascii").split("\n")
         assert lines[0] == "event: enc"
         assert lines[1].startswith("data: ")
         assert lines[2] == ""
@@ -41,12 +41,12 @@ class TestSSEOutputFormat:
         session = StreamingSession.create(key)
         encryptor = SSEEncryptor(session)
 
-        encrypted = encryptor.encrypt("event: test\n\n")
+        encrypted = encryptor.encrypt(b"event: test\n\n")
 
         # Should not contain CR
-        assert "\r" not in encrypted
+        assert b"\r" not in encrypted
         # Should contain LF
-        assert "\n" in encrypted
+        assert b"\n" in encrypted
 
     def test_sse_event_boundary(self) -> None:
         """SSE event should end with \\n\\n."""
@@ -54,9 +54,9 @@ class TestSSEOutputFormat:
         session = StreamingSession.create(key)
         encryptor = SSEEncryptor(session)
 
-        encrypted = encryptor.encrypt("event: test\n\n")
+        encrypted = encryptor.encrypt(b"event: test\n\n")
 
-        assert encrypted.endswith("\n\n")
+        assert encrypted.endswith(b"\n\n")
 
     def test_sse_data_is_base64url(self) -> None:
         """Data field should be valid base64url."""
@@ -64,7 +64,7 @@ class TestSSEOutputFormat:
         session = StreamingSession.create(key)
         encryptor = SSEEncryptor(session)
 
-        encrypted = encryptor.encrypt("event: test\ndata: {}\n\n")
+        encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
         # Extract data field
         data = self._extract_data_field(encrypted)
@@ -84,13 +84,13 @@ class TestSSEOutputFormat:
 
         # Different content types
         for content in [
-            "event: start\n\n",
-            "event: progress\ndata: {}\n\n",
-            ":keepalive\n\n",
-            "retry: 5000\n\n",
+            b"event: start\n\n",
+            b"event: progress\ndata: {}\n\n",
+            b":keepalive\n\n",
+            b"retry: 5000\n\n",
         ]:
             encrypted = encryptor.encrypt(content)
-            assert "event: enc\n" in encrypted
+            assert b"event: enc\n" in encrypted
 
     def test_raw_passthrough_preserves_content(self) -> None:
         """Raw content should roundtrip exactly."""
@@ -103,11 +103,11 @@ class TestSSEOutputFormat:
 
         # Various SSE chunk types
         chunks = [
-            "event: test\ndata: hello\n\n",
-            ":keepalive comment\n\n",
-            "retry: 5000\n\n",
-            'id: 123\nevent: msg\ndata: {"foo": "bar"}\n\n',
-            "",  # Empty chunk
+            b"event: test\ndata: hello\n\n",
+            b":keepalive comment\n\n",
+            b"retry: 5000\n\n",
+            b'id: 123\nevent: msg\ndata: {"foo": "bar"}\n\n',
+            b"",  # Empty chunk
         ]
 
         for original in chunks:
