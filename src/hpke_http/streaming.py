@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -123,11 +124,13 @@ class SSEEncryptor:
     Server-side SSE event encryptor.
 
     Encrypts events with monotonic counter for replay protection.
+    Thread-safe: uses a lock to protect counter operations.
     """
 
     session: StreamingSession
     counter: int = field(default=1)  # Start at 1 (0 reserved)
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
+    _lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         self._cipher = ChaCha20Poly1305(self.session.session_key)
@@ -160,24 +163,25 @@ class SSEEncryptor:
         Raises:
             SessionExpiredError: If counter exhausted
         """
-        if self.counter > SSE_MAX_COUNTER:
-            raise SessionExpiredError("SSE session counter exhausted")
+        with self._lock:
+            if self.counter > SSE_MAX_COUNTER:
+                raise SessionExpiredError("SSE session counter exhausted")
 
-        # Build plaintext: {"t": type, "d": data}
-        plaintext = json.dumps({"t": event_type, "d": data}, separators=(",", ":")).encode()
+            # Build plaintext: {"t": type, "d": data}
+            plaintext = json.dumps({"t": event_type, "d": data}, separators=(",", ":")).encode()
 
-        # Encrypt with counter nonce
-        nonce = self._compute_nonce(self.counter)
-        ciphertext = self._cipher.encrypt(nonce, plaintext, associated_data=None)
+            # Encrypt with counter nonce
+            nonce = self._compute_nonce(self.counter)
+            ciphertext = self._cipher.encrypt(nonce, plaintext, associated_data=None)
 
-        # Wire format: counter_be32 || ciphertext
-        payload = self.counter.to_bytes(SSE_COUNTER_SIZE, "big") + ciphertext
-        encoded = b64url_encode(payload)
+            # Wire format: counter_be32 || ciphertext
+            payload = self.counter.to_bytes(SSE_COUNTER_SIZE, "big") + ciphertext
+            encoded = b64url_encode(payload)
 
-        # Increment counter for next event
-        self.counter += 1
+            # Increment counter for next event
+            self.counter += 1
 
-        # Format as SSE
+        # Format as SSE (outside lock - no shared state modified)
         lines: list[str] = []
         if event_id is not None:
             lines.append(f"id: {event_id}")

@@ -21,6 +21,8 @@ CFRG_PSK := $(VECTORS_DIR)/rfc9180_psk_x25519_chacha.json
 WYCHEPROOF_BASE := https://raw.githubusercontent.com/C2SP/wycheproof/master/testvectors_v1
 WYCHEPROOF_X25519 := $(VECTORS_DIR)/wycheproof_x25519.json
 WYCHEPROOF_CHACHA := $(VECTORS_DIR)/wycheproof_chacha20_poly1305.json
+WYCHEPROOF_HKDF := $(VECTORS_DIR)/wycheproof_hkdf_sha256.json
+WYCHEPROOF_HMAC := $(VECTORS_DIR)/wycheproof_hmac_sha256.json
 
 upgrade:
 	uv lock --upgrade --refresh
@@ -51,12 +53,18 @@ download-vectors-wycheproof:
 	@mkdir -p $(VECTORS_DIR)
 	@curl -sL "$(WYCHEPROOF_BASE)/x25519_test.json" -o $(WYCHEPROOF_X25519)
 	@curl -sL "$(WYCHEPROOF_BASE)/chacha20_poly1305_test.json" -o $(WYCHEPROOF_CHACHA)
+	@curl -sL "$(WYCHEPROOF_BASE)/hkdf_sha256_test.json" -o $(WYCHEPROOF_HKDF)
+	@curl -sL "$(WYCHEPROOF_BASE)/hmac_sha256_test.json" -o $(WYCHEPROOF_HMAC)
 	@uv run python -c "\
 import json; \
 x = json.load(open('$(WYCHEPROOF_X25519)')); \
 c = json.load(open('$(WYCHEPROOF_CHACHA)')); \
+h = json.load(open('$(WYCHEPROOF_HKDF)')); \
+m = json.load(open('$(WYCHEPROOF_HMAC)')); \
 print(f'  X25519: {sum(len(g[\"tests\"]) for g in x[\"testGroups\"])} tests'); \
-print(f'  ChaCha20-Poly1305: {sum(len(g[\"tests\"]) for g in c[\"testGroups\"])} tests')"
+print(f'  ChaCha20-Poly1305: {sum(len(g[\"tests\"]) for g in c[\"testGroups\"])} tests'); \
+print(f'  HKDF-SHA256: {sum(len(g[\"tests\"]) for g in h[\"testGroups\"])} tests'); \
+print(f'  HMAC-SHA256: {sum(len(g[\"tests\"]) for g in m[\"testGroups\"])} tests')"
 
 test:
 	$(MAKE) test-static

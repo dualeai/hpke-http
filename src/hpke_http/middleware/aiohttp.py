@@ -19,6 +19,7 @@ import asyncio
 import json as json_module
 import time
 import types
+import weakref
 from collections.abc import AsyncIterator
 from http import HTTPStatus
 from typing import Any, ClassVar
@@ -87,8 +88,10 @@ class HPKEClientSession:
         self._aiohttp_kwargs = aiohttp_kwargs
         self._platform_keys: dict[KemId, bytes] | None = None
 
-        # Current request context for SSE decryption
-        self._current_sender_ctx: SenderContext | None = None
+        # Maps responses to their sender contexts for SSE decryption (thread-safe for concurrent requests)
+        self._response_contexts: weakref.WeakKeyDictionary[aiohttp.ClientResponse, SenderContext] = (
+            weakref.WeakKeyDictionary()
+        )
 
     @classmethod
     def _get_cache_lock(cls) -> asyncio.Lock:
@@ -255,17 +258,22 @@ class HPKEClientSession:
 
         # Encrypt if we have a body
         headers = dict(kwargs.pop("headers", {}))
+        sender_ctx: SenderContext | None = None
         if body:
             encrypted_body, enc_header, ctx = await self._encrypt_request(body)
             headers[HEADER_HPKE_ENC] = enc_header
             headers["Content-Type"] = "application/octet-stream"
-            self._current_sender_ctx = ctx
+            sender_ctx = ctx
             kwargs["data"] = encrypted_body
-        else:
-            self._current_sender_ctx = None
 
         kwargs["headers"] = headers
-        return await self._session.request(method, url, **kwargs)
+        response = await self._session.request(method, url, **kwargs)
+
+        # Store context per-response for concurrent request safety
+        if sender_ctx:
+            self._response_contexts[response] = sender_ctx
+
+        return response
 
     # Convenience methods
     async def get(self, url: str, **kwargs: Any) -> aiohttp.ClientResponse:
@@ -311,8 +319,9 @@ class HPKEClientSession:
         Yields:
             Tuples of (event_type, event_data)
         """
-        if not self._current_sender_ctx:
-            raise RuntimeError("No encryption context. Was the request encrypted?")
+        sender_ctx = self._response_contexts.get(response)
+        if not sender_ctx:
+            raise RuntimeError("No encryption context for this response. Was the request encrypted?")
 
         # Get session parameters from header
         stream_header = response.headers.get(HEADER_HPKE_STREAM)
@@ -320,7 +329,7 @@ class HPKEClientSession:
             raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
 
         # Derive session key from sender context
-        session_key = self._current_sender_ctx.export(b"sse-session-key", 32)
+        session_key = sender_ctx.export(b"sse-session-key", 32)
         session_params = b64url_decode(stream_header)
         session = StreamingSession.deserialize(session_params, session_key)
         decryptor = SSEDecryptor(session)

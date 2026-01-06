@@ -27,7 +27,11 @@ from hpke_http.constants import (
 from hpke_http.exceptions import InvalidPSKError, SequenceOverflowError
 from hpke_http.primitives.aead import aead_open, aead_seal, compute_nonce
 from hpke_http.primitives.kdf import labeled_expand, labeled_extract
-from hpke_http.primitives.kem import decap, encap, encap_deterministic
+from hpke_http.primitives.kem import (
+    _encap_deterministic,  # pyright: ignore[reportPrivateUsage] - internal package use
+    decap,
+    encap,
+)
 
 __all__ = [
     "HPKEContext",
@@ -159,7 +163,7 @@ def _verify_psk_inputs(psk: bytes, psk_id: bytes) -> None:
     if not psk or not psk_id:
         raise InvalidPSKError("PSK mode requires both psk and psk_id to be non-empty")
     if len(psk) < PSK_MIN_SIZE:
-        raise InvalidPSKError(f"PSK must be at least {PSK_MIN_SIZE} bytes (256 bits), got {len(psk)} bytes")
+        raise InvalidPSKError("PSK does not meet minimum security requirements")
 
 
 def _key_schedule_psk(
@@ -241,7 +245,7 @@ def setup_sender_psk(
     )
 
 
-def setup_sender_psk_deterministic(
+def _setup_sender_psk_deterministic(  # pyright: ignore[reportUnusedFunction]
     pk_r: bytes,
     info: bytes,
     psk: bytes,
@@ -263,7 +267,7 @@ def setup_sender_psk_deterministic(
     Returns:
         SenderContext with deterministic enc
     """
-    enc, shared_secret = encap_deterministic(pk_r, sk_e)
+    enc, shared_secret = _encap_deterministic(pk_r, sk_e)
     key, base_nonce, exporter_secret = _key_schedule_psk(shared_secret, info, psk, psk_id)
 
     return SenderContext(

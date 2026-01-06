@@ -8,7 +8,6 @@ requires-python = ">=3.10"
 dependencies = [
     # Shared libs are explicitly not included in the deps, they are installed separatly, see "make install-libs"
     "cryptography~=46.0",
-    "pydantic~=2.10",
 ]
 
 [project.optional-dependencies]
@@ -31,11 +30,11 @@ testing = [
 ]
 # FastAPI middleware (optional for server-side)
 fastapi = [
-    "starlette~=0.41",
+    "starlette~=0.50",  # Upgraded from ~=0.41 for security fixes
 ]
 # aiohttp client (optional for client-side)
 aiohttp = [
-    "aiohttp~=3.11",
+    "aiohttp~=3.13",  # Upgraded from ~=3.11 for security fixes
 ]
 
 [project.urls]
@@ -43,7 +42,7 @@ Homepage = "https://github.com/dualeai/hpke-http"
 Documentation = "https://github.com/dualeai/hpke-http#readme"
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=78.1.1"]  # Pinned for CVE-2025-47273
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -119,8 +118,6 @@ ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use se
 "tests/**/test_rfc9180*.py" = ["SLF001"]  # Vector tests need internal state access
 "tests/**/test_fuzz.py" = ["SLF001"]  # Fuzz tests need internal state access for overflow testing
 "tests/**/test_aiohttp_client.py" = ["SLF001"]  # Unit tests for private parsing methods
-"src/hpke_http/primitives/kem.py" = ["S101"]  # Security validation asserts in KEM
-"src/hpke_http/primitives/aead.py" = ["S101"]  # Security validation asserts in AEAD
 
 [tool.vulture]
 exclude = [".venv/"]  # Exclude deps

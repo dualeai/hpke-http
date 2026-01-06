@@ -110,8 +110,12 @@ def encap(pk_r: bytes) -> tuple[bytes, bytes]:
         Tuple of (enc, shared_secret):
         - enc: Encapsulated key (ephemeral public key, 32 bytes)
         - shared_secret: Derived shared secret (32 bytes)
+
+    Raises:
+        ValueError: If public key size is invalid
     """
-    assert len(pk_r) == X25519_PUBLIC_KEY_SIZE, f"Invalid public key size: {len(pk_r)}"
+    if len(pk_r) != X25519_PUBLIC_KEY_SIZE:
+        raise ValueError(f"Invalid public key size: expected {X25519_PUBLIC_KEY_SIZE}, got {len(pk_r)}")
 
     # Generate ephemeral keypair
     sk_e, pk_e = generate_keypair()
@@ -133,7 +137,7 @@ def encap(pk_r: bytes) -> tuple[bytes, bytes]:
     return (enc, shared_secret)
 
 
-def encap_deterministic(pk_r: bytes, sk_e: bytes) -> tuple[bytes, bytes]:
+def _encap_deterministic(pk_r: bytes, sk_e: bytes) -> tuple[bytes, bytes]:  # pyright: ignore[reportUnusedFunction]
     """
     Deterministic Encap for testing with known ephemeral key.
 
@@ -145,9 +149,14 @@ def encap_deterministic(pk_r: bytes, sk_e: bytes) -> tuple[bytes, bytes]:
 
     Returns:
         Tuple of (enc, shared_secret)
+
+    Raises:
+        ValueError: If key sizes are invalid
     """
-    assert len(pk_r) == X25519_PUBLIC_KEY_SIZE
-    assert len(sk_e) == X25519_PRIVATE_KEY_SIZE
+    if len(pk_r) != X25519_PUBLIC_KEY_SIZE:
+        raise ValueError(f"Invalid public key size: expected {X25519_PUBLIC_KEY_SIZE}, got {len(pk_r)}")
+    if len(sk_e) != X25519_PRIVATE_KEY_SIZE:
+        raise ValueError(f"Invalid private key size: expected {X25519_PRIVATE_KEY_SIZE}, got {len(sk_e)}")
 
     # Load keys
     ephemeral_private = x25519.X25519PrivateKey.from_private_bytes(sk_e)
@@ -176,9 +185,14 @@ def decap(enc: bytes, sk_r: bytes) -> bytes:
 
     Returns:
         Derived shared secret (32 bytes)
+
+    Raises:
+        ValueError: If enc or sk_r size is invalid
     """
-    assert len(enc) == X25519_ENC_SIZE, f"Invalid enc size: {len(enc)}"
-    assert len(sk_r) == X25519_PRIVATE_KEY_SIZE, f"Invalid private key size: {len(sk_r)}"
+    if len(enc) != X25519_ENC_SIZE:
+        raise ValueError(f"Invalid enc size: expected {X25519_ENC_SIZE}, got {len(enc)}")
+    if len(sk_r) != X25519_PRIVATE_KEY_SIZE:
+        raise ValueError(f"Invalid private key size: expected {X25519_PRIVATE_KEY_SIZE}, got {len(sk_r)}")
 
     # Load keys
     recipient_private = x25519.X25519PrivateKey.from_private_bytes(sk_r)

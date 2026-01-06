@@ -76,4 +76,5 @@ class ReplayAttackError(CryptoError):
     def __init__(self, expected: int, received: int) -> None:
         self.expected = expected
         self.received = received
-        super().__init__(f"Replay attack: expected counter {expected}, got {received}")
+        # Don't expose counter values in message to prevent information leakage
+        super().__init__("SSE event counter validation failed")

@@ -38,8 +38,12 @@ def compute_nonce(base_nonce: bytes, seq: int) -> bytes:
 
     Returns:
         Computed nonce (12 bytes)
+
+    Raises:
+        ValueError: If base_nonce is not 12 bytes
     """
-    assert len(base_nonce) == CHACHA20_POLY1305_NONCE_SIZE
+    if len(base_nonce) != CHACHA20_POLY1305_NONCE_SIZE:
+        raise ValueError(f"Invalid base_nonce size: expected {CHACHA20_POLY1305_NONCE_SIZE}, got {len(base_nonce)}")
 
     # Convert seq to bytes (big-endian, same size as nonce)
     seq_bytes = seq.to_bytes(CHACHA20_POLY1305_NONCE_SIZE, "big")
@@ -67,9 +71,14 @@ def aead_seal(
 
     Returns:
         Ciphertext with appended authentication tag (len = plaintext + 16)
+
+    Raises:
+        ValueError: If key or nonce size is invalid
     """
-    assert len(key) == CHACHA20_POLY1305_KEY_SIZE, f"Invalid key size: {len(key)}"
-    assert len(nonce) == CHACHA20_POLY1305_NONCE_SIZE, f"Invalid nonce size: {len(nonce)}"
+    if len(key) != CHACHA20_POLY1305_KEY_SIZE:
+        raise ValueError(f"Invalid key size: expected {CHACHA20_POLY1305_KEY_SIZE}, got {len(key)}")
+    if len(nonce) != CHACHA20_POLY1305_NONCE_SIZE:
+        raise ValueError(f"Invalid nonce size: expected {CHACHA20_POLY1305_NONCE_SIZE}, got {len(nonce)}")
 
     cipher = ChaCha20Poly1305(key)
     return cipher.encrypt(nonce, plaintext, aad if aad else None)
@@ -96,10 +105,13 @@ def aead_open(
         Decrypted plaintext
 
     Raises:
+        ValueError: If key or nonce size is invalid
         DecryptionError: If authentication fails or ciphertext is invalid
     """
-    assert len(key) == CHACHA20_POLY1305_KEY_SIZE, f"Invalid key size: {len(key)}"
-    assert len(nonce) == CHACHA20_POLY1305_NONCE_SIZE, f"Invalid nonce size: {len(nonce)}"
+    if len(key) != CHACHA20_POLY1305_KEY_SIZE:
+        raise ValueError(f"Invalid key size: expected {CHACHA20_POLY1305_KEY_SIZE}, got {len(key)}")
+    if len(nonce) != CHACHA20_POLY1305_NONCE_SIZE:
+        raise ValueError(f"Invalid nonce size: expected {CHACHA20_POLY1305_NONCE_SIZE}, got {len(nonce)}")
 
     if len(ciphertext) < CHACHA20_POLY1305_TAG_SIZE:
         raise DecryptionError("Ciphertext too short (missing authentication tag)")

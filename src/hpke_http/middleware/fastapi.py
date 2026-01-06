@@ -128,8 +128,9 @@ class HPKEMiddleware:
         try:
             decrypted_receive = await self._create_decrypted_receive(scope, receive, enc_header)
             await self.app(scope, decrypted_receive, send)
-        except CryptoError as e:
-            await self._send_error(send, 400, str(e))
+        except CryptoError:
+            # Don't expose internal error details to clients
+            await self._send_error(send, 400, "Request decryption failed")
 
     async def _handle_discovery(
         self,

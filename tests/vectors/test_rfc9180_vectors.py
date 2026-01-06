@@ -19,8 +19,8 @@ from typing import Any
 import pytest
 
 from hpke_http.hpke import (
+    _setup_sender_psk_deterministic,  # pyright: ignore[reportPrivateUsage] - test access
     setup_recipient_psk,
-    setup_sender_psk_deterministic,
 )
 
 
@@ -68,7 +68,7 @@ class TestRFC9180Vectors:
         expected_exporter_secret = bytes.fromhex(vector["exporter_secret"])
 
         # Run deterministic setup
-        ctx = setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
+        ctx = _setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
 
         # Validate all outputs match
         assert ctx.enc == expected_enc, "enc mismatch"
@@ -109,7 +109,7 @@ class TestRFC9180Vectors:
         psk_id = bytes.fromhex(vector["psk_id"])
 
         # Setup sender with deterministic ephemeral key
-        sender_ctx = setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
+        sender_ctx = _setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
 
         # Setup recipient
         recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, info, psk, psk_id)
@@ -146,7 +146,7 @@ class TestRFC9180Vectors:
         psk_id = bytes.fromhex(vector["psk_id"])
 
         # Setup contexts
-        sender_ctx = setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
+        sender_ctx = _setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
         recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, info, psk, psk_id)
 
         # Test each encryption
@@ -182,7 +182,7 @@ class TestRFC9180Vectors:
         psk_id = bytes.fromhex(vector["psk_id"])
 
         # Both sides should derive same key schedule
-        sender_ctx = setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
+        sender_ctx = _setup_sender_psk_deterministic(pk_r, info, psk, psk_id, sk_e)
         recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, info, psk, psk_id)
 
         assert sender_ctx.key == recipient_ctx.key
