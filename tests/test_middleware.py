@@ -18,6 +18,7 @@ from typing import Any
 
 import aiohttp
 import pytest
+from typing_extensions import assert_type
 
 from hpke_http.middleware.aiohttp import HPKEClientSession
 
@@ -300,3 +301,20 @@ class TestSSEEncryption:
         assert event_type == "complete"
         assert event_data is not None
         assert event_data["count"] == 50
+
+    async def test_iter_sse_yields_bytes(self, hpke_client: HPKEClientSession) -> None:
+        """iter_sse must yield bytes (matches native aiohttp response.content).
+
+        This is a type contract test - ensures API doesn't accidentally change.
+        Static: assert_type checked by pyright at type-check time.
+        Runtime: isinstance checked by pytest at test time.
+        """
+        resp = await hpke_client.post("/stream", json={"start": True})
+        assert resp.status == 200
+
+        async for chunk in hpke_client.iter_sse(resp):
+            # Static assertion - pyright validates this matches the type annotation
+            assert_type(chunk, bytes)
+            # Runtime assertion - catches any mismatch at test time
+            assert isinstance(chunk, bytes), f"Expected bytes, got {type(chunk).__name__}"
+            break  # Only need to check first chunk

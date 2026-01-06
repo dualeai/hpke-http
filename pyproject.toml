@@ -21,6 +21,7 @@ dev = [
     "pytest-xdist[psutil]~=3.8",
     "pytest~=8.3",
     "ruff~=0.7",
+    "typing_extensions~=4.12",   # assert_type for API contract tests (Python 3.10)
     "vulture~=2.14",
 ]
 # For downstream services using testing fixtures

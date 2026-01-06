@@ -701,6 +701,7 @@ dev = [
     { name = "pytest-mock" },
     { name = "pytest-xdist", extra = ["psutil"] },
     { name = "ruff" },
+    { name = "typing-extensions" },
     { name = "vulture" },
 ]
 fastapi = [
@@ -727,6 +728,7 @@ requires-dist = [
     { name = "pytest-xdist", extras = ["psutil"], marker = "extra == 'dev'", specifier = "~=3.8" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "~=0.7" },
     { name = "starlette", marker = "extra == 'fastapi'", specifier = "~=0.50" },
+    { name = "typing-extensions", marker = "extra == 'dev'", specifier = "~=4.12" },
     { name = "vulture", marker = "extra == 'dev'", specifier = "~=2.14" },
 ]
 provides-extras = ["dev", "testing", "fastapi", "aiohttp"]
