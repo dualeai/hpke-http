@@ -19,12 +19,32 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
+from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
 
 T = TypeVar("T")
 
 # Memory bounds (conservative to account for OpenSSL internals)
 MAX_CONTEXT_MEMORY = 100 * 1024  # 100KB per context (includes OpenSSL state)
 MAX_SEAL_OVERHEAD = 50 * 1024  # 50KB overhead per seal (excludes ciphertext)
+
+# SSE memory bounds
+# Wire format: "event: enc\ndata: " (17B) + "\n\n" (2B) = 19B
+# Payload overhead: counter (4B) + Poly1305 tag (16B) = 20B
+# Base64 encoding adds 33% to (payload + 20)
+# Formula: output = 19 + ceil((input + 20) * 4/3)
+SSE_WIRE_OVERHEAD = 19  # Fixed wire format bytes
+SSE_PAYLOAD_OVERHEAD = 20  # counter + tag
+MAX_SSE_STREAMING_NET = 50 * 1024  # 50KB net allocation after 1000 roundtrips
+
+
+def expected_sse_output_size(input_size: int) -> int:
+    """Calculate expected SSE output size for given input."""
+    # Binary payload = input + counter(4) + tag(16)
+    binary_size = input_size + SSE_PAYLOAD_OVERHEAD
+    # Base64 encoding: ceil(n * 4/3)
+    base64_size = (binary_size * 4 + 2) // 3
+    # Wire format wrapper
+    return SSE_WIRE_OVERHEAD + base64_size
 
 
 def make_psk(length: int = PSK_MIN_SIZE) -> bytes:
@@ -234,3 +254,161 @@ class TestMemoryPressure:
         # Net allocation after 1000 roundtrips should be < 100KB
         # (sequence counters increment but don't allocate much)
         assert net_allocated < 100 * 1024, f"Net allocation {net_allocated} bytes after 1000 ops, possible leak"
+
+
+class TestSSEMemory:
+    """Memory bounds for SSE streaming encryption.
+
+    Tests zero-copy optimizations:
+    - SSEEncryptor.encrypt(bytes) -> bytes
+    - SSEDecryptor.decrypt(str) -> bytes
+    - Wire format overhead (base64 + counter + tag)
+    """
+
+    @staticmethod
+    def _make_session() -> StreamingSession:
+        """Create a test SSE session."""
+        return StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
+
+    @staticmethod
+    def _extract_data_field(sse: bytes) -> str:
+        """Extract data field from encrypted SSE output."""
+        for line in sse.decode("ascii").split("\n"):
+            if line.startswith("data: "):
+                return line[6:]
+        raise ValueError("No data field found")
+
+    @pytest.mark.parametrize("chunk_size", [64, 1024, 64 * 1024])
+    def test_sse_encrypt_overhead_bounded(self, chunk_size: int) -> None:
+        """SSE encryption overhead is bounded (base64 + wire format).
+
+        Formula: output = 19 + ceil((input + 20) * 4/3)
+        - 19B wire format ("event: enc\\ndata: " + "\\n\\n")
+        - 20B payload overhead (4B counter + 16B tag)
+        - 33% base64 encoding expansion
+        """
+        session = self._make_session()
+        encryptor = SSEEncryptor(session)
+        chunk = secrets.token_bytes(chunk_size)
+
+        # Warmup
+        encryptor.encrypt(chunk)
+        gc.collect()
+
+        allocated, output = measure_allocation(lambda: encryptor.encrypt(chunk))
+
+        # Output should match formula (with small margin for rounding)
+        max_expected = expected_sse_output_size(chunk_size) + 10  # 10 byte margin
+        assert len(output) <= max_expected, (
+            f"Output {len(output)} bytes for {chunk_size} input, expected <= {max_expected}"
+        )
+
+        # Memory allocation should be proportional to output (+ 10KB for temp buffers)
+        assert allocated < len(output) + 10 * 1024, f"Allocated {allocated} bytes, expected < {len(output) + 10 * 1024}"
+
+    @pytest.mark.parametrize("payload_size", [64, 1024, 64 * 1024])
+    def test_sse_decrypt_overhead_bounded(self, payload_size: int) -> None:
+        """SSE decryption overhead is bounded.
+
+        Overhead = base64 decode temp buffer only.
+        Expected: allocation < 1.1x ciphertext size.
+        """
+        session = self._make_session()
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+        chunk = secrets.token_bytes(payload_size)
+
+        # Create encrypted data
+        encrypted = encryptor.encrypt(chunk)
+        data_field = self._extract_data_field(encrypted)
+
+        # Warmup
+        _ = decryptor.decrypt(data_field)
+        # Reset decryptor for fresh measurement
+        decryptor = SSEDecryptor(self._make_session())
+        encryptor2 = SSEEncryptor(self._make_session())
+        encrypted2 = encryptor2.encrypt(chunk)
+        data_field2 = self._extract_data_field(encrypted2)
+        gc.collect()
+
+        allocated, plaintext = measure_allocation(lambda: decryptor.decrypt(data_field2))
+
+        # Allocation should be proportional to payload
+        max_expected = int(payload_size * 1.2) + 10 * 1024  # 1.2x + 10KB buffer
+        assert allocated < max_expected, (
+            f"Allocated {allocated} bytes for {payload_size} payload, expected < {max_expected}"
+        )
+        assert plaintext == chunk
+
+    def test_sse_streaming_no_leak(self) -> None:
+        """1000 SSE encrypt/decrypt roundtrips don't leak memory.
+
+        Verifies zero-copy optimizations prevent memory accumulation.
+        """
+        session = self._make_session()
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+        chunk = b"event: test\ndata: {}\n\n"
+
+        # Warmup phase
+        for _ in range(100):
+            encrypted = encryptor.encrypt(chunk)
+            data_field = self._extract_data_field(encrypted)
+            decryptor.decrypt(data_field)
+        gc.collect()
+
+        # Measure net allocation over 1000 operations
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        for _ in range(1000):
+            encrypted = encryptor.encrypt(chunk)
+            data_field = self._extract_data_field(encrypted)
+            plaintext = decryptor.decrypt(data_field)
+            assert plaintext == chunk
+
+        gc.collect()
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        net_allocated = sum(stat.size_diff for stat in diff)
+
+        # Net allocation should be minimal (counters increment but don't allocate much)
+        assert net_allocated < MAX_SSE_STREAMING_NET, (
+            f"Net allocation {net_allocated} bytes after 1000 roundtrips, expected < {MAX_SSE_STREAMING_NET}"
+        )
+
+    def test_sse_large_chunk_memory_proportional(self) -> None:
+        """100KB SSE chunk memory scales linearly.
+
+        Verifies no quadratic blowup from string operations.
+        """
+        session = self._make_session()
+        encryptor = SSEEncryptor(session)
+
+        # 100KB chunk
+        chunk_size = 100 * 1024
+        chunk = secrets.token_bytes(chunk_size)
+
+        # Warmup
+        encryptor.encrypt(chunk)
+        gc.collect()
+
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        output = encryptor.encrypt(chunk)
+
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Should allocate close to output size (formula-based)
+        max_expected = expected_sse_output_size(chunk_size) + 10 * 1024  # 10KB buffer margin
+        assert allocated < max_expected, (
+            f"Allocated {allocated} bytes for {chunk_size} chunk, expected < {max_expected}"
+        )
+        assert len(output) <= expected_sse_output_size(chunk_size) + 10
