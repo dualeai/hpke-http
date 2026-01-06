@@ -17,6 +17,7 @@ Reference: RFC-065 §4.4, §5.2
 
 import asyncio
 import json as json_module
+import re
 import time
 import types
 import weakref
@@ -313,6 +314,13 @@ class HPKEClientSession:
         """
         Iterate over encrypted SSE events.
 
+        Implements WHATWG EventSource parsing:
+        - All line endings: CR, LF, CRLF
+        - Comment lines (starting with :) are ignored
+        - Field values with optional leading space after colon
+
+        Reference: https://html.spec.whatwg.org/multipage/server-sent-events.html
+
         Args:
             response: Response from an SSE endpoint
 
@@ -334,20 +342,39 @@ class HPKEClientSession:
         session = StreamingSession.deserialize(session_params, session_key)
         decryptor = SSEDecryptor(session)
 
+        # WHATWG event boundary: blank line (any combination of line endings)
+        # Matches: \r\n\r\n, \n\n, \r\r, \r\n\n, \n\r\n, etc.
+        event_boundary = re.compile(r"(?:\r\n|\r|\n)(?:\r\n|\r|\n)")
+
         # Parse SSE stream
         buffer = ""
         async for chunk in response.content:
             buffer += chunk.decode("utf-8")
 
-            # Process complete events (separated by \n\n)
-            while "\n\n" in buffer:
-                event_text, buffer = buffer.split("\n\n", 1)
+            # Process complete events (separated by blank line)
+            while True:
+                match = event_boundary.search(buffer)
+                if not match:
+                    break
+                event_text = buffer[: match.start()]
+                buffer = buffer[match.end() :]
 
-                # Parse SSE fields
+                # Parse SSE fields per WHATWG spec
                 event_data = None
-                for line in event_text.split("\n"):
-                    if line.startswith("data: "):
-                        event_data = line[6:]
+                # Split on any line ending
+                lines = re.split(r"\r\n|\r|\n", event_text)
+                for line in lines:
+                    # Skip empty lines and comments
+                    if not line or line.startswith(":"):
+                        continue
+                    # Parse field
+                    if ":" in line:
+                        key, _, value = line.partition(":")
+                        # Remove single leading space if present (per WHATWG)
+                        if value.startswith(" "):
+                            value = value[1:]
+                        if key == "data":
+                            event_data = value
 
                 if event_data and event_data.strip():
                     # Decrypt event

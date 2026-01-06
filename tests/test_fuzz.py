@@ -328,3 +328,109 @@ class TestFuzzSecurityBoundaries:
             # Should accept strong PSKs
             ctx = setup_sender_psk(pk_r, b"", psk, TEST_PSK_ID)
             assert ctx is not None
+
+
+@pytest.mark.fuzz
+class TestFuzzSSE:
+    """Property-based tests for SSE streaming encryption."""
+
+    @staticmethod
+    def _extract_data_field(sse: str) -> str:
+        """Extract data field from SSE event."""
+        for line in sse.split("\n"):
+            if line.startswith("data: "):
+                return line[6:]
+        raise ValueError("No data field found in SSE event")
+
+    @given(event_type=st.text(min_size=1, max_size=100, alphabet=st.characters(blacklist_categories=["Cc", "Cs"])))
+    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    def test_roundtrip_any_event_type(self, event_type: str) -> None:
+        """Any event type roundtrips correctly."""
+        from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
+
+        session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        sse_event = encryptor.encrypt_event(event_type, {"test": 1})
+        data = self._extract_data_field(sse_event)
+        dec_type, dec_data = decryptor.decrypt_event(data)
+
+        assert dec_type == event_type
+        assert dec_data == {"test": 1}
+
+    @given(
+        data=st.dictionaries(
+            keys=st.text(min_size=1, max_size=20, alphabet=st.characters(blacklist_categories=["Cc", "Cs"])),
+            values=st.one_of(
+                st.text(max_size=100),
+                st.integers(),
+                st.floats(allow_nan=False, allow_infinity=False),
+                st.booleans(),
+                st.none(),
+            ),
+            max_size=10,
+        )
+    )
+    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    def test_roundtrip_any_json_data(self, data: dict[str, object]) -> None:
+        """Any JSON-serializable data roundtrips correctly."""
+        from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
+
+        session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        sse_event = encryptor.encrypt_event("test", data)
+        data_field = self._extract_data_field(sse_event)
+        dec_type, dec_data = decryptor.decrypt_event(data_field)
+
+        assert dec_type == "test"
+        assert dec_data == data
+
+    @given(event_count=st.integers(min_value=1, max_value=50))
+    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    def test_counter_always_increments(self, event_count: int) -> None:
+        """Property: counter monotonically increases."""
+        from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
+
+        session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        for i in range(event_count):
+            assert encryptor.counter == i + 1
+            assert decryptor.expected_counter == i + 1
+
+            sse_event = encryptor.encrypt_event("test", {"i": i})
+            data = self._extract_data_field(sse_event)
+            decryptor.decrypt_event(data)
+
+        assert encryptor.counter == event_count + 1
+        assert decryptor.expected_counter == event_count + 1
+
+    @given(salt1=st.binary(min_size=4, max_size=4), salt2=st.binary(min_size=4, max_size=4))
+    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    def test_different_salt_different_ciphertext(self, salt1: bytes, salt2: bytes) -> None:
+        """Property: different salts produce different ciphertexts."""
+        from hpke_http.streaming import SSEEncryptor, StreamingSession
+
+        # Skip if salts are identical
+        if salt1 == salt2:
+            return
+
+        key = b"k" * 32
+        session1 = StreamingSession(session_key=key, session_salt=salt1)
+        session2 = StreamingSession(session_key=key, session_salt=salt2)
+
+        encryptor1 = SSEEncryptor(session1)
+        encryptor2 = SSEEncryptor(session2)
+
+        sse1 = encryptor1.encrypt_event("test", {"data": "same"})
+        sse2 = encryptor2.encrypt_event("test", {"data": "same"})
+
+        data1 = self._extract_data_field(sse1)
+        data2 = self._extract_data_field(sse2)
+
+        # Ciphertexts should differ due to different salts
+        assert data1 != data2

@@ -18,6 +18,7 @@ Reference: RFC-065 §6
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import threading
 from dataclasses import dataclass, field
@@ -262,17 +263,42 @@ class SSEDecryptor:
 
 def parse_sse_event(raw_event: str) -> dict[str, str]:
     """
-    Parse raw SSE event into components.
+    Parse raw SSE event into components per WHATWG EventSource spec.
+
+    Handles:
+    - All line endings: CR (\\r), LF (\\n), CRLF (\\r\\n)
+    - Comment lines (starting with :)
+    - Field values with single leading space removed
+    - Lines without colons (empty value)
+
+    Reference: https://html.spec.whatwg.org/multipage/server-sent-events.html
 
     Args:
         raw_event: Raw SSE event text
 
     Returns:
-        Dict with 'id', 'event', 'data' keys (if present)
+        Dict with 'id', 'event', 'data', 'retry' keys (if present)
     """
     result: dict[str, str] = {}
-    for line in raw_event.strip().split("\n"):
+    # Split on any line ending: CRLF, LF, or CR
+    lines = re.split(r"\r\n|\r|\n", raw_event.strip())
+
+    for line in lines:
+        # Skip empty lines
+        if not line:
+            continue
+        # Skip comment lines (start with :)
+        if line.startswith(":"):
+            continue
+        # Parse field
         if ":" in line:
-            key, value = line.split(":", 1)
-            result[key.strip()] = value.strip()
+            key, _, value = line.partition(":")
+            # Remove single leading space if present (per WHATWG spec)
+            if value.startswith(" "):
+                value = value[1:]
+            result[key] = value
+        else:
+            # Line without colon: field name with empty value
+            result[line] = ""
+
     return result

@@ -114,10 +114,11 @@ select = [
 ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use secrets)
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["PLR2004", "S101", "S603", "ASYNC109", "ASYNC220", "SIM117", "F841", "RUF059"]  # Tests: magic values, assert, subprocess, async patterns, nested with, unused vars
+"tests/**/*.py" = ["PLR2004", "S101", "S603", "ASYNC109", "ASYNC220", "SIM117", "F841", "RUF059", "PLC0415"]  # Tests: magic values, assert, subprocess, async patterns, nested with, unused vars, local imports
 "tests/**/test_rfc9180*.py" = ["SLF001"]  # Vector tests need internal state access
 "tests/**/test_fuzz.py" = ["SLF001"]  # Fuzz tests need internal state access for overflow testing
 "tests/**/test_aiohttp_client.py" = ["SLF001"]  # Unit tests for private parsing methods
+"tests/**/test_streaming_errors.py" = ["SLF001"]  # Error tests need internal cipher access
 
 [tool.vulture]
 exclude = [".venv/"]  # Exclude deps

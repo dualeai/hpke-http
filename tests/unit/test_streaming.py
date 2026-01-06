@@ -134,6 +134,276 @@ class TestSSEEncryption:
         assert lines[3] == ""  # Empty line for event boundary
 
 
+class TestCounterBoundaries:
+    """Test counter boundary conditions."""
+
+    @staticmethod
+    def _extract_data_field(sse: str) -> str:
+        """Extract data field from SSE event."""
+        for line in sse.split("\n"):
+            if line.startswith("data: "):
+                return line[6:]
+        raise ValueError("No data field found in SSE event")
+
+    def test_counter_starts_at_1(self) -> None:
+        """First event should have counter=1."""
+        from hpke_http.constants import SSE_COUNTER_SIZE
+        from hpke_http.headers import b64url_decode
+
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+
+        sse_event = encryptor.encrypt_event("test", {})
+        data = self._extract_data_field(sse_event)
+        payload = b64url_decode(data)
+
+        # Extract counter from first 4 bytes (big-endian)
+        counter = int.from_bytes(payload[:SSE_COUNTER_SIZE], "big")
+        assert counter == 1
+
+    def test_counter_increments(self) -> None:
+        """Counter should increment with each event."""
+        from hpke_http.constants import SSE_COUNTER_SIZE
+        from hpke_http.headers import b64url_decode
+
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+
+        for expected_counter in range(1, 6):
+            sse_event = encryptor.encrypt_event("test", {"i": expected_counter})
+            data = self._extract_data_field(sse_event)
+            payload = b64url_decode(data)
+            counter = int.from_bytes(payload[:SSE_COUNTER_SIZE], "big")
+            assert counter == expected_counter
+
+    def test_counter_near_max(self) -> None:
+        """Counter near max should still work."""
+        from hpke_http.constants import SSE_MAX_COUNTER
+
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+
+        # Set counter to max - 1
+        encryptor.counter = SSE_MAX_COUNTER
+
+        # This should work (counter == max)
+        sse_event = encryptor.encrypt_event("test", {"at": "max"})
+        assert "data:" in sse_event
+
+        # Next one should fail (counter > max)
+        from hpke_http.exceptions import SessionExpiredError
+
+        with pytest.raises(SessionExpiredError):
+            encryptor.encrypt_event("test", {"over": "max"})
+
+
+class TestEventIDHandling:
+    """Test event ID handling in SSE output."""
+
+    def test_event_with_id(self) -> None:
+        """Event with ID should include id: field."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+
+        sse_event = encryptor.encrypt_event("test", {}, event_id=42)
+        assert "id: 42\n" in sse_event
+
+    def test_event_without_id(self) -> None:
+        """Event without ID should omit id: field."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+
+        sse_event = encryptor.encrypt_event("test", {}, event_id=None)
+        assert "id:" not in sse_event
+
+    def test_event_id_zero(self) -> None:
+        """Event ID 0 should be valid."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+
+        sse_event = encryptor.encrypt_event("test", {}, event_id=0)
+        assert "id: 0\n" in sse_event
+
+
+class TestSessionSaltRandomness:
+    """Test session salt randomness."""
+
+    def test_different_sessions_have_different_salts(self) -> None:
+        """Multiple sessions should have unique salts."""
+        key = b"0" * 32
+        salts: set[bytes] = set()
+
+        for _ in range(100):
+            session = StreamingSession.create(key)
+            salts.add(session.session_salt)
+
+        # With 4-byte salts and 100 samples, collisions are extremely unlikely
+        assert len(salts) == 100
+
+
+class TestPayloadVariations:
+    """Test various payload types and sizes."""
+
+    @staticmethod
+    def _extract_data_field(sse: str) -> str:
+        """Extract data field from SSE event."""
+        for line in sse.split("\n"):
+            if line.startswith("data: "):
+                return line[6:]
+        raise ValueError("No data field found in SSE event")
+
+    def test_large_event_payload(self) -> None:
+        """100KB JSON data should encrypt/decrypt correctly."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        # Create ~100KB payload
+        large_data = {"items": ["x" * 1000 for _ in range(100)]}
+
+        sse_event = encryptor.encrypt_event("large", large_data)
+        data = self._extract_data_field(sse_event)
+        event_type, decrypted = decryptor.decrypt_event(data)
+
+        assert event_type == "large"
+        assert decrypted == large_data
+
+    def test_unicode_event_data(self) -> None:
+        """Unicode (Chinese, emoji, RTL) should work."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        unicode_data = {
+            "chinese": "你好世界",
+            "emoji": "🔐🔑🛡️",
+            "rtl": "مرحبا بالعالم",
+            "mixed": "Hello 世界 🌍",
+        }
+
+        sse_event = encryptor.encrypt_event("unicode", unicode_data)
+        data = self._extract_data_field(sse_event)
+        event_type, decrypted = decryptor.decrypt_event(data)
+
+        assert event_type == "unicode"
+        assert decrypted == unicode_data
+
+    def test_empty_event_data(self) -> None:
+        """Empty dict data should work."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        sse_event = encryptor.encrypt_event("ping", {})
+        data = self._extract_data_field(sse_event)
+        event_type, decrypted = decryptor.decrypt_event(data)
+
+        assert event_type == "ping"
+        assert decrypted == {}
+
+    def test_nested_json_data(self) -> None:
+        """Deeply nested JSON should work."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        nested_data = {
+            "level1": {
+                "level2": {
+                    "level3": {
+                        "level4": {
+                            "value": [1, 2, {"deep": True}],
+                        }
+                    }
+                }
+            }
+        }
+
+        sse_event = encryptor.encrypt_event("nested", nested_data)
+        data = self._extract_data_field(sse_event)
+        event_type, decrypted = decryptor.decrypt_event(data)
+
+        assert event_type == "nested"
+        assert decrypted == nested_data
+
+    def test_special_characters_in_data(self) -> None:
+        """Newlines, tabs, quotes should be handled."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        special_data = {
+            "newlines": "line1\nline2\nline3",
+            "tabs": "col1\tcol2\tcol3",
+            "quotes": 'He said "hello"',
+            "backslash": "path\\to\\file",
+        }
+
+        sse_event = encryptor.encrypt_event("special", special_data)
+        data = self._extract_data_field(sse_event)
+        event_type, decrypted = decryptor.decrypt_event(data)
+
+        assert event_type == "special"
+        assert decrypted == special_data
+
+
+class TestEventVolume:
+    """Test high volume of events."""
+
+    @staticmethod
+    def _extract_data_field(sse: str) -> str:
+        """Extract data field from SSE event."""
+        for line in sse.split("\n"):
+            if line.startswith("data: "):
+                return line[6:]
+        raise ValueError("No data field found in SSE event")
+
+    def test_many_events_100(self) -> None:
+        """100 sequential events should work."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        for i in range(100):
+            sse_event = encryptor.encrypt_event("event", {"index": i})
+            data = self._extract_data_field(sse_event)
+            event_type, decrypted = decryptor.decrypt_event(data)
+
+            assert event_type == "event"
+            assert decrypted["index"] == i
+
+    def test_many_events_1000(self) -> None:
+        """1000 events should work with correct counters."""
+        key = b"0" * 32
+        session = StreamingSession.create(key)
+        encryptor = SSEEncryptor(session)
+        decryptor = SSEDecryptor(session)
+
+        for i in range(1000):
+            sse_event = encryptor.encrypt_event("bulk", {"n": i})
+            data = self._extract_data_field(sse_event)
+            event_type, decrypted = decryptor.decrypt_event(data)
+
+            assert event_type == "bulk"
+            assert decrypted["n"] == i
+
+        # Verify final counter state
+        assert encryptor.counter == 1001
+        assert decryptor.expected_counter == 1001
+
+
 class TestSessionFromContext:
     """Test session creation from HPKE context."""
 

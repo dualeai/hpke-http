@@ -190,3 +190,75 @@ class TestSSEEncryption:
 
         # Verify all events were processed (counter worked correctly)
         assert event_count == 4
+
+    async def test_sse_delayed_events(self, hpke_client: HPKEClientSession) -> None:
+        """SSE events with delays between them work correctly."""
+        import time
+
+        events: list[tuple[str, dict[str, Any]]] = []
+        start = time.monotonic()
+
+        resp = await hpke_client.post("/stream-delayed", json={"start": True})
+        assert resp.status == 200
+        async for event_type, event_data in hpke_client.iter_sse(resp):
+            events.append((event_type, event_data))
+
+        elapsed = time.monotonic() - start
+
+        # Should have 6 events: 5 ticks + 1 done
+        assert len(events) == 6
+
+        # Verify tick events
+        for i in range(5):
+            assert events[i][0] == "tick"
+            assert events[i][1]["count"] == i
+
+        # Verify done event
+        assert events[5][0] == "done"
+        assert events[5][1]["total"] == 5
+
+        # Should have taken at least 400ms (5 events * 100ms delay)
+        # Allow some slack for test timing
+        assert elapsed >= 0.4, f"Expected >= 400ms, got {elapsed * 1000:.0f}ms"
+
+    async def test_sse_large_payload_stream(self, hpke_client: HPKEClientSession) -> None:
+        """SSE events with ~10KB payloads work correctly."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        resp = await hpke_client.post("/stream-large", json={"start": True})
+        assert resp.status == 200
+        async for event_type, event_data in hpke_client.iter_sse(resp):
+            events.append((event_type, event_data))
+
+        # Should have 4 events: 3 large + 1 complete
+        assert len(events) == 4
+
+        # Verify large events have ~10KB data
+        for i in range(3):
+            assert events[i][0] == "large"
+            assert events[i][1]["index"] == i
+            assert len(events[i][1]["data"]) == 10000
+
+        # Verify complete event
+        assert events[3][0] == "complete"
+
+    async def test_sse_many_events_stream(self, hpke_client: HPKEClientSession) -> None:
+        """SSE stream with 50+ events works correctly."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        resp = await hpke_client.post("/stream-many", json={"start": True})
+        assert resp.status == 200
+        async for event_type, event_data in hpke_client.iter_sse(resp):
+            events.append((event_type, event_data))
+
+        # Should have 51 events: 50 event + 1 complete
+        assert len(events) == 51
+
+        # Verify sequential events
+        for i in range(50):
+            assert events[i][0] == "event"
+            assert events[i][1]["index"] == i
+
+        # Verify complete event
+        assert events[50][0] == "complete"
+        assert events[50][1]["count"] == 50

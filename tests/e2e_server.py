@@ -59,6 +59,73 @@ async def stream(request: Request) -> EncryptedSSEResponse | StreamingResponse:
     return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
 
 
+async def stream_delayed(request: Request) -> EncryptedSSEResponse | StreamingResponse:
+    """SSE endpoint with delayed events (tests real streaming)."""
+    import asyncio
+
+    await request.body()
+
+    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
+        """Generate events with 100ms delays between them."""
+        for i in range(5):
+            yield ("tick", {"count": i})
+            await asyncio.sleep(0.1)  # 100ms delay
+        yield ("done", {"total": 5})
+
+    ctx = request.scope.get("hpke_context")
+    if ctx:
+        return EncryptedSSEResponse(ctx, event_generator())
+
+    async def plaintext_sse() -> AsyncGenerator[bytes]:
+        async for event_type, data in event_generator():
+            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+    return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
+
+
+async def stream_large(request: Request) -> EncryptedSSEResponse | StreamingResponse:
+    """SSE endpoint with large payload events."""
+    await request.body()
+
+    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
+        """Generate events with ~10KB payloads."""
+        for i in range(3):
+            large_payload = {"index": i, "data": "x" * 10000}  # ~10KB
+            yield ("large", large_payload)
+        yield ("complete", {"sizes": [10000, 10000, 10000]})
+
+    ctx = request.scope.get("hpke_context")
+    if ctx:
+        return EncryptedSSEResponse(ctx, event_generator())
+
+    async def plaintext_sse() -> AsyncGenerator[bytes]:
+        async for event_type, data in event_generator():
+            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+    return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
+
+
+async def stream_many(request: Request) -> EncryptedSSEResponse | StreamingResponse:
+    """SSE endpoint with 50+ events."""
+    await request.body()
+
+    async def event_generator() -> AsyncGenerator[tuple[str, dict[str, Any]]]:
+        """Generate 50 events."""
+        for i in range(50):
+            yield ("event", {"index": i})
+        yield ("complete", {"count": 50})
+
+    ctx = request.scope.get("hpke_context")
+    if ctx:
+        return EncryptedSSEResponse(ctx, event_generator())
+
+    async def plaintext_sse() -> AsyncGenerator[bytes]:
+        async for event_type, data in event_generator():
+            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+    return StreamingResponse(plaintext_sse(), media_type="text/event-stream")
+
+
 def _create_app() -> HPKEMiddleware:
     """Create ASGI app wrapped with HPKEMiddleware.
 
@@ -84,6 +151,9 @@ def _create_app() -> HPKEMiddleware:
         Route("/health", health, methods=["GET"]),
         Route("/echo", echo, methods=["POST"]),
         Route("/stream", stream, methods=["POST"]),
+        Route("/stream-delayed", stream_delayed, methods=["POST"]),
+        Route("/stream-large", stream_large, methods=["POST"]),
+        Route("/stream-many", stream_many, methods=["POST"]),
     ]
     starlette_app = Starlette(routes=routes)
 
