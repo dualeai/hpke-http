@@ -25,9 +25,9 @@ from tests.conftest import extract_sse_data_field, make_sse_session
 
 T = TypeVar("T")
 
-# Memory bounds (conservative to account for OpenSSL internals)
-MAX_CONTEXT_MEMORY = 100 * 1024  # 100KB per context (includes OpenSSL state)
-MAX_SEAL_OVERHEAD = 50 * 1024  # 50KB overhead per seal (excludes ciphertext)
+# Memory bounds (measured + safety margin for test variance)
+MAX_CONTEXT_MEMORY = 20 * 1024  # 20KB per context (measured: ~3-17KB with test variance)
+MAX_SEAL_OVERHEAD = 4 * 1024  # 4KB overhead per seal (measured: ~1-3KB with test variance)
 
 # SSE memory bounds
 # Wire format: "event: enc\ndata: " (17B) + "\n\n" (2B) = 19B
@@ -36,7 +36,7 @@ MAX_SEAL_OVERHEAD = 50 * 1024  # 50KB overhead per seal (excludes ciphertext)
 # Formula: output = 19 + ceil((input + 20) * 4/3)
 SSE_WIRE_OVERHEAD = 19  # Fixed wire format bytes
 SSE_PAYLOAD_OVERHEAD = 20  # counter + tag
-MAX_SSE_STREAMING_NET = 50 * 1024  # 50KB net allocation after 1000 roundtrips
+MAX_SSE_STREAMING_NET = 20 * 1024  # 20KB net allocation after 1000 roundtrips
 
 
 def expected_sse_output_size(input_size: int) -> int:
@@ -212,8 +212,8 @@ class TestMemoryPressure:
         allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
 
         # Should allocate roughly 1x payload (for ciphertext)
-        # Allow up to 1.5x for intermediate buffers
-        max_expected = int(payload_size * 1.5)
+        # Measured: 1.001x for 1MB payload
+        max_expected = int(payload_size * 1.1)
         assert allocated < max_expected, f"Allocated {allocated} bytes for {payload_size} byte payload"
         assert len(ciphertext) == payload_size + 16
 
@@ -292,8 +292,8 @@ class TestSSEMemory:
             f"Output {len(output)} bytes for {chunk_size} input, expected <= {max_expected}"
         )
 
-        # Memory allocation should be proportional to output (+ 10KB for temp buffers)
-        assert allocated < len(output) + 10 * 1024, f"Allocated {allocated} bytes, expected < {len(output) + 10 * 1024}"
+        # Memory allocation should be proportional to output (measured: ~900B-2.5KB with variance)
+        assert allocated < len(output) + 3 * 1024, f"Allocated {allocated} bytes, expected < {len(output) + 3 * 1024}"
 
     @pytest.mark.parametrize("payload_size", [64, 1024, 64 * 1024])
     def test_sse_decrypt_overhead_bounded(self, payload_size: int) -> None:
@@ -320,8 +320,8 @@ class TestSSEMemory:
         # Measure the warmed-up decryptor
         allocated, plaintext = measure_allocation(lambda: decryptor.decrypt(data_field_measure))
 
-        # Allocation should be proportional to payload
-        max_expected = int(payload_size * 1.2) + 10 * 1024  # 1.2x + 10KB buffer
+        # Allocation should be proportional to payload (measured: ~833B-2.5KB with variance)
+        max_expected = int(payload_size * 1.1) + 3 * 1024  # 1.1x + 3KB buffer
         assert allocated < max_expected, (
             f"Allocated {allocated} bytes for {payload_size} payload, expected < {max_expected}"
         )
@@ -393,8 +393,8 @@ class TestSSEMemory:
         diff = snapshot2.compare_to(snapshot1, "lineno")
         allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
 
-        # Should allocate close to output size (formula-based)
-        max_expected = expected_sse_output_size(chunk_size) + 10 * 1024  # 10KB buffer margin
+        # Should allocate close to output size (measured: ~900B-2.5KB with variance)
+        max_expected = expected_sse_output_size(chunk_size) + 3 * 1024  # 3KB buffer margin
         assert allocated < max_expected, (
             f"Allocated {allocated} bytes for {chunk_size} chunk, expected < {max_expected}"
         )
