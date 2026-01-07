@@ -17,7 +17,7 @@ import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
-from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
+from hpke_http.streaming import ChunkDecryptor, ChunkEncryptor, StreamingSession
 
 # Enable hpke_http debug logging during tests
 logging.getLogger("hpke_http").setLevel(logging.DEBUG)
@@ -151,8 +151,8 @@ class SSETestPair:
         decrypted = pair.decryptor.decrypt(extract_sse_data_field(encrypted))
     """
 
-    encryptor: SSEEncryptor
-    decryptor: SSEDecryptor
+    encryptor: ChunkEncryptor
+    decryptor: ChunkDecryptor
     session: StreamingSession
 
     @classmethod
@@ -177,8 +177,8 @@ class SSETestPair:
         """
         session = StreamingSession(session_key=session_key, session_salt=session_salt)
         pair = cls(
-            encryptor=SSEEncryptor(session, compress=compress),
-            decryptor=SSEDecryptor(session),
+            encryptor=ChunkEncryptor(session, compress=compress),
+            decryptor=ChunkDecryptor(session),
             session=session,
         )
         if warmup_count > 0:

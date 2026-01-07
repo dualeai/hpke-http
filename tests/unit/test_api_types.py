@@ -9,16 +9,16 @@ This prevents the anti-pattern of changing tests to match broken code.
 
 from typing_extensions import assert_type
 
-from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
+from hpke_http.streaming import ChunkDecryptor, ChunkEncryptor, StreamingSession
 
 
-class TestSSEEncryptorTypes:
-    """Verify SSEEncryptor type contracts."""
+class TestChunkEncryptorTypes:
+    """Verify ChunkEncryptor type contracts."""
 
     def test_encrypt_returns_bytes(self) -> None:
-        """SSEEncryptor.encrypt must return bytes (matches ASGI wire format)."""
+        """ChunkEncryptor.encrypt must return bytes (matches ASGI wire format)."""
         session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         result = encryptor.encrypt(b"event: test\n\n")
 
@@ -28,9 +28,9 @@ class TestSSEEncryptorTypes:
         assert isinstance(result, bytes)
 
     def test_encrypt_accepts_bytes(self) -> None:
-        """SSEEncryptor.encrypt must accept bytes input."""
+        """ChunkEncryptor.encrypt must accept bytes input."""
         session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         # This should type-check without errors
         chunk: bytes = b"event: test\n\n"
@@ -38,14 +38,14 @@ class TestSSEEncryptorTypes:
         assert_type(result, bytes)
 
 
-class TestSSEDecryptorTypes:
-    """Verify SSEDecryptor type contracts."""
+class TestChunkDecryptorTypes:
+    """Verify ChunkDecryptor type contracts."""
 
     def test_decrypt_returns_bytes(self) -> None:
-        """SSEDecryptor.decrypt must return bytes (matches native aiohttp)."""
+        """ChunkDecryptor.decrypt must return bytes (matches native aiohttp)."""
         session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         # Create valid encrypted data
         encrypted = encryptor.encrypt(b"event: test\n\n")
@@ -59,10 +59,10 @@ class TestSSEDecryptorTypes:
         assert isinstance(result, bytes)
 
     def test_decrypt_accepts_str(self) -> None:
-        """SSEDecryptor.decrypt must accept str input (base64url encoded)."""
+        """ChunkDecryptor.decrypt must accept str input (base64url encoded)."""
         session = StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         encrypted = encryptor.encrypt(b"test")
         data_field: str = encrypted.decode("ascii").split("\n")[1][6:]

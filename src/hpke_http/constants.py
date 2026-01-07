@@ -162,6 +162,9 @@ HEADER_HPKE_STREAM: Final[str] = "X-HPKE-Stream"
 HEADER_HPKE_ENCODING: Final[str] = "X-HPKE-Encoding"
 """Header specifying compression algorithm for request body (RFC 8878)."""
 
+RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"
+"""Export label for deriving response encryption key from HPKE context."""
+
 # =============================================================================
 # ASGI Scope Keys
 # =============================================================================

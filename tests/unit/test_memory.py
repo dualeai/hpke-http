@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from hpke_http.constants import PSK_MIN_SIZE
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
-from hpke_http.streaming import SSEDecryptor, SSEEncryptor
+from hpke_http.streaming import ChunkDecryptor, ChunkEncryptor
 from tests.conftest import extract_sse_data_field, make_sse_session
 
 T = TypeVar("T")
@@ -262,8 +262,8 @@ class TestSSEMemory:
     """Memory bounds for SSE streaming encryption.
 
     Tests zero-copy optimizations:
-    - SSEEncryptor.encrypt(bytes) -> bytes
-    - SSEDecryptor.decrypt(str) -> bytes
+    - ChunkEncryptor.encrypt(bytes) -> bytes
+    - ChunkDecryptor.decrypt(str) -> bytes
     - Wire format overhead (base64 + counter + tag)
     """
 
@@ -277,7 +277,7 @@ class TestSSEMemory:
         - 33% base64 encoding expansion
         """
         session = make_sse_session()
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
         chunk = secrets.token_bytes(chunk_size)
 
         # Warmup
@@ -303,8 +303,8 @@ class TestSSEMemory:
         decoded bytes (no extra copy). Slicing for counter/ciphertext is zero-copy.
         """
         session = make_sse_session()
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
         chunk = secrets.token_bytes(payload_size)
 
         # Create two encrypted messages (counter increments)
@@ -333,8 +333,8 @@ class TestSSEMemory:
         Verifies zero-copy optimizations prevent memory accumulation.
         """
         session = make_sse_session()
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
         chunk = b"event: test\ndata: {}\n\n"
 
         # Warmup phase
@@ -372,7 +372,7 @@ class TestSSEMemory:
         Verifies no quadratic blowup from string operations.
         """
         session = make_sse_session()
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         # 100KB chunk
         chunk_size = 100 * 1024
@@ -512,9 +512,9 @@ class TestBase64Memory:
         # Zero-copy proof: memoryview slice objects are tiny (~184 bytes)
         # regardless of the underlying data size. A bytes copy would be ~64KB.
         import sys
+
         assert sys.getsizeof(ciphertext_slice) < 300, (
-            f"Slice object is {sys.getsizeof(ciphertext_slice)} bytes, "
-            "expected <300 (should be a view, not a copy)"
+            f"Slice object is {sys.getsizeof(ciphertext_slice)} bytes, expected <300 (should be a view, not a copy)"
         )
 
         # Verify data correctness
@@ -598,10 +598,8 @@ class TestBase64Memory:
 
         # Should allocate based on slice size (2KB), not full buffer
         # Measured ~1.34x; allow 2x + overhead for safety margin
-        max_expected = int(2048 * 2) + 4096
-        assert allocated < max_expected, (
-            f"Allocated {allocated} bytes for 2KB slice, expected < {max_expected}"
-        )
+        max_expected = (2048 * 2) + 4096
+        assert allocated < max_expected, f"Allocated {allocated} bytes for 2KB slice, expected < {max_expected}"
 
         # Verify encoding is correct
         assert b64url_encode(bytes(data[1024:3072])) == encoded
@@ -634,9 +632,7 @@ class TestBase64Memory:
         net_allocated = sum(stat.size_diff for stat in diff)
 
         # Net allocation after 1000 roundtrips should be minimal
-        assert net_allocated < 50 * 1024, (
-            f"Net allocation {net_allocated} bytes after 1000 roundtrips, possible leak"
-        )
+        assert net_allocated < 50 * 1024, f"Net allocation {net_allocated} bytes after 1000 roundtrips, possible leak"
 
     def test_large_payload_memory_bounded(self) -> None:
         """1MB payload encode/decode uses bounded memory."""
@@ -660,9 +656,7 @@ class TestBase64Memory:
 
         # Measured ~1.33x payload; allow 2x for safety margin
         max_encode = int(payload_size * 2)
-        assert encode_allocated < max_encode, (
-            f"Encode allocated {encode_allocated} bytes for {payload_size} payload"
-        )
+        assert encode_allocated < max_encode, f"Encode allocated {encode_allocated} bytes for {payload_size} payload"
 
         gc.collect()
 
@@ -678,9 +672,7 @@ class TestBase64Memory:
 
         # Measured ~1.0x payload; allow 1.2x for safety margin
         max_decode = int(payload_size * 1.2)
-        assert decode_allocated < max_decode, (
-            f"Decode allocated {decode_allocated} bytes for {payload_size} payload"
-        )
+        assert decode_allocated < max_decode, f"Decode allocated {decode_allocated} bytes for {payload_size} payload"
         assert bytes(decoded) == data
 
     @pytest.mark.parametrize(

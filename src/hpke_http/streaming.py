@@ -21,13 +21,13 @@ import secrets
 import sys
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
-    SSE_COUNTER_SIZE,
+    CHACHA20_POLY1305_TAG_SIZE,
     SSE_MAX_COUNTER,
     SSE_SESSION_KEY_LABEL,
     SSE_SESSION_SALT_SIZE,
@@ -182,14 +182,103 @@ def zstd_decompress(
 
 
 __all__ = [
-    "SSEDecryptor",
-    "SSEEncryptor",
+    "ChunkDecryptor",
+    "ChunkEncryptor",
+    "ChunkFormat",
+    "RawFormat",
+    "SSEFormat",
     "StreamingSession",
     "create_session_from_context",
     "import_zstd",
     "zstd_compress",
     "zstd_decompress",
 ]
+
+
+# =============================================================================
+# Chunk Format Strategy (for different wire formats)
+# =============================================================================
+
+
+class ChunkFormat(Protocol):
+    """Strategy for encoding/decoding encrypted chunks.
+
+    Implementations define how counter + ciphertext are formatted for wire
+    transmission. This allows the same encryption logic to work with different
+    output formats (SSE events, raw binary, WebSocket frames, etc.).
+    """
+
+    def encode(self, counter: int, ciphertext: bytes) -> bytes:
+        """Format counter + ciphertext for wire transmission.
+
+        Args:
+            counter: Chunk counter (4 bytes, big-endian)
+            ciphertext: Encrypted payload with 16-byte auth tag
+
+        Returns:
+            Wire-formatted bytes
+        """
+        ...
+
+    def decode(self, data: bytes | str) -> tuple[int, bytes]:
+        """Parse wire data into (counter, ciphertext).
+
+        Args:
+            data: Wire-formatted data
+
+        Returns:
+            Tuple of (counter, ciphertext)
+        """
+        ...
+
+
+class SSEFormat:
+    """SSE event format: event: enc\\ndata: <base64url>\\n\\n
+
+    Used for Server-Sent Events streaming encryption.
+    """
+
+    _PREFIX: bytes = b"event: enc\ndata: "
+    _SUFFIX: bytes = b"\n\n"
+
+    def encode(self, counter: int, ciphertext: bytes) -> bytes:
+        """Encode as SSE event with base64url payload."""
+        payload = counter.to_bytes(4, "big") + ciphertext
+        encoded = b64url_encode(payload)
+        return self._PREFIX + encoded.encode("ascii") + self._SUFFIX
+
+    def decode(self, data: bytes | str) -> tuple[int, bytes]:
+        """Decode base64url payload from SSE data field."""
+        data_str = data.decode("ascii") if isinstance(data, bytes) else data
+        payload = bytes(b64url_decode(data_str))
+        return int.from_bytes(payload[:4], "big"), payload[4:]
+
+
+class RawFormat:
+    """Binary format: length(4B) || counter(4B) || ciphertext
+
+    Used for standard HTTP response encryption.
+
+    The length prefix enables O(1) chunk boundary detection when multiple
+    chunks are concatenated in a response body. Length is the size of
+    counter + ciphertext (excludes the length field itself).
+    """
+
+    def encode(self, counter: int, ciphertext: bytes) -> bytes:
+        """Encode as raw binary: length || counter || ciphertext."""
+        chunk = counter.to_bytes(4, "big") + ciphertext
+        length = len(chunk)
+        return length.to_bytes(4, "big") + chunk
+
+    def decode(self, data: bytes | str) -> tuple[int, bytes]:
+        """Decode raw binary: length(4B) || counter(4B) || ciphertext.
+
+        The length prefix is read and validated, then counter and ciphertext
+        are extracted from the remaining bytes.
+        """
+        raw = data if isinstance(data, bytes) else data.encode("latin-1")
+        # Skip length prefix (4 bytes), read counter and ciphertext
+        return int.from_bytes(raw[4:8], "big"), raw[8:]
 
 
 @dataclass
@@ -267,23 +356,25 @@ def create_session_from_context(ctx: HPKEContext) -> StreamingSession:
 
 
 @dataclass
-class SSEEncryptor:
+class ChunkEncryptor:
     """
-    Server-side SSE encryptor.
+    Chunk encryptor with counter-based nonces.
 
-    Encrypts raw SSE chunks with monotonic counter for replay protection.
+    Encrypts chunks with monotonic counter for replay protection.
     Thread-safe: uses a lock to protect counter operations.
 
-    The encryption is transparent - any valid SSE chunk (events, comments,
-    retry directives) is encrypted as-is and will be decrypted identically.
+    Wire format is determined by the ChunkFormat strategy:
+    - SSEFormat (default): SSE events with base64url payload
+    - RawFormat: Binary length || counter || ciphertext
 
     Optional compression (RFC 8878 Zstd) can be enabled via compress=True.
     Compressed chunks are prefixed with encoding ID for client detection.
     """
 
     session: StreamingSession
+    format: ChunkFormat = field(default_factory=SSEFormat)
+    compress: bool = False
     counter: int = field(default=1)  # Start at 1 (0 reserved)
-    compress: bool = False  # Enable Zstd compression
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
     _lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)
     _compressor: Any = field(init=False, repr=False, default=None)  # Reused per session
@@ -302,27 +393,22 @@ class SSEEncryptor:
         """
         return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
 
-    # Pre-computed wire format parts (avoid repeated allocations)
-    _WIRE_PREFIX: bytes = b"event: enc\ndata: "
-    _WIRE_SUFFIX: bytes = b"\n\n"
-
     def encrypt(self, chunk: bytes) -> bytes:
         """
-        Encrypt a raw SSE chunk.
+        Encrypt a chunk.
 
         Args:
-            chunk: Raw SSE chunk as bytes, exactly as server would send it.
-                   Can be event, comment, retry directive, or any valid SSE.
+            chunk: Raw chunk as bytes.
 
         Returns:
-            Encrypted SSE event as bytes (event: enc, data: <encrypted>)
+            Encrypted chunk formatted according to the format strategy.
 
         Raises:
             SessionExpiredError: If counter exhausted
         """
         with self._lock:
             if self.counter > SSE_MAX_COUNTER:
-                raise SessionExpiredError("SSE session counter exhausted")
+                raise SessionExpiredError("Session counter exhausted")
 
             # Build payload: encoding_id (1B) || data
             # Compress if enabled and chunk is large enough
@@ -337,29 +423,32 @@ class SSEEncryptor:
             nonce = self._compute_nonce(self.counter)
             ciphertext = self._cipher.encrypt(nonce, data, associated_data=None)
 
-            # Wire format: counter_be32 || ciphertext
-            payload = self.counter.to_bytes(SSE_COUNTER_SIZE, "big") + ciphertext
-            encoded = b64url_encode(payload)
+            # Format output via strategy
+            result = self.format.encode(self.counter, ciphertext)
 
             # Increment counter for next chunk
             self.counter += 1
 
-        # Format as encrypted SSE event (zero-copy concatenation)
-        return self._WIRE_PREFIX + encoded.encode("ascii") + self._WIRE_SUFFIX
+        return result
 
 
 @dataclass
-class SSEDecryptor:
+class ChunkDecryptor:
     """
-    Client-side SSE decryptor.
+    Chunk decryptor with counter validation.
 
-    Decrypts SSE chunks and validates counter monotonicity for replay protection.
-    Returns the exact raw SSE chunk the server originally sent.
+    Decrypts chunks and validates counter monotonicity for replay protection.
+    Returns the exact raw chunk the server originally sent.
+
+    Wire format is determined by the ChunkFormat strategy:
+    - SSEFormat (default): Base64url-encoded SSE data field
+    - RawFormat: Binary length || counter || ciphertext
 
     Automatically handles decompression based on encoding ID prefix.
     """
 
     session: StreamingSession
+    format: ChunkFormat = field(default_factory=SSEFormat)
     expected_counter: int = field(default=1)  # Expect counter starting at 1
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
     _decompressor: Any = field(init=False, repr=False, default=None)  # Lazy init, reused
@@ -378,32 +467,28 @@ class SSEDecryptor:
             self._decompressor = zstd.ZstdDecompressor()
         return self._decompressor
 
-    def decrypt(self, sse_data: str) -> bytes:
+    def decrypt(self, data: bytes | str) -> bytes:
         """
-        Decrypt an SSE data field to recover the original chunk.
+        Decrypt a chunk to recover the original data.
 
         Args:
-            sse_data: base64url-encoded payload from SSE data field
+            data: Encrypted data in format-specific encoding
 
         Returns:
-            Original raw SSE chunk as bytes exactly as server sent it
+            Original raw chunk as bytes
 
         Raises:
             ReplayAttackError: If counter is out of order
             DecryptionError: If decryption fails or unknown encoding
         """
-        # Decode payload
+        # Parse via format strategy
         try:
-            payload = b64url_decode(sse_data)
+            counter, ciphertext = self.format.decode(data)
         except Exception as e:
-            raise DecryptionError("Invalid base64url encoding") from e
+            raise DecryptionError("Failed to decode chunk") from e
 
-        if len(payload) < SSE_COUNTER_SIZE + 16:  # Counter + minimum ciphertext (tag only)
-            raise DecryptionError("Payload too short")
-
-        # Extract counter and ciphertext (zero-copy slicing via memoryview)
-        counter = int.from_bytes(payload[:SSE_COUNTER_SIZE], "big")
-        ciphertext = payload[SSE_COUNTER_SIZE:]
+        if len(ciphertext) < CHACHA20_POLY1305_TAG_SIZE:  # Minimum ciphertext (tag only)
+            raise DecryptionError("Ciphertext too short")
 
         # Validate counter monotonicity
         if counter != self.expected_counter:
@@ -412,16 +497,16 @@ class SSEDecryptor:
         # Decrypt
         nonce = self._compute_nonce(counter)
         try:
-            data = self._cipher.decrypt(nonce, ciphertext, associated_data=None)
+            payload = self._cipher.decrypt(nonce, ciphertext, associated_data=None)
         except Exception as e:
-            raise DecryptionError("SSE decryption failed") from e
+            raise DecryptionError("Decryption failed") from e
 
         # Parse encoding_id and decompress if needed
-        if len(data) < 1:
+        if len(payload) < 1:
             raise DecryptionError("Decrypted payload too short (missing encoding ID)")
 
-        encoding_id = data[0]
-        encoded_payload = data[1:]
+        encoding_id = payload[0]
+        encoded_payload = payload[1:]
 
         if encoding_id == SSEEncodingId.ZSTD:
             try:

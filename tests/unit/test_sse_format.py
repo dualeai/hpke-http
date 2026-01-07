@@ -6,18 +6,18 @@ Tests encrypted SSE output format compliance.
 import re
 
 from hpke_http.headers import b64url_decode
-from hpke_http.streaming import SSEEncryptor, StreamingSession
+from hpke_http.streaming import ChunkEncryptor, StreamingSession
 from tests.conftest import extract_sse_data_field
 
 
 class TestSSEOutputFormat:
-    """Test SSEEncryptor output format compliance."""
+    """Test ChunkEncryptor output format compliance."""
 
     def test_sse_format_basic(self) -> None:
         """Encrypted SSE should have correct format."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
@@ -32,7 +32,7 @@ class TestSSEOutputFormat:
         """SSE output should use LF (not CRLF)."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\n\n")
 
@@ -45,7 +45,7 @@ class TestSSEOutputFormat:
         """SSE event should end with \\n\\n."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\n\n")
 
@@ -55,7 +55,7 @@ class TestSSEOutputFormat:
         """Data field should be valid base64url."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
@@ -73,7 +73,7 @@ class TestSSEOutputFormat:
         """Event type in SSE should always be 'enc'."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         # Different content types
         for content in [
@@ -87,12 +87,12 @@ class TestSSEOutputFormat:
 
     def test_raw_passthrough_preserves_content(self) -> None:
         """Raw content should roundtrip exactly."""
-        from hpke_http.streaming import SSEDecryptor
+        from hpke_http.streaming import ChunkDecryptor
 
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         # Various SSE chunk types
         chunks = [
