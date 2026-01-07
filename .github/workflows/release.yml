@@ -115,7 +115,7 @@ jobs:
 
   publish-testpypi:
     needs: build
-    runs-on: linux-arm64-ubuntu2404-small-private
+    runs-on: linux-x64-ubuntu2404-small-private  # x64 required: pypi-publish action is amd64 only
     timeout-minutes: 10
     environment:
       name: testpypi
@@ -139,7 +139,7 @@ jobs:
 
   publish-pypi:
     needs: [build, publish-testpypi]
-    runs-on: linux-arm64-ubuntu2404-small-private
+    runs-on: linux-x64-ubuntu2404-small-private  # x64 required: pypi-publish action is amd64 only
     timeout-minutes: 10
     environment:
       name: pypi
