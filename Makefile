@@ -2,6 +2,19 @@
 name ?= hpke_http
 python_version ?= 3.10  # Lowest compatible version (see pyproject.toml requires-python)
 
+# Versions
+version_full ?= $(shell $(MAKE) --silent version-full)
+version_small ?= $(shell $(MAKE) --silent version)
+
+version:
+	@bash ./cicd/version.sh -g . -c
+
+version-full:
+	@bash ./cicd/version.sh -g . -c -m
+
+version-pypi:
+	@bash ./cicd/version.sh -g .
+
 install:
 	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
@@ -87,3 +100,15 @@ test-fuzz:
 lint:
 	uv run ruff format .
 	uv run ruff check --fix .
+
+# Build and publish
+build:
+	rm -rf dist/
+	uv build
+	uv run twine check dist/*
+
+publish-test:
+	uv publish --publish-url https://test.pypi.org/legacy/
+
+publish:
+	uv publish

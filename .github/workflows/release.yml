@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# CLI versions are centralized here for easy maintenance
+env:
+  CYCLONEDX_CLI_VERSION: v0.29.2 # https://github.com/CycloneDX/cyclonedx-cli/releases
+
+permissions:
+  attestations: write # Required for GitHub attestations
+  contents: write # Required for release asset upload
+  id-token: write # Required for PyPI trusted publishing + Sigstore signing
+
+jobs:
+  build:
+    runs-on: linux-arm64-ubuntu2404-small-private
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Inject version from git tag
+        run: |
+          VERSION=$(./cicd/version.sh -g .)
+          VERSION_FULL=$(./cicd/version.sh -g . -c -m)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION_FULL=$VERSION_FULL" >> $GITHUB_ENV
+          echo "Injecting version: $VERSION (full: $VERSION_FULL)"
+          sed -i "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
+          sed -i "s/__version_full__ = .*/__version_full__ = \"$VERSION_FULL\"/" src/hpke_http/__init__.py
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify build artifacts
+        run: |
+          ls -la dist/
+          test -f dist/hpke_http-*.whl
+          test -f dist/hpke_http-*.tar.gz
+          uv run twine check dist/*
+
+      - name: Generate SBOM (CycloneDX)
+        run: uv export --format cyclonedx1.5 --all-extras --output-file sbom.cyclonedx.json
+
+      - name: Install CycloneDX CLI
+        run: |
+          curl -sSfL "https://github.com/CycloneDX/cyclonedx-cli/releases/download/${{ env.CYCLONEDX_CLI_VERSION }}/cyclonedx-linux-arm64" -o cyclonedx
+          chmod +x cyclonedx
+
+      - name: Convert to SPDX
+        run: ./cyclonedx convert --input-file sbom.cyclonedx.json --output-file sbom.spdx.json --output-format spdxjson
+
+      - name: Validate SBOMs
+        run: |
+          echo "Validating CycloneDX SBOM..."
+          jq empty sbom.cyclonedx.json
+          echo "- Components: $(jq '.components | length' sbom.cyclonedx.json)"
+          echo "Validating SPDX SBOM..."
+          jq empty sbom.spdx.json
+          echo "- Packages: $(jq '.packages | length' sbom.spdx.json)"
+
+      - name: Attest SBOM (CycloneDX)
+        uses: actions/attest-sbom@v3.0.0
+        with:
+          subject-path: dist/*
+          sbom-path: sbom.cyclonedx.json
+
+      - name: Attest SBOM (SPDX)
+        uses: actions/attest-sbom@v3.0.0
+        with:
+          subject-path: dist/*
+          sbom-path: sbom.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3.1.0
+        with:
+          subject-path: dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: dist
+          path: dist/
+          retention-days: 30
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: sbom
+          path: |
+            sbom.cyclonedx.json
+            sbom.spdx.json
+          retention-days: 30
+
+  publish-testpypi:
+    needs: build
+    runs-on: linux-arm64-ubuntu2404-small-private
+    timeout-minutes: 10
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/hpke_http
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6.0.0
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true
+          print-hash: true
+
+  publish-pypi:
+    needs: [build, publish-testpypi]
+    runs-on: linux-arm64-ubuntu2404-small-private
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hpke_http
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6.0.0
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+          print-hash: true
+
+  upload-release:
+    needs: [build, publish-pypi]
+    runs-on: linux-arm64-ubuntu2404-small-private
+    timeout-minutes: 5
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6.0.0
+        with:
+          name: dist
+          path: dist/
+
+      - name: Download SBOM artifacts
+        uses: actions/download-artifact@v6.0.0
+        with:
+          name: sbom
+          path: sbom/
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          files: |
+            sbom/sbom.cyclonedx.json
+            sbom/sbom.spdx.json
+            dist/*
+
+      - name: Generate job summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Published To" >> $GITHUB_STEP_SUMMARY
+          echo "- [TestPyPI](https://test.pypi.org/p/hpke_http)" >> $GITHUB_STEP_SUMMARY
+          echo "- [PyPI](https://pypi.org/p/hpke_http)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Attestations" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub: SBOM (CycloneDX + SPDX), Build Provenance" >> $GITHUB_STEP_SUMMARY
+          echo "- PyPI: PEP 740 Digital Attestations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- $(ls -1 dist/ | wc -l | tr -d ' ') distribution files" >> $GITHUB_STEP_SUMMARY
+          echo "- 2 SBOM files (CycloneDX, SPDX)" >> $GITHUB_STEP_SUMMARY
