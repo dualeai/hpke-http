@@ -230,3 +230,17 @@ ZSTD_COMPRESSION_LEVEL: Final[int] = 3
 
 ZSTD_MIN_SIZE: Final[int] = 64
 """Minimum payload size for compression. Smaller payloads skip compression."""
+
+ZSTD_STREAMING_THRESHOLD: Final[int] = 1024 * 1024  # 1MB
+"""Threshold for using streaming compression vs in-memory.
+
+Payloads >= this size use streaming compression with constant memory (~4MB).
+Smaller payloads use in-memory compression for better performance.
+"""
+
+ZSTD_STREAMING_CHUNK_SIZE: Final[int] = 4 * 1024 * 1024  # 4MB
+"""Chunk size for streaming compression write operations.
+
+Determines how much data is written to ZstdFile at once.
+Affects peak memory usage during compression.
+"""

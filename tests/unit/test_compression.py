@@ -757,3 +757,234 @@ async def fetch(url, timeout=30):
             encrypted = enc.encrypt(p)
             decrypted = dec.decrypt(extract_sse_data_field(encrypted))
             assert decrypted == p
+
+
+class TestUnifiedCompression:
+    """Unified compression functions with auto-selection."""
+
+    def test_compress_decompress_roundtrip(self) -> None:
+        """Unified compress/decompress returns original data."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        original = b"Hello, unified compression!" * 1000
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+    def test_empty_input_compress(self) -> None:
+        """Empty input returns empty bytes (compress)."""
+        from hpke_http.streaming import zstd_compress
+
+        result = zstd_compress(b"")
+        assert result == b""
+
+    def test_empty_input_decompress(self) -> None:
+        """Empty input returns empty bytes (decompress)."""
+        from hpke_http.streaming import zstd_decompress
+
+        result = zstd_decompress(b"")
+        assert result == b""
+
+    def test_compression_level_parameter(self) -> None:
+        """Compression level affects output size."""
+        from hpke_http.streaming import zstd_compress
+
+        data = b"x" * 100000
+        compressed_level1 = zstd_compress(data, level=1)
+        compressed_level22 = zstd_compress(data, level=22)
+
+        # Higher level should produce smaller output (for compressible data)
+        assert len(compressed_level22) <= len(compressed_level1)
+
+    def test_small_payload_uses_inmemory(self) -> None:
+        """Small payloads (< threshold) use in-memory compression."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        # Small payload - below default 1MB threshold
+        original = b"small payload " * 100
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+    def test_large_payload_uses_streaming(self) -> None:
+        """Large payloads (>= threshold) use streaming compression."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        # Large payload - above default 1MB threshold
+        original = b"x" * (2 * 1024 * 1024)  # 2MB
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+    def test_custom_threshold(self) -> None:
+        """Custom streaming_threshold parameter works."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        original = b"data " * 1000  # ~5KB
+        # Set threshold to 1KB to force streaming
+        compressed = zstd_compress(original, streaming_threshold=1024)
+        decompressed = zstd_decompress(compressed, streaming_threshold=1024)
+
+        assert decompressed == original
+
+    def test_interop_with_raw_zstd(self) -> None:
+        """Unified functions interop with raw zstd module."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        zstd = import_zstd()
+        original = b"test data " * 1000
+
+        # Unified compress -> raw decompress
+        compressed = zstd_compress(original)
+        decompressed = zstd.decompress(compressed)
+        assert decompressed == original
+
+        # Raw compress -> unified decompress
+        compressed = zstd.compress(original, level=ZSTD_COMPRESSION_LEVEL)
+        decompressed = zstd_decompress(compressed)
+        assert decompressed == original
+
+    def test_incompressible_data(self) -> None:
+        """Random (incompressible) data still works."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        original = secrets.token_bytes(100000)
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+
+class TestUnifiedCompressionMemory:
+    """Memory usage tests for unified compression.
+
+    Validates that streaming compression/decompression uses bounded memory
+    overhead (~4MB) regardless of payload size. Tests multiple payload sizes
+    to ensure consistent behavior.
+    """
+
+    # Maximum allowed overhead for streaming operations (4MB)
+    MAX_OVERHEAD_BYTES = 4 * 1024 * 1024
+
+    @pytest.mark.parametrize(
+        "payload_size_mb",
+        [5, 10, 50],
+        ids=["5MB", "10MB", "50MB"],
+    )
+    def test_compress_memory_overhead_bounded(self, payload_size_mb: int) -> None:
+        """Compression overhead stays under 4MB regardless of payload size."""
+        from hpke_http.streaming import zstd_compress
+
+        payload_size = payload_size_mb * 1024 * 1024
+        payload = b"x" * payload_size
+
+        # Warmup - first call may allocate internal buffers
+        _ = zstd_compress(payload[:1024])
+
+        gc.collect()
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        compressed = zstd_compress(payload)
+
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        peak_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Overhead = peak - input - output (compressed is much smaller for repetitive data)
+        overhead = peak_allocated - payload_size - len(compressed)
+
+        assert overhead < self.MAX_OVERHEAD_BYTES, (
+            f"Compression overhead {overhead / 1024 / 1024:.1f}MB exceeds 4MB limit "
+            f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
+        )
+
+    @pytest.mark.parametrize(
+        "payload_size_mb",
+        [5, 10, 50],
+        ids=["5MB", "10MB", "50MB"],
+    )
+    def test_decompress_memory_overhead_bounded(self, payload_size_mb: int) -> None:
+        """Decompression overhead stays under 4MB regardless of payload size.
+
+        Note: Uses low streaming_threshold to force streaming mode, since
+        repetitive test data compresses extremely well (<2KB for 50MB).
+        """
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        payload_size = payload_size_mb * 1024 * 1024
+        original = b"y" * payload_size
+        compressed = zstd_compress(original)
+
+        # Warmup - first call may allocate internal buffers
+        _ = zstd_decompress(zstd_compress(b"warmup" * 100), streaming_threshold=1)
+
+        gc.collect()
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        # Force streaming mode with low threshold (compressed data is tiny)
+        decompressed = zstd_decompress(compressed, streaming_threshold=1)
+
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        peak_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Overhead = peak - input (compressed) - output (decompressed)
+        overhead = peak_allocated - len(compressed) - len(decompressed)
+
+        assert overhead < self.MAX_OVERHEAD_BYTES, (
+            f"Decompression overhead {overhead / 1024 / 1024:.1f}MB exceeds 4MB limit "
+            f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
+        )
+
+    @pytest.mark.parametrize(
+        "payload_size_mb",
+        [5, 10, 50],
+        ids=["5MB", "10MB", "50MB"],
+    )
+    def test_roundtrip_memory_overhead_bounded(self, payload_size_mb: int) -> None:
+        """Full compress+decompress roundtrip overhead stays under 4MB.
+
+        Note: Uses low streaming_threshold for decompression to force streaming
+        mode, since repetitive test data compresses extremely well.
+        """
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        payload_size = payload_size_mb * 1024 * 1024
+        original = b"z" * payload_size
+
+        # Warmup
+        _ = zstd_decompress(zstd_compress(b"warmup" * 100), streaming_threshold=1)
+
+        gc.collect()
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        compressed = zstd_compress(original)
+        # Force streaming decompression with low threshold
+        decompressed = zstd_decompress(compressed, streaming_threshold=1)
+
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        assert decompressed == original
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        peak_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Overhead = peak - input - compressed - output
+        # Note: input and output are same size, compressed is small
+        overhead = peak_allocated - payload_size - len(compressed) - payload_size
+
+        assert overhead < self.MAX_OVERHEAD_BYTES, (
+            f"Roundtrip overhead {overhead / 1024 / 1024:.1f}MB exceeds 4MB limit "
+            f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
+        )

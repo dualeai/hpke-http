@@ -37,7 +37,6 @@ from hpke_http.constants import (
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
-    ZSTD_COMPRESSION_LEVEL,
     ZSTD_MIN_SIZE,
     KemId,
 )
@@ -45,7 +44,7 @@ from hpke_http.envelope import encode_envelope
 from hpke_http.exceptions import DecryptionError, KeyDiscoveryError
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import SenderContext, setup_sender_psk
-from hpke_http.streaming import SSEDecryptor, StreamingSession, import_zstd
+from hpke_http.streaming import SSEDecryptor, StreamingSession, zstd_compress
 
 __all__ = [
     "HPKEClientSession",
@@ -228,8 +227,7 @@ class HPKEClientSession:
         was_compressed = False
         if self.compress and len(body) >= ZSTD_MIN_SIZE:
             original_size = len(body)
-            zstd = import_zstd()
-            body = zstd.compress(body, level=ZSTD_COMPRESSION_LEVEL)
+            body = zstd_compress(body)
             was_compressed = True
             _logger.debug(
                 "Request compressed: original=%d compressed=%d ratio=%.1f%%",

@@ -16,6 +16,7 @@ Reference: RFC-065 §6
 
 from __future__ import annotations
 
+import io
 import secrets
 import sys
 import threading
@@ -32,6 +33,8 @@ from hpke_http.constants import (
     SSE_SESSION_SALT_SIZE,
     ZSTD_COMPRESSION_LEVEL,
     ZSTD_MIN_SIZE,
+    ZSTD_STREAMING_CHUNK_SIZE,
+    ZSTD_STREAMING_THRESHOLD,
     SSEEncodingId,
 )
 from hpke_http.exceptions import DecryptionError, ReplayAttackError, SessionExpiredError
@@ -73,12 +76,119 @@ def import_zstd() -> Any:
     return _zstd_module  # type: ignore[return-value]
 
 
+def _zstd_compress_streaming(
+    data: bytes,
+    level: int,
+    chunk_size: int,
+) -> bytes:
+    """Internal: streaming compression with ZstdFile."""
+    zstd = import_zstd()
+    output = io.BytesIO()
+
+    with zstd.ZstdFile(output, mode="wb", level=level) as f:
+        for offset in range(0, len(data), chunk_size):
+            f.write(data[offset : offset + chunk_size])
+
+    return output.getvalue()
+
+
+def _zstd_decompress_streaming(
+    data: bytes,
+    chunk_size: int,
+) -> bytes:
+    """Internal: streaming decompression with ZstdFile."""
+    zstd = import_zstd()
+    input_buffer = io.BytesIO(data)
+    output_chunks: list[bytes] = []
+
+    with zstd.ZstdFile(input_buffer, mode="rb") as f:
+        while chunk := f.read(chunk_size):
+            output_chunks.append(chunk)
+
+    return b"".join(output_chunks)
+
+
+def zstd_compress(
+    data: bytes,
+    level: int = ZSTD_COMPRESSION_LEVEL,
+    streaming_threshold: int = ZSTD_STREAMING_THRESHOLD,
+) -> bytes:
+    """
+    Compress data, auto-selecting streaming for large payloads.
+
+    For payloads >= streaming_threshold (default 1MB), uses streaming
+    compression with ~4MB constant memory. Smaller payloads use faster
+    in-memory compression.
+
+    Args:
+        data: Raw bytes to compress
+        level: Compression level (1-22, default 3 = fast)
+        streaming_threshold: Size threshold for streaming mode (default 1MB)
+
+    Returns:
+        Compressed bytes in Zstandard format
+
+    Raises:
+        ImportError: If backports.zstd not installed (Python < 3.14)
+
+    Example:
+        >>> compressed = zstd_compress(large_image_bytes)
+        >>> # Auto-selects streaming for 50MB+ payloads
+    """
+    if not data:
+        return b""
+
+    if len(data) >= streaming_threshold:
+        return _zstd_compress_streaming(data, level, ZSTD_STREAMING_CHUNK_SIZE)
+
+    zstd = import_zstd()
+    return zstd.compress(data, level=level)
+
+
+def zstd_decompress(
+    data: bytes,
+    streaming_threshold: int = ZSTD_STREAMING_THRESHOLD,
+) -> bytes:
+    """
+    Decompress data, auto-selecting streaming for large payloads.
+
+    For compressed payloads >= streaming_threshold (default 1MB), uses
+    streaming decompression with bounded memory. Smaller payloads use
+    faster in-memory decompression.
+
+    Args:
+        data: Zstandard-compressed bytes
+        streaming_threshold: Size threshold for streaming mode (default 1MB)
+
+    Returns:
+        Decompressed bytes
+
+    Raises:
+        ImportError: If backports.zstd not installed (Python < 3.14)
+        zstd.ZstdError: If data is invalid or corrupted
+
+    Example:
+        >>> original = zstd_decompress(compressed_data)
+        >>> # Auto-selects streaming for large compressed payloads
+    """
+    if not data:
+        return b""
+
+    if len(data) >= streaming_threshold:
+        return _zstd_decompress_streaming(data, ZSTD_STREAMING_CHUNK_SIZE)
+
+    zstd = import_zstd()
+    return zstd.decompress(data)
+
+
 __all__ = [
     "SSEDecryptor",
     "SSEEncryptor",
     "StreamingSession",
     "create_session_from_context",
     "import_zstd",
+    "zstd_compress",
+    "zstd_decompress",
 ]
 
 

@@ -56,7 +56,11 @@ from hpke_http.envelope import decode_envelope
 from hpke_http.exceptions import CryptoError, DecryptionError, EnvelopeError
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import setup_recipient_psk
-from hpke_http.streaming import SSEEncryptor, create_session_from_context, import_zstd
+from hpke_http.streaming import (
+    SSEEncryptor,
+    create_session_from_context,
+    zstd_decompress,
+)
 
 __all__ = [
     "HPKEMiddleware",
@@ -446,13 +450,12 @@ class HPKEMiddleware:
         if encoding_header == b"zstd":
             try:
                 compressed_size = len(plaintext)
-                zstd = import_zstd()
-                plaintext = zstd.decompress(plaintext)
+                plaintext = zstd_decompress(plaintext)
                 _logger.debug(
                     "Request decompressed: compressed=%d decompressed=%d ratio=%.1f%%",
                     compressed_size,
                     len(plaintext),
-                    compressed_size / len(plaintext) * 100,
+                    compressed_size / len(plaintext) * 100 if plaintext else 0,
                 )
             except ImportError as e:
                 raise DecryptionError(f"Zstd decompression unavailable: {e}") from e
