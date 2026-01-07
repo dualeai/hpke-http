@@ -19,7 +19,8 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
-from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
+from hpke_http.streaming import SSEDecryptor, SSEEncryptor
+from tests.conftest import extract_sse_data_field, make_sse_session
 
 T = TypeVar("T")
 
@@ -265,19 +266,6 @@ class TestSSEMemory:
     - Wire format overhead (base64 + counter + tag)
     """
 
-    @staticmethod
-    def _make_session() -> StreamingSession:
-        """Create a test SSE session."""
-        return StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found")
-
     @pytest.mark.parametrize("chunk_size", [64, 1024, 64 * 1024])
     def test_sse_encrypt_overhead_bounded(self, chunk_size: int) -> None:
         """SSE encryption overhead is bounded (base64 + wire format).
@@ -287,7 +275,7 @@ class TestSSEMemory:
         - 20B payload overhead (4B counter + 16B tag)
         - 33% base64 encoding expansion
         """
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
         chunk = secrets.token_bytes(chunk_size)
 
@@ -313,25 +301,23 @@ class TestSSEMemory:
         Overhead = base64 decode temp buffer only.
         Expected: allocation < 1.1x ciphertext size.
         """
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
         chunk = secrets.token_bytes(payload_size)
 
-        # Create encrypted data
-        encrypted = encryptor.encrypt(chunk)
-        data_field = self._extract_data_field(encrypted)
+        # Create two encrypted messages (counter increments)
+        encrypted_warmup = encryptor.encrypt(chunk)
+        encrypted_measure = encryptor.encrypt(chunk)
+        data_field_warmup = extract_sse_data_field(encrypted_warmup)
+        data_field_measure = extract_sse_data_field(encrypted_measure)
 
-        # Warmup
-        _ = decryptor.decrypt(data_field)
-        # Reset decryptor for fresh measurement
-        decryptor = SSEDecryptor(self._make_session())
-        encryptor2 = SSEEncryptor(self._make_session())
-        encrypted2 = encryptor2.encrypt(chunk)
-        data_field2 = self._extract_data_field(encrypted2)
+        # Warmup the same decryptor we'll measure
+        _ = decryptor.decrypt(data_field_warmup)
         gc.collect()
 
-        allocated, plaintext = measure_allocation(lambda: decryptor.decrypt(data_field2))
+        # Measure the warmed-up decryptor
+        allocated, plaintext = measure_allocation(lambda: decryptor.decrypt(data_field_measure))
 
         # Allocation should be proportional to payload
         max_expected = int(payload_size * 1.2) + 10 * 1024  # 1.2x + 10KB buffer
@@ -345,7 +331,7 @@ class TestSSEMemory:
 
         Verifies zero-copy optimizations prevent memory accumulation.
         """
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
         chunk = b"event: test\ndata: {}\n\n"
@@ -353,7 +339,7 @@ class TestSSEMemory:
         # Warmup phase
         for _ in range(100):
             encrypted = encryptor.encrypt(chunk)
-            data_field = self._extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decryptor.decrypt(data_field)
         gc.collect()
 
@@ -363,7 +349,7 @@ class TestSSEMemory:
 
         for _ in range(1000):
             encrypted = encryptor.encrypt(chunk)
-            data_field = self._extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             plaintext = decryptor.decrypt(data_field)
             assert plaintext == chunk
 
@@ -384,7 +370,7 @@ class TestSSEMemory:
 
         Verifies no quadratic blowup from string operations.
         """
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
 
         # 100KB chunk

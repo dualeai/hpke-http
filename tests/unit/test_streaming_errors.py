@@ -12,29 +12,15 @@ from hpke_http.streaming import (
     SSEEncryptor,
     StreamingSession,
 )
+from tests.conftest import extract_sse_data_field, make_sse_session
 
 
 class TestDecryptionErrors:
     """Test DecryptionError paths in SSEDecryptor."""
 
-    def _make_session(self) -> StreamingSession:
-        """Create a test session."""
-        return StreamingSession(
-            session_key=b"0" * 32,
-            session_salt=b"salt",
-        )
-
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found")
-
     def test_invalid_base64_raises(self) -> None:
         """Invalid base64url should raise DecryptionError."""
-        session = self._make_session()
+        session = make_sse_session()
         decryptor = SSEDecryptor(session)
 
         # Single character causes base64 decode error (1 mod 4 = 1 is invalid)
@@ -43,7 +29,7 @@ class TestDecryptionErrors:
 
     def test_truncated_payload_raises(self) -> None:
         """Payload shorter than counter + min ciphertext should raise."""
-        session = self._make_session()
+        session = make_sse_session()
         decryptor = SSEDecryptor(session)
 
         # 4-byte counter + 16-byte tag minimum = 20 bytes
@@ -54,13 +40,13 @@ class TestDecryptionErrors:
 
     def test_corrupted_ciphertext_raises(self) -> None:
         """Bit flip in ciphertext should raise DecryptionError."""
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
         # Encrypt valid chunk
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
-        encoded = self._extract_data_field(encrypted)
+        encoded = extract_sse_data_field(encrypted)
 
         # Decode, corrupt, re-encode
         from hpke_http.headers import b64url_decode
@@ -81,7 +67,7 @@ class TestDecryptionErrors:
         decryptor = SSEDecryptor(session2)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
-        encoded = self._extract_data_field(encrypted)
+        encoded = extract_sse_data_field(encrypted)
 
         with pytest.raises(DecryptionError, match="decryption failed"):
             decryptor.decrypt(encoded)
@@ -95,7 +81,7 @@ class TestDecryptionErrors:
         decryptor = SSEDecryptor(session2)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
-        encoded = self._extract_data_field(encrypted)
+        encoded = extract_sse_data_field(encrypted)
 
         with pytest.raises(DecryptionError, match="decryption failed"):
             decryptor.decrypt(encoded)
@@ -104,25 +90,14 @@ class TestDecryptionErrors:
 class TestReplayOrderErrors:
     """Test replay attack and counter order error paths."""
 
-    def _make_session(self) -> StreamingSession:
-        """Create a test session."""
-        return StreamingSession(session_key=b"0" * 32, session_salt=b"salt")
-
-    def _extract_data(self, sse_event: bytes) -> str:
-        """Extract data field from SSE event bytes."""
-        for line in sse_event.decode("ascii").split("\n"):
-            if line.startswith("data:"):
-                return line.split(": ", 1)[1]
-        raise ValueError("No data field found")
-
     def test_replay_same_event_raises(self) -> None:
         """Decrypting same event twice should raise ReplayAttackError."""
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
-        data = self._extract_data(encrypted)
+        data = extract_sse_data_field(encrypted)
 
         # First decryption succeeds
         decryptor.decrypt(data)
@@ -136,14 +111,14 @@ class TestReplayOrderErrors:
 
     def test_out_of_order_raises(self) -> None:
         """Receiving event 2 when expecting 1 should raise ReplayAttackError."""
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
         # Generate events 1 and 2
         _event1 = encryptor.encrypt(b"event: first\n\n")
         event2 = encryptor.encrypt(b"event: second\n\n")
-        data2 = self._extract_data(event2)
+        data2 = extract_sse_data_field(event2)
 
         # Try to decrypt event 2 first (expecting 1)
         with pytest.raises(ReplayAttackError) as exc:
@@ -154,7 +129,7 @@ class TestReplayOrderErrors:
 
     def test_skipped_counter_raises(self) -> None:
         """Skipping counter (1, then 3) should raise ReplayAttackError."""
-        session = self._make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session)
         decryptor = SSEDecryptor(session)
 
@@ -164,11 +139,11 @@ class TestReplayOrderErrors:
         event3 = encryptor.encrypt(b"event: three\n\n")
 
         # Decrypt event 1
-        decryptor.decrypt(self._extract_data(event1))
+        decryptor.decrypt(extract_sse_data_field(event1))
 
         # Skip event 2, try event 3 (expecting 2)
         with pytest.raises(ReplayAttackError) as exc:
-            decryptor.decrypt(self._extract_data(event3))
+            decryptor.decrypt(extract_sse_data_field(event3))
 
         assert exc.value.expected == 2
         assert exc.value.received == 3

@@ -7,18 +7,11 @@ import re
 
 from hpke_http.headers import b64url_decode
 from hpke_http.streaming import SSEEncryptor, StreamingSession
+from tests.conftest import extract_sse_data_field
 
 
 class TestSSEOutputFormat:
     """Test SSEEncryptor output format compliance."""
-
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found")
 
     def test_sse_format_basic(self) -> None:
         """Encrypted SSE should have correct format."""
@@ -67,7 +60,7 @@ class TestSSEOutputFormat:
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
         # Extract data field
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
 
         # Should be valid base64url (no exceptions)
         decoded = b64url_decode(data)
@@ -112,6 +105,6 @@ class TestSSEOutputFormat:
 
         for original in chunks:
             encrypted = encryptor.encrypt(original)
-            data = self._extract_data_field(encrypted)
+            data = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data)
             assert decrypted == original, f"Failed for: {original!r}"

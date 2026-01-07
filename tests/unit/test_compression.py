@@ -21,9 +21,9 @@ from hpke_http.exceptions import DecryptionError
 from hpke_http.streaming import (
     SSEDecryptor,
     SSEEncryptor,
-    StreamingSession,
     import_zstd,
 )
+from tests.conftest import extract_sse_data_field, make_sse_session
 
 
 def _zstd_available() -> bool:
@@ -42,25 +42,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_session() -> StreamingSession:
-    """Create a test streaming session."""
-    return StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-
-
-def _extract_data_field(sse: bytes) -> str:
-    """Extract data field from encrypted SSE output."""
-    for line in sse.decode("ascii").split("\n"):
-        if line.startswith("data: "):
-            return line[6:]
-    raise ValueError("No data field found")
-
-
 class TestSSECompression:
     """Zstd compression for SSE streaming."""
 
     def test_compress_sse_roundtrip(self) -> None:
         """Compressed SSE encrypt/decrypt roundtrip works."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
@@ -68,14 +55,14 @@ class TestSSECompression:
         chunk = json.dumps({"data": "x" * 1000, "id": 123}).encode()
 
         encrypted = encryptor.encrypt(chunk)
-        data_field = _extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
 
     def test_encoding_id_zstd_in_payload(self) -> None:
         """Encoding ID ZSTD is correctly set for large chunks."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
 
         # Large chunk - should be compressed
@@ -84,14 +71,14 @@ class TestSSECompression:
         encrypted = encryptor.encrypt(chunk)
         # Verify it decrypts correctly (encoding ID is parsed internally)
         decryptor = SSEDecryptor(session)
-        data_field = _extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
 
     def test_encoding_id_identity_for_small_chunks(self) -> None:
         """Small chunks use IDENTITY encoding (no compression)."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
@@ -100,14 +87,14 @@ class TestSSECompression:
         assert len(chunk) < ZSTD_MIN_SIZE
 
         encrypted = encryptor.encrypt(chunk)
-        data_field = _extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
 
     def test_compression_disabled_uses_identity(self) -> None:
         """compress=False always uses IDENTITY encoding."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=False)
         decryptor = SSEDecryptor(session)
 
@@ -115,7 +102,7 @@ class TestSSECompression:
         chunk = b"x" * 1000
 
         encrypted = encryptor.encrypt(chunk)
-        data_field = _extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
@@ -134,7 +121,7 @@ class TestSSECompression:
 
     def test_unknown_encoding_raises_error(self) -> None:
         """Unknown encoding ID raises DecryptionError."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=False)
 
         # Encrypt with IDENTITY encoding (not used - we manually craft invalid payload below)
@@ -147,7 +134,7 @@ class TestSSECompression:
         from hpke_http.headers import b64url_encode
 
         # Create a new session for tampering
-        tamper_session = _make_session()
+        tamper_session = make_sse_session()
         cipher = ChaCha20Poly1305(tamper_session.session_key)
         nonce = tamper_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -163,7 +150,7 @@ class TestSSECompression:
 
     def test_multiple_chunks_compressed(self) -> None:
         """Multiple chunks compress/decompress correctly in sequence."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
@@ -173,7 +160,7 @@ class TestSSECompression:
 
         for chunk in chunks:
             encrypted = encryptor.encrypt(chunk)
-            data_field = _extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data_field)
             assert decrypted == chunk
 
@@ -237,7 +224,7 @@ class TestCompressionMemory:
 
     def test_streaming_no_memory_leak(self) -> None:
         """1000 compress/decompress cycles don't leak memory."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
         chunk = json.dumps({"data": "x" * 200}).encode()
@@ -245,12 +232,12 @@ class TestCompressionMemory:
         # Warmup
         for _ in range(100):
             encrypted = encryptor.encrypt(chunk)
-            data_field = _extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decryptor.decrypt(data_field)
         gc.collect()
 
         # Reset for fresh measurement
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
@@ -259,7 +246,7 @@ class TestCompressionMemory:
 
         for _ in range(1000):
             encrypted = encryptor.encrypt(chunk)
-            data_field = _extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data_field)
             assert decrypted == chunk
 
@@ -301,7 +288,7 @@ class TestCompressionMemory:
 
     def test_instance_reuse_memory_stable(self) -> None:
         """Reusing compressor/decompressor keeps memory stable."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         chunk = json.dumps({"data": "x" * 200}).encode()
 
@@ -338,7 +325,7 @@ class TestCompressionErrors:
         from hpke_http.constants import SSEEncodingId
         from hpke_http.headers import b64url_encode
 
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -360,7 +347,7 @@ class TestCompressionErrors:
         from hpke_http.headers import b64url_encode
 
         zstd = import_zstd()
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -385,7 +372,7 @@ class TestCompressionErrors:
         from hpke_http.constants import SSEEncodingId
         from hpke_http.headers import b64url_encode
 
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -406,7 +393,7 @@ class TestCompressionErrors:
 
         from hpke_http.headers import b64url_encode
 
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -427,7 +414,7 @@ class TestCompressionErrors:
 
         for encoding_id in [0x02, 0x03, 0x10, 0x80, 0xFE, 0xFF]:
             # Fresh session for each test (counter resets)
-            test_session = _make_session()
+            test_session = make_sse_session()
             test_cipher = ChaCha20Poly1305(test_session.session_key)
             nonce = test_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -446,29 +433,29 @@ class TestCompressionBoundaries:
 
     def test_exactly_min_size_compressed(self) -> None:
         """Chunk exactly at ZSTD_MIN_SIZE gets compressed."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
         chunk = b"x" * ZSTD_MIN_SIZE
         encrypted = encryptor.encrypt(chunk)
-        decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+        decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
         assert decrypted == chunk
 
     def test_below_min_size_not_compressed(self) -> None:
         """Chunk below ZSTD_MIN_SIZE uses IDENTITY."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
         chunk = b"x" * (ZSTD_MIN_SIZE - 1)
         encrypted = encryptor.encrypt(chunk)
-        decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+        decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
         assert decrypted == chunk
 
     def test_mixed_sizes_in_stream(self) -> None:
         """Stream with mixed sizes handles compression correctly."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
@@ -481,18 +468,18 @@ class TestCompressionBoundaries:
 
         for chunk in chunks:
             encrypted = encryptor.encrypt(chunk)
-            decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+            decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
             assert decrypted == chunk
 
     def test_incompressible_data_works(self) -> None:
         """Random (incompressible) data still works."""
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         decryptor = SSEDecryptor(session)
 
         chunk = secrets.token_bytes(200)
         encrypted = encryptor.encrypt(chunk)
-        decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+        decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
         assert decrypted == chunk
 
 
@@ -503,7 +490,7 @@ class TestCompressionThreadSafety:
         """SSEEncryptor handles concurrent encryption safely."""
         import threading
 
-        session = _make_session()
+        session = make_sse_session()
         encryptor = SSEEncryptor(session, compress=True)
         results: list[bytes] = []
         lock = threading.Lock()
@@ -539,7 +526,7 @@ class TestCompressionRatiosRealisticData:
 
     def _sse_wire_size(self, chunks: list[bytes], *, compress: bool) -> int:
         """Total encrypted SSE wire size."""
-        session = _make_session()
+        session = make_sse_session()
         enc = SSEEncryptor(session, compress=compress)
         return sum(len(enc.encrypt(c)) for c in chunks)
 
@@ -762,11 +749,11 @@ async def fetch(url, timeout=30):
             secrets.token_bytes(100),  # Raw binary
         ]
 
-        session = _make_session()
+        session = make_sse_session()
         enc = SSEEncryptor(session, compress=True)
         dec = SSEDecryptor(session)
 
         for p in patterns:
             encrypted = enc.encrypt(p)
-            decrypted = dec.decrypt(_extract_data_field(encrypted))
+            decrypted = dec.decrypt(extract_sse_data_field(encrypted))
             assert decrypted == p

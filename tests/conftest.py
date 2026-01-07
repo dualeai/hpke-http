@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 
 import aiohttp
 import pytest
@@ -15,6 +16,7 @@ import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
+from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
 
 # === Key Fixtures ===
 
@@ -92,6 +94,134 @@ def wrong_psk() -> bytes:
 def wrong_psk_id() -> bytes:
     """A PSK ID that differs from test_psk_id."""
     return b"wrong-tenant"
+
+
+# === SSE Test Utilities ===
+
+
+def extract_sse_data_field(sse: bytes) -> str:
+    """Extract data field from encrypted SSE output.
+
+    Args:
+        sse: Raw SSE event bytes (e.g., b"event: enc\\ndata: <payload>\\n\\n")
+
+    Returns:
+        The base64url-encoded payload string
+
+    Raises:
+        ValueError: If no data field found
+    """
+    for line in sse.decode("ascii").split("\n"):
+        if line.startswith("data: "):
+            return line[6:]
+    raise ValueError("No data field found in SSE event")
+
+
+def make_sse_session(
+    session_key: bytes = b"k" * 32,
+    session_salt: bytes = b"salt",
+) -> StreamingSession:
+    """Create a deterministic SSE session for testing.
+
+    Args:
+        session_key: 32-byte key (default: b"k" * 32)
+        session_salt: 4-byte salt (default: b"salt")
+
+    Returns:
+        StreamingSession with specified parameters
+    """
+    return StreamingSession(session_key=session_key, session_salt=session_salt)
+
+
+@dataclass
+class SSETestPair:
+    """Matched SSE encryptor/decryptor pair for testing.
+
+    Provides a convenient way to create encrypt/decrypt pairs with
+    optional warmup for memory measurement tests.
+
+    Example:
+        pair = SSETestPair.create(warmup_count=1)
+        encrypted = pair.encryptor.encrypt(b"test")
+        decrypted = pair.decryptor.decrypt(extract_sse_data_field(encrypted))
+    """
+
+    encryptor: SSEEncryptor
+    decryptor: SSEDecryptor
+    session: StreamingSession
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        compress: bool = False,
+        warmup_count: int = 0,
+        session_key: bytes = b"k" * 32,
+        session_salt: bytes = b"salt",
+    ) -> "SSETestPair":
+        """Create a matched encryptor/decryptor pair.
+
+        Args:
+            compress: Enable Zstd compression for encryptor
+            warmup_count: Number of warmup roundtrips to perform
+            session_key: 32-byte session key
+            session_salt: 4-byte session salt
+
+        Returns:
+            SSETestPair ready for use
+        """
+        session = StreamingSession(session_key=session_key, session_salt=session_salt)
+        pair = cls(
+            encryptor=SSEEncryptor(session, compress=compress),
+            decryptor=SSEDecryptor(session),
+            session=session,
+        )
+        if warmup_count > 0:
+            pair.warmup(warmup_count)
+        return pair
+
+    def warmup(self, count: int = 1, chunk: bytes = b"warmup") -> None:
+        """Perform warmup roundtrips to initialize cipher internals.
+
+        Args:
+            count: Number of roundtrips
+            chunk: Data to encrypt/decrypt
+        """
+        for _ in range(count):
+            encrypted = self.encryptor.encrypt(chunk)
+            data = extract_sse_data_field(encrypted)
+            self.decryptor.decrypt(data)
+
+    def roundtrip(self, chunk: bytes) -> bytes:
+        """Encrypt then decrypt a chunk.
+
+        Args:
+            chunk: Data to roundtrip
+
+        Returns:
+            Decrypted data (should equal input)
+        """
+        encrypted = self.encryptor.encrypt(chunk)
+        data = extract_sse_data_field(encrypted)
+        return self.decryptor.decrypt(data)
+
+
+@pytest.fixture
+def sse_session() -> StreamingSession:
+    """Fixture providing a deterministic SSE session."""
+    return make_sse_session()
+
+
+@pytest.fixture
+def sse_pair() -> SSETestPair:
+    """Fixture providing a matched SSE encryptor/decryptor pair."""
+    return SSETestPair.create()
+
+
+@pytest.fixture
+def sse_pair_warmed() -> SSETestPair:
+    """Fixture providing a warmed-up SSE pair (for memory tests)."""
+    return SSETestPair.create(warmup_count=1)
 
 
 # === E2E Server Fixtures ===
