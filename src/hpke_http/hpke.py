@@ -13,8 +13,10 @@ Cipher Suite:
 Reference: https://datatracker.ietf.org/doc/rfc9180/
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
+
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
@@ -24,8 +26,8 @@ from hpke_http.constants import (
     PSK_MIN_SIZE,
     SUITE_ID,
 )
-from hpke_http.exceptions import InvalidPSKError, SequenceOverflowError
-from hpke_http.primitives.aead import aead_open, aead_seal, compute_nonce
+from hpke_http.exceptions import DecryptionError, InvalidPSKError, SequenceOverflowError
+from hpke_http.primitives.aead import compute_nonce
 from hpke_http.primitives.kdf import labeled_expand, labeled_extract
 from hpke_http.primitives.kem import (
     _encap_deterministic,  # pyright: ignore[reportPrivateUsage] - internal package use
@@ -54,6 +56,15 @@ class HPKEContext:
 
     Maintains the sequence number for nonce computation and provides
     encryption/decryption operations.
+
+    The cipher instance is cached for efficient batch operations, avoiding
+    the overhead of creating a new ChaCha20Poly1305 instance per seal/open call.
+
+    TODO: Monitor pyca/cryptography for AEAD zero-copy buffer support.
+    As of cryptography 46.x (January 2026), ChaCha20Poly1305 uses single-shot
+    encrypt()/decrypt() without output buffer parameters. The `update_into()`
+    method exists only for block cipher modes (CBC, CTR), not AEAD constructs.
+    See: https://cryptography.io/en/latest/hazmat/primitives/aead/
     """
 
     key: bytes
@@ -68,9 +79,16 @@ class HPKEContext:
     seq: int = 0
     """Sequence number, incremented after each encryption/decryption."""
 
+    _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
+    """Cached AEAD cipher instance for efficient batch operations."""
+
     # Max sequence: (1 << (8 * Nn)) - 1 = 2^96 - 1 for 12-byte nonce
     # Nonce reuse is catastrophic for ChaCha20-Poly1305
     _MAX_SEQ: Final[int] = (1 << (8 * CHACHA20_POLY1305_NONCE_SIZE)) - 1
+
+    def __post_init__(self) -> None:
+        """Initialize cached cipher instance."""
+        self._cipher = ChaCha20Poly1305(self.key)
 
     def _increment_seq(self) -> None:
         """Increment sequence number, checking for overflow."""
@@ -124,7 +142,7 @@ class SenderContext(HPKEContext):
             Ciphertext with authentication tag
         """
         nonce = self._compute_nonce()
-        ct = aead_seal(self.key, nonce, aad, plaintext)
+        ct = self._cipher.encrypt(nonce, plaintext, aad if aad else None)
         self._increment_seq()
         return ct
 
@@ -148,7 +166,10 @@ class RecipientContext(HPKEContext):
             DecryptionError: If authentication fails
         """
         nonce = self._compute_nonce()
-        pt = aead_open(self.key, nonce, aad, ciphertext)
+        try:
+            pt = self._cipher.decrypt(nonce, ciphertext, aad if aad else None)
+        except Exception as e:
+            raise DecryptionError("Authentication failed") from e
         self._increment_seq()
         return pt
 
