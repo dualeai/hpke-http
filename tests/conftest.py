@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable
 
 import aiohttp
 import pytest
+import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
@@ -18,9 +19,12 @@ from hpke_http.constants import PSK_MIN_SIZE
 # === Key Fixtures ===
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def platform_keypair() -> tuple[bytes, bytes]:
-    """Generate a platform X25519 keypair for testing."""
+    """Generate a platform X25519 keypair for testing.
+
+    Session-scoped: one keypair per xdist worker, shared across all tests.
+    """
     private_key = x25519.X25519PrivateKey.generate()
     return (
         private_key.private_bytes_raw(),
@@ -57,15 +61,21 @@ def psk_factory() -> Callable[[int], bytes]:
     return _make_psk
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def test_psk() -> bytes:
-    """Test pre-shared key (API key). Fixed value for deterministic tests."""
+    """Test pre-shared key (API key). Fixed value for deterministic tests.
+
+    Session-scoped: shared with granian_server fixture.
+    """
     return b"test-api-key-for-hpke-psk-mode!!"  # 32 bytes
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def test_psk_id() -> bytes:
-    """Test pre-shared key ID (tenant ID)."""
+    """Test pre-shared key ID (tenant ID).
+
+    Session-scoped: shared with granian_server fixture.
+    """
     return b"tenant-123"
 
 
@@ -180,23 +190,30 @@ async def _start_granian_server(
             proc.wait()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def granian_server(
     platform_keypair: tuple[bytes, bytes],
     test_psk: bytes,
     test_psk_id: bytes,
 ) -> AsyncIterator[tuple[str, int, bytes]]:
-    """Start granian server with HPKE middleware."""
+    """Start granian server with HPKE middleware.
+
+    Session-scoped: one server per xdist worker, shared across all tests.
+    Eliminates port reuse issues and speeds up test execution.
+    """
     async for result in _start_granian_server(platform_keypair, test_psk, test_psk_id):
         yield result
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def granian_server_compressed(
     platform_keypair: tuple[bytes, bytes],
     test_psk: bytes,
     test_psk_id: bytes,
 ) -> AsyncIterator[tuple[str, int, bytes]]:
-    """Start granian server with HPKE middleware and compression enabled."""
+    """Start granian server with HPKE middleware and compression enabled.
+
+    Session-scoped: one server per xdist worker, shared across all tests.
+    """
     async for result in _start_granian_server(platform_keypair, test_psk, test_psk_id, compress=True):
         yield result
