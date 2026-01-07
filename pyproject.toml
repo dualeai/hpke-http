@@ -6,7 +6,6 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
-    # Shared libs are explicitly not included in the deps, they are installed separatly, see "make install-libs"
     "cryptography~=46.0",
 ]
 
