@@ -30,6 +30,7 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from typing_extensions import Self
 
+from hpke_http._logging import get_logger
 from hpke_http.constants import (
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
@@ -49,6 +50,8 @@ from hpke_http.streaming import SSEDecryptor, StreamingSession, import_zstd
 __all__ = [
     "HPKEClientSession",
 ]
+
+_logger = get_logger(__name__)
 
 
 class HPKEClientSession:
@@ -145,9 +148,11 @@ class HPKEClientSession:
             if host in self._key_cache:
                 keys, expires_at = self._key_cache[host]
                 if time.time() < expires_at:
+                    _logger.debug("Key cache hit: host=%s", host)
                     self._platform_keys = keys
                     return self._platform_keys
 
+            _logger.debug("Key cache miss: host=%s fetching from %s", host, self.discovery_url)
             # Fetch from discovery endpoint
             if not self._session:
                 raise RuntimeError("Session not initialized. Use 'async with' context manager.")
@@ -170,9 +175,16 @@ class HPKEClientSession:
                     # Cache
                     self._key_cache[host] = (keys, expires_at)
                     self._platform_keys = keys
+                    _logger.debug(
+                        "Keys fetched: host=%s kem_ids=%s ttl=%ds",
+                        host,
+                        [f"0x{k:04x}" for k in keys],
+                        max_age,
+                    )
                     return self._platform_keys
 
             except aiohttp.ClientError as e:
+                _logger.debug("Key discovery failed: host=%s error=%s", host, e)
                 raise KeyDiscoveryError(f"Failed to fetch keys: {e}") from e
 
     def _parse_max_age(self, cache_control: str) -> int:
@@ -215,9 +227,16 @@ class HPKEClientSession:
         # Compress if enabled and body is large enough
         was_compressed = False
         if self.compress and len(body) >= ZSTD_MIN_SIZE:
+            original_size = len(body)
             zstd = import_zstd()
             body = zstd.compress(body, level=ZSTD_COMPRESSION_LEVEL)
             was_compressed = True
+            _logger.debug(
+                "Request compressed: original=%d compressed=%d ratio=%.1f%%",
+                original_size,
+                len(body),
+                len(body) / original_size * 100,
+            )
 
         # Set up sender context
         ctx = setup_sender_psk(
@@ -285,6 +304,13 @@ class HPKEClientSession:
                 headers[HEADER_HPKE_ENCODING] = "zstd"
             sender_ctx = ctx
             kwargs["data"] = encrypted_body
+            _logger.debug(
+                "Request encrypted: method=%s url=%s body_size=%d compressed=%s",
+                method,
+                url,
+                len(body),
+                was_compressed,
+            )
 
         kwargs["headers"] = headers
         response = await self._session.request(method, url, **kwargs)
@@ -356,6 +382,7 @@ class HPKEClientSession:
         session_params = b64url_decode(stream_header)
         session = StreamingSession.deserialize(session_params, session_key)
         decryptor = SSEDecryptor(session)
+        _logger.debug("SSE decryption started: url=%s", response.url)
 
         # WHATWG event boundary: blank line (any combination of line endings)
         event_boundary = re.compile(r"(?:\r\n|\r|\n)(?:\r\n|\r|\n)")

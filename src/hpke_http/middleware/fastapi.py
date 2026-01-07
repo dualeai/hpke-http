@@ -39,6 +39,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric import x25519
 
+from hpke_http._logging import get_logger
 from hpke_http.constants import (
     AEAD_ID,
     DISCOVERY_CACHE_MAX_AGE,
@@ -60,6 +61,8 @@ from hpke_http.streaming import SSEEncryptor, create_session_from_context, impor
 __all__ = [
     "HPKEMiddleware",
 ]
+
+_logger = get_logger(__name__)
 
 
 @dataclass
@@ -154,7 +157,9 @@ class HPKEMiddleware:
 
         # Handle discovery endpoint
         path = scope.get("path", "")
+        method = scope.get("method", "")
         if path == self.discovery_path:
+            _logger.debug("Discovery endpoint requested: path=%s", path)
             await self._handle_discovery(scope, receive, send)
             return
 
@@ -164,16 +169,20 @@ class HPKEMiddleware:
 
         if not enc_header:
             # Not encrypted, pass through
+            _logger.debug("Unencrypted request: method=%s path=%s", method, path)
             await self.app(scope, receive, send)
             return
+
+        _logger.debug("Encrypted request received: method=%s path=%s", method, path)
 
         # Decrypt request AND wrap send for response encryption
         try:
             decrypted_receive = await self._create_decrypted_receive(scope, receive, enc_header)
             encrypting_send = self._create_encrypting_send(scope, send)
             await self.app(scope, decrypted_receive, encrypting_send)
-        except CryptoError:
+        except CryptoError as e:
             # Don't expose internal error details to clients
+            _logger.debug("Decryption failed: method=%s path=%s error_type=%s", method, path, type(e).__name__)
             await self._send_error(send, 400, "Request decryption failed")
 
     def _create_encrypting_send(  # noqa: PLR0915
@@ -213,6 +222,11 @@ class HPKEMiddleware:
                 state.is_sse = True
                 session = create_session_from_context(ctx)
                 state.encryptor = SSEEncryptor(session, compress=self.compress)
+                _logger.debug(
+                    "SSE encryption enabled: path=%s compress=%s",
+                    scope.get("path", ""),
+                    self.compress,
+                )
 
                 # Add X-HPKE-Stream header
                 session_params = session.serialize()
@@ -419,14 +433,27 @@ class HPKEMiddleware:
         )
 
         plaintext = ctx.open(aad=b"", ciphertext=ciphertext)
+        _logger.debug(
+            "Request decrypted: path=%s kem_id=0x%04x body_size=%d",
+            scope.get("path", ""),
+            kem_id,
+            len(plaintext),
+        )
 
         # Decompress if X-HPKE-Encoding header indicates compression
         headers = dict(scope.get("headers", []))
         encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
         if encoding_header == b"zstd":
             try:
+                compressed_size = len(plaintext)
                 zstd = import_zstd()
                 plaintext = zstd.decompress(plaintext)
+                _logger.debug(
+                    "Request decompressed: compressed=%d decompressed=%d ratio=%.1f%%",
+                    compressed_size,
+                    len(plaintext),
+                    compressed_size / len(plaintext) * 100,
+                )
             except ImportError as e:
                 raise DecryptionError(f"Zstd decompression unavailable: {e}") from e
             except Exception as e:

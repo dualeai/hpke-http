@@ -1,6 +1,7 @@
 """Shared test fixtures for hpke_http tests."""
 
 import asyncio
+import logging
 import os
 import secrets
 import socket
@@ -17,6 +18,10 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
 from hpke_http.streaming import SSEDecryptor, SSEEncryptor, StreamingSession
+
+# Enable hpke_http debug logging during tests
+logging.getLogger("hpke_http").setLevel(logging.DEBUG)
+logging.getLogger("hpke_http").addHandler(logging.StreamHandler())
 
 # === Key Fixtures ===
 
