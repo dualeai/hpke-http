@@ -19,6 +19,8 @@ Usage (Client - aiohttp):
                 print(event)
 """
 
+from importlib.metadata import version
+
 from hpke_http.constants import AEAD_ID, KDF_ID, KEM_ID, MODE_PSK, VERSION
 from hpke_http.exceptions import (
     CryptoError,
@@ -41,6 +43,10 @@ __all__ = [
     "EnvelopeError",
     "InvalidPSKError",
     "UnsupportedSuiteError",
+    # Versioning
+    "__version__",
+    "__version_full__",
 ]
 
-__version__ = "0.1.0"
+__version__ = version("hpke_http")
+__version_full__ = "dev"

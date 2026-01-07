@@ -1,10 +1,42 @@
 [project]
 name = "hpke_http"
 version = "0.1.0"
-description = "End-to-end encryption for HTTP APIs"
+description = "End-to-end encryption for HTTP APIs using RFC 9180 HPKE"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
+authors = [
+    {name = "Duale AI"},
+]
+keywords = [
+    "hpke",
+    "encryption",
+    "rfc9180",
+    "cryptography",
+    "http",
+    "e2e",
+    "chacha20",
+    "x25519",
+    "fastapi",
+    "aiohttp",
+    "sse",
+    "streaming",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
+]
 dependencies = [
     "cryptography~=46.0",
 ]
@@ -20,6 +52,7 @@ dev = [
     "pytest-xdist[psutil]~=3.8",
     "pytest~=8.3",
     "ruff~=0.7",
+    "twine~=6.1",                # Package verification before PyPI upload
     "typing_extensions~=4.12",   # assert_type for API contract tests (Python 3.10)
     "vulture~=2.14",
 ]
@@ -44,6 +77,9 @@ zstd = [
 [project.urls]
 Homepage = "https://github.com/dualeai/hpke-http"
 Documentation = "https://github.com/dualeai/hpke-http#readme"
+Repository = "https://github.com/dualeai/hpke-http.git"
+Changelog = "https://github.com/dualeai/hpke-http/releases"
+Issues = "https://github.com/dualeai/hpke-http/issues"
 
 [build-system]
 requires = ["setuptools>=78.1.1"]  # Pinned for CVE-2025-47273
