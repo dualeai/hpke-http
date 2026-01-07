@@ -9,6 +9,11 @@ concurrency:
   group: sbom-${{ github.ref }}
   cancel-in-progress: false
 
+# CLI versions are centralized here for easy maintenance
+# See: https://github.com/CycloneDX/cyclonedx-cli/releases
+env:
+  CYCLONEDX_CLI_VERSION: v0.29.2
+
 permissions:
   attestations: write # Required for attestation upload
   contents: write # Required for release asset upload
@@ -28,10 +33,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # Use minimum supported Python for maximum compatibility
       - name: Set up Python
         uses: actions/setup-python@v6.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.10"
 
       - name: Install dependencies
         run: make install-deps
@@ -45,18 +51,39 @@ jobs:
           test -f dist/hpke_http-*.whl
           test -f dist/hpke_http-*.tar.gz
 
-      - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@v0.21.0
-        with:
-          format: spdx-json
-          output-file: sbom.spdx.json
+      # Generate CycloneDX from uv.lock (universal, all Python versions)
+      - name: Generate SBOM (CycloneDX)
+        run: uv export --format cyclonedx1.5 --all-extras --output-file sbom.cyclonedx.json
 
-      - name: Validate SBOM
+      # Install CycloneDX CLI for format conversion
+      - name: Install CycloneDX CLI
         run: |
-          jq empty sbom.spdx.json
-          echo "SBOM contains $(jq '.packages | length' sbom.spdx.json) packages"
+          curl -sSfL "https://github.com/CycloneDX/cyclonedx-cli/releases/download/${{ env.CYCLONEDX_CLI_VERSION }}/cyclonedx-linux-x64" -o cyclonedx
+          chmod +x cyclonedx
 
-      - name: Attest SBOM
+      # Convert CycloneDX to SPDX (preserves all Python version info)
+      - name: Convert to SPDX
+        run: ./cyclonedx convert --input-file sbom.cyclonedx.json --output-file sbom.spdx.json --output-format spdxjson
+
+      - name: Validate SBOMs
+        run: |
+          echo "Validating CycloneDX SBOM..."
+          jq empty sbom.cyclonedx.json
+          echo "- Components: $(jq '.components | length' sbom.cyclonedx.json)"
+
+          echo "Validating SPDX SBOM..."
+          jq empty sbom.spdx.json
+          echo "- Packages: $(jq '.packages | length' sbom.spdx.json)"
+
+      # Attest CycloneDX SBOM
+      - name: Attest SBOM (CycloneDX)
+        uses: actions/attest-sbom@v3.0.0
+        with:
+          subject-path: dist/*
+          sbom-path: sbom.cyclonedx.json
+
+      # Attest SPDX SBOM
+      - name: Attest SBOM (SPDX)
         uses: actions/attest-sbom@v3.0.0
         with:
           subject-path: dist/*
@@ -67,11 +94,13 @@ jobs:
         with:
           subject-path: dist/*
 
-      - name: Upload SBOM artifact
+      - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v6.0.0
         with:
           name: sbom
-          path: sbom.spdx.json
+          path: |
+            sbom.cyclonedx.json
+            sbom.spdx.json
           retention-days: 30
 
       - name: Upload dist artifact
@@ -86,6 +115,7 @@ jobs:
         uses: softprops/action-gh-release@v2.5.0
         with:
           files: |
+            sbom.cyclonedx.json
             sbom.spdx.json
             dist/*
 
@@ -93,10 +123,24 @@ jobs:
         if: always()
         run: |
           echo "## SBOM Generation Summary" >> $GITHUB_STEP_SUMMARY
-          if [ -f sbom.spdx.json ]; then
-            echo "- **Format:** SPDX JSON" >> $GITHUB_STEP_SUMMARY
-            echo "- **Packages:** $(jq '.packages | length' sbom.spdx.json)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Build artifacts:** $(ls -1 dist/ 2>/dev/null | wc -l | tr -d ' ')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Both SBOMs contain dependencies for **all supported Python versions** (exported from universal \`uv.lock\`)." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### CycloneDX" >> $GITHUB_STEP_SUMMARY
+          if [ -f sbom.cyclonedx.json ]; then
+            echo "- **Components:** $(jq '.components | length' sbom.cyclonedx.json)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Source:** \`uv export --format cyclonedx1.5\`" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- **Status:** SBOM generation failed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status:** Generation failed" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### SPDX" >> $GITHUB_STEP_SUMMARY
+          if [ -f sbom.spdx.json ]; then
+            echo "- **Packages:** $(jq '.packages | length' sbom.spdx.json)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Source:** Converted from CycloneDX via \`cyclonedx-cli\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status:** Generation failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- **Files:** $(ls -1 dist/ 2>/dev/null | wc -l | tr -d ' ')" >> $GITHUB_STEP_SUMMARY
