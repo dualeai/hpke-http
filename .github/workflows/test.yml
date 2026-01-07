@@ -8,10 +8,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
     strategy:
       fail-fast: false
       matrix:
+        arch: [x64, arm64]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
 
     steps:
