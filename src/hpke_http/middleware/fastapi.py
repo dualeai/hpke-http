@@ -393,7 +393,7 @@ class HPKEMiddleware:
         """
         # Decode encapsulated key from header
         try:
-            enc = b64url_decode(enc_header.decode("ascii"))
+            enc = bytes(b64url_decode(enc_header.decode("ascii")))
         except Exception as e:
             raise DecryptionError(f"Invalid {HEADER_HPKE_ENC} header encoding") from e
 

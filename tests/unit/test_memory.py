@@ -18,6 +18,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import x25519
 
 from hpke_http.constants import PSK_MIN_SIZE
+from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
 from hpke_http.streaming import SSEDecryptor, SSEEncryptor
 from tests.conftest import extract_sse_data_field, make_sse_session
@@ -298,8 +299,8 @@ class TestSSEMemory:
     def test_sse_decrypt_overhead_bounded(self, payload_size: int) -> None:
         """SSE decryption overhead is bounded.
 
-        Overhead = base64 decode temp buffer only.
-        Expected: allocation < 1.1x ciphertext size.
+        With memoryview optimization, b64url_decode returns a view over
+        decoded bytes (no extra copy). Slicing for counter/ciphertext is zero-copy.
         """
         session = make_sse_session()
         encryptor = SSEEncryptor(session)
@@ -398,3 +399,325 @@ class TestSSEMemory:
             f"Allocated {allocated} bytes for {chunk_size} chunk, expected < {max_expected}"
         )
         assert len(output) <= expected_sse_output_size(chunk_size) + 10
+
+
+class TestBase64Memory:
+    """Memory bounds for base64url encode/decode operations.
+
+    Tests zero-copy optimizations:
+    - b64url_encode: accepts memoryview input (Python 3.4+)
+    - b64url_decode: returns memoryview for zero-copy slicing
+    """
+
+    # Base64 expands data by 4/3 (33%)
+    BASE64_EXPANSION = 4 / 3
+
+    @pytest.mark.parametrize("input_size", [1024, 64 * 1024, 256 * 1024])
+    def test_encode_memory_proportional(self, input_size: int) -> None:
+        """b64url_encode memory scales linearly with input size.
+
+        Allocations:
+        - urlsafe_b64encode: 1.33x input (base64 expansion)
+        - rstrip: reuses buffer or small copy
+        - decode to string: 1.33x input
+        Measured: ~1.34x input for large payloads, ~3.5x for small (fixed overhead)
+
+        Note: Small payloads tested separately due to fixed Python overhead.
+        """
+        data = secrets.token_bytes(input_size)
+
+        # Warmup
+        b64url_encode(data)
+        gc.collect()
+
+        allocated, encoded = measure_allocation(lambda: b64url_encode(data))
+
+        # Expected output size (base64 without padding)
+        expected_output = (input_size * 4 + 2) // 3
+
+        # Measured ~1.34x for large payloads; allow 2x + overhead for safety margin
+        max_expected = int(input_size * 2) + 4096
+        assert allocated < max_expected, (
+            f"Allocated {allocated} bytes for {input_size} input, expected < {max_expected}"
+        )
+        # Verify output size is correct
+        assert len(encoded) == expected_output or len(encoded) == expected_output - 1, (
+            f"Output {len(encoded)} bytes, expected ~{expected_output}"
+        )
+
+    @pytest.mark.parametrize("input_size", [1024, 64 * 1024, 256 * 1024])
+    def test_decode_memory_proportional(self, input_size: int) -> None:
+        """b64url_decode memory scales linearly with input size.
+
+        Allocations:
+        - urlsafe_b64decode: 1x decoded size (bytes)
+        - memoryview: ~184 bytes (view object only, no copy)
+        Measured: ~1.01x decoded size for large payloads
+
+        Note: Small payloads tested separately due to fixed Python overhead.
+        """
+        data = secrets.token_bytes(input_size)
+        encoded = b64url_encode(data)
+
+        # Warmup
+        b64url_decode(encoded)
+        gc.collect()
+
+        allocated, decoded = measure_allocation(lambda: b64url_decode(encoded))
+
+        # Measured ~1.01x for large payloads; allow 1.2x + overhead for safety margin
+        max_expected = int(input_size * 1.2) + 4096
+        assert allocated < max_expected, (
+            f"Allocated {allocated} bytes for {input_size} decoded, expected < {max_expected}"
+        )
+        # Verify decoded content
+        assert bytes(decoded) == data
+
+    def test_decode_returns_memoryview(self) -> None:
+        """b64url_decode returns memoryview type."""
+        data = secrets.token_bytes(64)
+        encoded = b64url_encode(data)
+
+        decoded = b64url_decode(encoded)
+
+        assert isinstance(decoded, memoryview), f"Expected memoryview, got {type(decoded)}"
+        assert bytes(decoded) == data
+
+    def test_decode_memoryview_enables_zero_copy_slicing(self) -> None:
+        """Slicing memoryview result doesn't copy underlying buffer data.
+
+        This is the key optimization: extracting counter and ciphertext
+        from decoded SSE payload should be zero-copy (memoryview slices
+        share the underlying buffer).
+
+        Proof: slice objects are tiny (~184 bytes) regardless of data size.
+        """
+        # Simulate SSE payload: counter (4B) + ciphertext (64KB)
+        counter_bytes = (42).to_bytes(4, "big")
+        ciphertext = secrets.token_bytes(64 * 1024)
+        payload = counter_bytes + ciphertext
+        encoded = b64url_encode(payload)
+
+        # Decode once
+        decoded = b64url_decode(encoded)
+
+        # Slice into counter and ciphertext
+        counter_slice = decoded[:4]
+        ciphertext_slice = decoded[4:]
+
+        # Verify slice objects are memoryview (not bytes copies)
+        assert isinstance(counter_slice, memoryview), f"Expected memoryview, got {type(counter_slice)}"
+        assert isinstance(ciphertext_slice, memoryview), f"Expected memoryview, got {type(ciphertext_slice)}"
+
+        # Zero-copy proof: memoryview slice objects are tiny (~184 bytes)
+        # regardless of the underlying data size. A bytes copy would be ~64KB.
+        import sys
+        assert sys.getsizeof(ciphertext_slice) < 300, (
+            f"Slice object is {sys.getsizeof(ciphertext_slice)} bytes, "
+            "expected <300 (should be a view, not a copy)"
+        )
+
+        # Verify data correctness
+        assert int.from_bytes(counter_slice, "big") == 42
+        assert bytes(ciphertext_slice) == ciphertext
+
+    def test_decode_slice_vs_bytes_slice_comparison(self) -> None:
+        """Compare memory: memoryview slice vs bytes slice.
+
+        Demonstrates the optimization benefit by measuring allocation
+        when slicing already-decoded data.
+        """
+        payload = secrets.token_bytes(64 * 1024)  # 64KB
+        encoded = b64url_encode(payload)
+
+        # Pre-decode for both methods
+        mv_decoded = b64url_decode(encoded)
+        bytes_decoded = bytes(mv_decoded)
+        gc.collect()
+
+        # Measure bytes slicing (creates copies)
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+        bytes_counter = bytes_decoded[:4]
+        bytes_ciphertext = bytes_decoded[4:]
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        bytes_slice_alloc = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        gc.collect()
+
+        # Measure memoryview slicing (zero-copy views)
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+        mv_counter = mv_decoded[:4]
+        mv_ciphertext = mv_decoded[4:]
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        mv_slice_alloc = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # bytes slicing copies data (~64KB for large slice)
+        # memoryview slicing just creates view objects (~200 bytes)
+        assert mv_slice_alloc < bytes_slice_alloc, (
+            f"memoryview slicing ({mv_slice_alloc}) should allocate less than bytes ({bytes_slice_alloc})"
+        )
+
+        # Verify data is correct
+        assert bytes(mv_counter) == bytes_counter
+        assert bytes(mv_ciphertext) == bytes_ciphertext
+
+        # Verify slices are correct types
+        assert isinstance(mv_counter, memoryview)
+        assert isinstance(bytes_counter, bytes)
+
+    def test_encode_accepts_memoryview_input(self) -> None:
+        """b64url_encode accepts memoryview input (zero-copy from caller)."""
+        data = bytearray(secrets.token_bytes(1024))
+        mv = memoryview(data)
+
+        # Should not raise
+        encoded = b64url_encode(mv)
+
+        # Verify result is correct
+        assert b64url_encode(bytes(data)) == encoded
+
+    def test_encode_memoryview_slice_input(self) -> None:
+        """b64url_encode accepts memoryview slice (zero-copy partial encoding)."""
+        data = bytearray(secrets.token_bytes(4096))
+        mv = memoryview(data)
+
+        # Encode only middle 2KB
+        partial = mv[1024:3072]
+
+        # Warmup
+        b64url_encode(partial)
+        gc.collect()
+
+        allocated, encoded = measure_allocation(lambda: b64url_encode(partial))
+
+        # Should allocate based on slice size (2KB), not full buffer
+        # Measured ~1.34x; allow 2x + overhead for safety margin
+        max_expected = int(2048 * 2) + 4096
+        assert allocated < max_expected, (
+            f"Allocated {allocated} bytes for 2KB slice, expected < {max_expected}"
+        )
+
+        # Verify encoding is correct
+        assert b64url_encode(bytes(data[1024:3072])) == encoded
+
+    def test_roundtrip_no_memory_leak(self) -> None:
+        """Repeated encode/decode cycles don't leak memory."""
+        data = secrets.token_bytes(1024)
+
+        # Warmup
+        for _ in range(100):
+            encoded = b64url_encode(data)
+            decoded = b64url_decode(encoded)
+            assert bytes(decoded) == data
+        gc.collect()
+
+        # Measure over many iterations
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        for _ in range(1000):
+            encoded = b64url_encode(data)
+            decoded = b64url_decode(encoded)
+            assert bytes(decoded) == data
+
+        gc.collect()
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        net_allocated = sum(stat.size_diff for stat in diff)
+
+        # Net allocation after 1000 roundtrips should be minimal
+        assert net_allocated < 50 * 1024, (
+            f"Net allocation {net_allocated} bytes after 1000 roundtrips, possible leak"
+        )
+
+    def test_large_payload_memory_bounded(self) -> None:
+        """1MB payload encode/decode uses bounded memory."""
+        payload_size = 1024 * 1024  # 1MB
+        data = secrets.token_bytes(payload_size)
+
+        # Warmup
+        encoded = b64url_encode(data)
+        _ = b64url_decode(encoded)
+        gc.collect()
+
+        # Measure encode
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+        encoded = b64url_encode(data)
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        encode_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Measured ~1.33x payload; allow 2x for safety margin
+        max_encode = int(payload_size * 2)
+        assert encode_allocated < max_encode, (
+            f"Encode allocated {encode_allocated} bytes for {payload_size} payload"
+        )
+
+        gc.collect()
+
+        # Measure decode
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+        decoded = b64url_decode(encoded)
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        decode_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Measured ~1.0x payload; allow 1.2x for safety margin
+        max_decode = int(payload_size * 1.2)
+        assert decode_allocated < max_decode, (
+            f"Decode allocated {decode_allocated} bytes for {payload_size} payload"
+        )
+        assert bytes(decoded) == data
+
+    @pytest.mark.parametrize(
+        "size",
+        [
+            pytest.param(32, id="32B-ephemeral-key"),
+            pytest.param(4, id="4B-sse-salt"),
+            pytest.param(64, id="64B-typical-header"),
+        ],
+    )
+    def test_small_payload_overhead_reasonable(self, size: int) -> None:
+        """Small payloads (headers, keys) have reasonable overhead.
+
+        For small data, fixed Python object overhead dominates.
+        Verify allocations stay bounded (not growing unexpectedly).
+        """
+        data = secrets.token_bytes(size)
+
+        # Warmup
+        b64url_encode(data)
+        gc.collect()
+
+        allocated, encoded = measure_allocation(lambda: b64url_encode(data))
+
+        # Small payloads: fixed overhead ~3KB for Python objects
+        max_expected = 4096
+        assert allocated < max_expected, (
+            f"Allocated {allocated} bytes for {size}-byte payload, expected < {max_expected}"
+        )
+
+        # Decode
+        _ = b64url_decode(encoded)
+        gc.collect()
+
+        allocated, decoded = measure_allocation(lambda: b64url_decode(encoded))
+
+        assert allocated < max_expected, (
+            f"Decode allocated {allocated} bytes for {size}-byte payload, expected < {max_expected}"
+        )
+        assert bytes(decoded) == data

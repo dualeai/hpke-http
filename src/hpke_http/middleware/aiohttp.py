@@ -202,7 +202,7 @@ class HPKEClientSession:
         result: dict[KemId, bytes] = {}
         for key_info in response.get("keys", []):
             kem_id = KemId(int(key_info["kem_id"], 16))
-            public_key = b64url_decode(key_info["public_key"])
+            public_key = bytes(b64url_decode(key_info["public_key"]))
             result[kem_id] = public_key
         return result
 
@@ -377,7 +377,7 @@ class HPKEClientSession:
 
         # Derive session key from sender context
         session_key = sender_ctx.export(b"sse-session-key", 32)
-        session_params = b64url_decode(stream_header)
+        session_params = bytes(b64url_decode(stream_header))
         session = StreamingSession.deserialize(session_params, session_key)
         decryptor = SSEDecryptor(session)
         _logger.debug("SSE decryption started: url=%s", response.url)

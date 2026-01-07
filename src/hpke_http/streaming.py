@@ -401,7 +401,7 @@ class SSEDecryptor:
         if len(payload) < SSE_COUNTER_SIZE + 16:  # Counter + minimum ciphertext (tag only)
             raise DecryptionError("Payload too short")
 
-        # Extract counter and ciphertext
+        # Extract counter and ciphertext (zero-copy slicing via memoryview)
         counter = int.from_bytes(payload[:SSE_COUNTER_SIZE], "big")
         ciphertext = payload[SSE_COUNTER_SIZE:]
 
