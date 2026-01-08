@@ -398,14 +398,53 @@ class RequestEncryptor:
         """
         return self._encryptor.encrypt(chunk)
 
+    def encrypt_iter(self, body: bytes) -> Iterator[bytes]:
+        """
+        Yield encrypted chunks for streaming upload.
+
+        Memory-efficient: O(chunk_size) instead of O(body_size).
+        Use with HTTP clients that support streaming/chunked transfer.
+
+        Handles compression (if enabled) before chunking.
+        Uses memoryview for zero-copy slicing.
+
+        Args:
+            body: Complete request body
+
+        Yields:
+            Encrypted chunks in wire format (length || counter || ciphertext)
+
+        Example:
+            # With aiohttp async generator
+            async def stream():
+                for chunk in encryptor.encrypt_iter(body):
+                    yield chunk
+            await session.post(url, data=stream())
+        """
+        # Compress whole body first (better ratio than per-chunk)
+        if self._compress and len(body) >= ZSTD_MIN_SIZE:
+            body = zstd_compress(body)
+            self._was_compressed = True
+
+        # Handle empty body
+        if len(body) == 0:
+            yield self._encryptor.encrypt(b"")
+            return
+
+        # Use memoryview for zero-copy slicing
+        body_view = memoryview(body)
+        body_len = len(body)
+
+        # Yield encrypted chunks
+        for offset in range(0, body_len, CHUNK_SIZE):
+            yield self._encryptor.encrypt(body_view[offset : offset + CHUNK_SIZE])
+
     def encrypt_all(self, body: bytes) -> bytes:
         """
         Encrypt entire body at once.
 
-        Handles compression (if enabled) and chunking automatically.
-        This is the recommended method for most use cases.
-
-        Uses memoryview for zero-copy slicing (~10-15% faster for large payloads).
+        Convenience wrapper around encrypt_iter() that joins all chunks.
+        For memory-efficient streaming uploads, use encrypt_iter() directly.
 
         Args:
             body: Complete request body
@@ -413,26 +452,7 @@ class RequestEncryptor:
         Returns:
             Encrypted body ready for transmission
         """
-        # Compress whole body first (better ratio than per-chunk)
-        if self._compress and len(body) >= ZSTD_MIN_SIZE:
-            body = zstd_compress(body)
-            self._was_compressed = True
-
-        # Use memoryview for zero-copy slicing (avoids bytes copy on each slice)
-        body_view = memoryview(body)
-        body_len = len(body)
-
-        # Chunk and encrypt - pass memoryview slices directly (no copy until needed)
-        chunks = [
-            self._encryptor.encrypt(body_view[offset : offset + CHUNK_SIZE])
-            for offset in range(0, body_len, CHUNK_SIZE)
-        ]
-
-        # Handle empty body
-        if not chunks:
-            chunks.append(self._encryptor.encrypt(b""))
-
-        return b"".join(chunks)
+        return b"".join(self.encrypt_iter(body))
 
     @property
     def context(self) -> SenderContext:
@@ -801,12 +821,38 @@ class ResponseEncryptor:
         """
         return self._encryptor.encrypt(chunk)
 
+    def encrypt_iter(self, body: bytes) -> Iterator[bytes]:
+        """
+        Yield encrypted chunks for streaming response.
+
+        Memory-efficient: O(chunk_size) instead of O(body_size).
+        Uses memoryview for zero-copy slicing.
+
+        Args:
+            body: Complete response body
+
+        Yields:
+            Encrypted chunks in wire format
+        """
+        # Handle empty body
+        if len(body) == 0:
+            yield self._encryptor.encrypt(b"")
+            return
+
+        # Use memoryview for zero-copy slicing
+        body_view = memoryview(body)
+        body_len = len(body)
+
+        # Yield encrypted chunks
+        for offset in range(0, body_len, CHUNK_SIZE):
+            yield self._encryptor.encrypt(body_view[offset : offset + CHUNK_SIZE])
+
     def encrypt_all(self, body: bytes) -> bytes:
         """
         Encrypt entire response body at once.
 
-        Handles chunking automatically.
-        Uses memoryview for zero-copy slicing (~10-15% faster for large payloads).
+        Convenience wrapper around encrypt_iter() that joins all chunks.
+        For memory-efficient streaming, use encrypt_iter() directly.
 
         Args:
             body: Complete response body
@@ -814,21 +860,7 @@ class ResponseEncryptor:
         Returns:
             Encrypted body ready for transmission
         """
-        # Use memoryview for zero-copy slicing (avoids bytes copy on each slice)
-        body_view = memoryview(body)
-        body_len = len(body)
-
-        # Chunk and encrypt - pass memoryview slices directly (no copy until needed)
-        chunks = [
-            self._encryptor.encrypt(body_view[offset : offset + CHUNK_SIZE])
-            for offset in range(0, body_len, CHUNK_SIZE)
-        ]
-
-        # Handle empty body
-        if not chunks:
-            chunks.append(self._encryptor.encrypt(b""))
-
-        return b"".join(chunks)
+        return b"".join(self.encrypt_iter(body))
 
 
 class SSEEncryptor:

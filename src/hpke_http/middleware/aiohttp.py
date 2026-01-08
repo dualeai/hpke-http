@@ -399,15 +399,15 @@ class HPKEClientSession:
     async def _encrypt_request(
         self,
         body: bytes,
-    ) -> tuple[bytes, dict[str, str], SenderContext]:
+    ) -> tuple[AsyncIterator[bytes], dict[str, str], SenderContext]:
         """
-        Encrypt request body using RequestEncryptor.
+        Encrypt request body using RequestEncryptor with streaming.
 
-        Uses the centralized RequestEncryptor class which handles
-        compression, chunking, header generation, and encryption.
+        Returns an async generator for memory-efficient chunked upload.
+        Uses HTTP chunked transfer encoding (Transfer-Encoding: chunked).
 
         Returns:
-            Tuple of (encrypted_body, headers_dict, sender_context)
+            Tuple of (async_chunk_generator, headers_dict, sender_context)
         """
         keys = await self._ensure_keys()
 
@@ -423,16 +423,29 @@ class HPKEClientSession:
             psk_id=self.psk_id,
             compress=self.compress,
         )
-        encrypted_body = encryptor.encrypt_all(body)
+
+        # Prime the generator to trigger compression BEFORE get_headers()
+        # Generator code doesn't execute until iteration starts, so we must
+        # consume at least the first chunk to set _was_compressed flag
+        chunk_iter = encryptor.encrypt_iter(body)
+        first_chunk = next(chunk_iter)
+
+        # Now compression has happened and _was_compressed is set
         headers = encryptor.get_headers()
 
+        # Create async generator for streaming upload
+        # Memory: O(chunk_size) instead of O(body_size)
+        async def stream_chunks() -> AsyncIterator[bytes]:
+            yield first_chunk  # Return the primed first chunk
+            for chunk in chunk_iter:  # Then yield remaining chunks
+                yield chunk
+
         _logger.debug(
-            "Request encrypted: body_size=%d encrypted_size=%d",
+            "Request encryption prepared: body_size=%d streaming=True",
             len(body),
-            len(encrypted_body),
         )
 
-        return (encrypted_body, headers, encryptor.context)
+        return (stream_chunks(), headers, encryptor.context)
 
     async def request(
         self,
@@ -475,13 +488,14 @@ class HPKEClientSession:
         headers = dict(kwargs.pop("headers", {}))
         sender_ctx: SenderContext | None = None
         if body:
-            encrypted_body, crypto_headers, ctx = await self._encrypt_request(body)
+            encrypted_stream, crypto_headers, ctx = await self._encrypt_request(body)
             headers.update(crypto_headers)
             headers["Content-Type"] = "application/octet-stream"
             sender_ctx = ctx
-            kwargs["data"] = encrypted_body
+            # Pass async generator for streaming upload (chunked transfer encoding)
+            kwargs["data"] = encrypted_stream
             _logger.debug(
-                "Request encrypted: method=%s url=%s body_size=%d",
+                "Request encrypted: method=%s url=%s body_size=%d streaming=True",
                 method,
                 url,
                 len(body),
