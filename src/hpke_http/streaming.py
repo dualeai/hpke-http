@@ -495,6 +495,11 @@ class ChunkDecryptor:
             raise ReplayAttackError(self.expected_counter, counter)
 
         # Decrypt
+        # TODO(perf): When cryptography >= 47.0.0 is available, use decrypt_into()
+        # to eliminate per-chunk allocation. Example:
+        #   buffer = bytearray(len(ciphertext) - 16)
+        #   self._cipher.decrypt_into(nonce, ciphertext, None, buffer)
+        # See: https://cryptography.io/en/latest/hazmat/primitives/aead/
         nonce = self._compute_nonce(counter)
         try:
             payload = self._cipher.decrypt(nonce, ciphertext, associated_data=None)
