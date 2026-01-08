@@ -26,6 +26,8 @@ uv add "hpke-http[fastapi,zstd]"  # + compression
 
 ## Quick Start
 
+Both standard JSON requests and SSE streaming are transparently encrypted.
+
 ### Server (FastAPI)
 
 ```python
@@ -46,6 +48,13 @@ app.add_middleware(
     psk_resolver=resolve_psk,
 )
 
+# Standard JSON endpoint - encryption is automatic
+@app.post("/users")
+async def create_user(request: Request):
+    data = await request.json()  # Decrypted automatically
+    return {"id": 123, "name": data["name"]}  # Encrypted automatically
+
+# SSE streaming endpoint - encryption is automatic
 @app.post("/chat")
 async def chat(request: Request):
     data = await request.json()  # Decrypted automatically
@@ -67,6 +76,12 @@ async with HPKEClientSession(
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
 ) as session:
+    # Standard JSON request - encryption is automatic
+    resp = await session.post("/users", json={"name": "Alice"})
+    user = await resp.json()  # Decrypted automatically
+    print(user)  # {"id": 123, "name": "Alice"}
+
+    # SSE streaming request - encryption is automatic
     resp = await session.post("/chat", json={"prompt": "Hello"})
     async for chunk in session.iter_sse(resp):
         print(chunk)  # b"event: progress\ndata: {...}\n\n"
@@ -142,14 +157,17 @@ Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 
 Uses standard base64 (not base64url) - SSE data fields allow +/= characters.
 
-## SSE Auto-Encryption
+## Auto-Encryption
 
-The middleware automatically encrypts SSE responses when **both** conditions are met:
+The middleware automatically encrypts **all responses** when the request was encrypted:
 
-1. **Request was encrypted** - `SCOPE_HPKE_CONTEXT` exists in scope
-2. **Response is SSE** - `Content-Type: text/event-stream` detected
+- **Standard responses** (JSON, HTML, etc.) - Uses chunked binary format (RawFormat)
+- **SSE responses** - Uses base64-encoded SSE events (SSEFormat)
 
-This is why `media_type="text/event-stream"` is required.
+Response type is detected via `Content-Type` header:
+
+- `text/event-stream` → SSE format (requires `media_type="text/event-stream"`)
+- Everything else → Binary chunked format
 
 ## Compression (Optional)
 
@@ -173,21 +191,24 @@ HPKEClientSession(..., compress=True)   # Client
 HPKEClientSession(psk=b"short")                 # InvalidPSKError
 HPKEClientSession(psk=secrets.token_bytes(32))  # >= 32 bytes
 
-# Missing content-type (won't auto-encrypt)
-return StreamingResponse(gen())                                  # No encryption
-return StreamingResponse(gen(), media_type="text/event-stream")  # Auto-encrypted
+# SSE missing content-type (won't use SSE format)
+return StreamingResponse(gen())                                  # Binary format (wrong for SSE)
+return StreamingResponse(gen(), media_type="text/event-stream")  # SSE format (correct)
+
+# Standard responses work automatically - no special handling needed
+return {"data": "value"}  # Auto-encrypted as binary chunks
 ```
 
 ## Limits
 
-| Resource | Limit |
-| -------- | ----- |
-| HPKE messages/context | 2^96-1 |
-| SSE events/session | 2^32-1 |
-| SSE event buffer | 64MB (configurable) |
-| PSK minimum | 32 bytes |
-| Chunk overhead | 24B (length + counter + tag) |
-| Chunk size | 64KB |
+| Resource | Limit | Applies to |
+| -------- | ----- | ---------- |
+| HPKE messages/context | 2^96-1 | All |
+| Chunks/session | 2^32-1 | All |
+| PSK minimum | 32 bytes | All |
+| Chunk size | 64KB | All |
+| Binary chunk overhead | 24B (length + counter + tag) | Requests & standard responses |
+| SSE event buffer | 64MB (configurable) | SSE only |
 
 > **Note:** SSE is text-only (UTF-8). Binary data must be base64-encoded (+33% overhead).
 
