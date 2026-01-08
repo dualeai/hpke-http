@@ -86,24 +86,30 @@ async with HPKEClientSession(
 
 ## Wire Format
 
-### Request
+### Request/Response (Chunked Binary)
 
 ```text
-┌─────────┬─────────┬─────────┬─────────┬──────┬────────────┐
-│ Ver(1B) │ KEM(2B) │ KDF(2B) │AEAD(2B) │Mode  │ Ciphertext │
-│  0x01   │ 0x0020  │ 0x0001  │ 0x0003  │(1B)  │  + 16B tag │
-└─────────┴─────────┴─────────┴─────────┴──────┴────────────┘
-Header: X-HPKE-Enc: <base64url(32B ephemeral key)>
-Overhead: 24 bytes (8B header + 16B tag)
+Headers:
+  X-HPKE-Enc: <base64url(32B ephemeral key)>
+  X-HPKE-Stream: <base64url(4B session salt)>
+
+Body (repeating chunks):
+┌───────────┬────────────┬─────────────────────────────────┐
+│ Length(4B)│ Counter(4B)│ Ciphertext (N + 16B tag)        │
+│ big-end   │ big-end    │ encrypted: encoding_id || data  │
+└───────────┴────────────┴─────────────────────────────────┘
+Overhead: 24B/chunk (4B length + 4B counter + 16B tag)
 ```
 
 ### SSE Event
 
 ```text
 event: enc
-data: <base64url(counter_be32 || ciphertext || tag)>
+data: <base64(counter_be32 || ciphertext)>
 Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 ```
+
+Uses standard base64 (not base64url) - SSE data fields allow +/= characters.
 
 ## How SSE Auto-Encryption Works
 
@@ -182,7 +188,8 @@ recipient.open(aad, ct1)  # ✅ Decrypt in order
 | SSE events/session | 2^32-1 |
 | SSE event buffer | 64MB (configurable) |
 | PSK minimum | 32 bytes |
-| Overhead | 24 bytes |
+| Chunk overhead | 24B (length + counter + tag) |
+| Chunk size | 64KB |
 
 > **Note:** SSE is text-only (UTF-8). Binary data must be base64-encoded (+33% overhead).
 
