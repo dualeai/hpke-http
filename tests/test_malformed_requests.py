@@ -12,6 +12,8 @@ from hpke_http.envelope import encode_envelope
 from hpke_http.headers import b64url_encode
 from hpke_http.hpke import setup_sender_psk
 
+from .conftest import E2EServer
+
 
 class TestMalformedRequests:
     """Test server handling of malformed HPKE requests.
@@ -29,14 +31,14 @@ class TestMalformedRequests:
     )
     async def test_malformed_hpke_request(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
         enc_header: str,
         body: bytes,
         expected_status: int,
         description: str,
     ) -> None:
         """Malformed HPKE request handling: {description}."""
-        host, port, _ = granian_server
+        host, port = granian_server.host, granian_server.port
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -51,10 +53,10 @@ class TestMalformedRequests:
 
     async def test_plaintext_request_passes_through(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
     ) -> None:
         """Plaintext request without X-HPKE-Enc header passes through."""
-        host, port, _ = granian_server
+        host, port = granian_server.host, granian_server.port
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -65,10 +67,10 @@ class TestMalformedRequests:
 
     async def test_health_endpoint_always_plaintext(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
     ) -> None:
         """Health endpoint works without encryption."""
-        host, port, _ = granian_server
+        host, port = granian_server.host, granian_server.port
 
         async with aiohttp.ClientSession() as session:
             async with session.get(f"http://{host}:{port}/health") as resp:
@@ -120,7 +122,7 @@ class TestMalformedCompressionHeaders:
     )
     async def test_encoding_header_handling(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
         test_psk: bytes,
         test_psk_id: bytes,
         encoding_value: str,
@@ -128,7 +130,7 @@ class TestMalformedCompressionHeaders:
         description: str,
     ) -> None:
         """X-HPKE-Encoding header handling: {description}."""
-        host, port, pk = granian_server
+        host, port, pk = granian_server.host, granian_server.port, granian_server.public_key
         body = b'{"test": "compression header test"}'
 
         encrypted_body, enc_header = _encrypt_request(body, pk, test_psk, test_psk_id)

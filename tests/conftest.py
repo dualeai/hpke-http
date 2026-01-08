@@ -9,9 +9,11 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from typing import IO
 
 import aiohttp
 import pytest
@@ -234,6 +236,21 @@ def sse_pair_warmed() -> SSETestPair:
 # === E2E Server Fixtures ===
 
 
+@dataclass
+class E2EServer:
+    """E2E test server info with log capture."""
+
+    host: str
+    port: int
+    public_key: bytes
+    _log_file: IO[bytes]
+
+    def get_logs(self) -> str:
+        """Read captured server logs."""
+        self._log_file.seek(0)
+        return self._log_file.read().decode("utf-8", errors="replace")
+
+
 def get_free_port() -> int:
     """Get a free port on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -267,7 +284,7 @@ async def _start_granian_server(
     test_psk_id: bytes,
     *,
     compress: bool = False,
-) -> AsyncIterator[tuple[str, int, bytes]]:
+) -> AsyncIterator[E2EServer]:
     """Start granian server with HPKE middleware.
 
     Args:
@@ -277,7 +294,7 @@ async def _start_granian_server(
         compress: Enable Zstd compression for SSE responses
 
     Yields:
-        Tuple of (host, port, public_key)
+        E2EServer with host, port, public_key, and log access
     """
     sk, pk = platform_keypair
     port = get_free_port()
@@ -292,6 +309,10 @@ async def _start_granian_server(
     }
     if compress:
         env["TEST_COMPRESS"] = "true"
+
+    # Capture server logs to temp file for per-test debugging
+    # Note: intentionally not using context manager - file must stay open across yield
+    log_file = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
 
     # Use start_new_session=True to create a new process group.
     # This allows us to kill granian and all its child workers together.
@@ -310,11 +331,11 @@ async def _start_granian_server(
             "--workers",
             "1",
             "--log-level",
-            "warning",
+            "info",
         ],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=log_file,
+        stderr=log_file,
         start_new_session=True,
     )
 
@@ -325,7 +346,7 @@ async def _start_granian_server(
 
     try:
         await wait_for_server(host, port)
-        yield (host, port, pk)
+        yield E2EServer(host=host, port=port, public_key=pk, _log_file=log_file)
     finally:
         # Kill entire process group to avoid orphaned workers
         _kill_process_group(signal.SIGTERM)
@@ -334,32 +355,56 @@ async def _start_granian_server(
         except subprocess.TimeoutExpired:
             _kill_process_group(signal.SIGKILL)
             proc.wait()
+        log_file.close()
 
 
-@pytest_asyncio.fixture(scope="session", loop_scope="session")
+@pytest_asyncio.fixture
 async def granian_server(
     platform_keypair: tuple[bytes, bytes],
     test_psk: bytes,
     test_psk_id: bytes,
-) -> AsyncIterator[tuple[str, int, bytes]]:
+    request: pytest.FixtureRequest,
+) -> AsyncIterator[E2EServer]:
     """Start granian server with HPKE middleware.
 
-    Session-scoped: one server per xdist worker, shared across all tests.
-    Eliminates port reuse issues and speeds up test execution.
+    Function-scoped: each test gets its own server with isolated logs.
+    Server logs are printed to console after each test.
     """
-    async for result in _start_granian_server(platform_keypair, test_psk, test_psk_id):
-        yield result
+    async for server in _start_granian_server(platform_keypair, test_psk, test_psk_id):
+        yield server
+        # Print server logs after test completes
+        logs = server.get_logs()
+        if logs.strip():
+            test_name: str = request.node.name  # type: ignore[attr-defined]
+            sys.stdout.write(f"\n{'=' * 60}\n")
+            sys.stdout.write(f"Server logs for: {test_name}\n")
+            sys.stdout.write(f"{'=' * 60}\n")
+            sys.stdout.write(logs)
+            sys.stdout.write(f"\n{'=' * 60}\n\n")
+            sys.stdout.flush()
 
 
-@pytest_asyncio.fixture(scope="session", loop_scope="session")
+@pytest_asyncio.fixture
 async def granian_server_compressed(
     platform_keypair: tuple[bytes, bytes],
     test_psk: bytes,
     test_psk_id: bytes,
-) -> AsyncIterator[tuple[str, int, bytes]]:
+    request: pytest.FixtureRequest,
+) -> AsyncIterator[E2EServer]:
     """Start granian server with HPKE middleware and compression enabled.
 
-    Session-scoped: one server per xdist worker, shared across all tests.
+    Function-scoped: each test gets its own server with isolated logs.
+    Server logs are printed to console after each test.
     """
-    async for result in _start_granian_server(platform_keypair, test_psk, test_psk_id, compress=True):
-        yield result
+    async for server in _start_granian_server(platform_keypair, test_psk, test_psk_id, compress=True):
+        yield server
+        # Print server logs after test completes
+        logs = server.get_logs()
+        if logs.strip():
+            test_name: str = request.node.name  # type: ignore[attr-defined]
+            sys.stdout.write(f"\n{'=' * 60}\n")
+            sys.stdout.write(f"Server logs for: {test_name} (compressed)\n")
+            sys.stdout.write(f"{'=' * 60}\n")
+            sys.stdout.write(logs)
+            sys.stdout.write(f"\n{'=' * 60}\n\n")
+            sys.stdout.flush()

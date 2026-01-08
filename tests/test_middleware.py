@@ -23,6 +23,7 @@ from typing_extensions import assert_type
 
 from hpke_http.constants import HEADER_HPKE_STREAM
 from hpke_http.middleware.aiohttp import DecryptedResponse, HPKEClientSession
+from tests.conftest import E2EServer
 
 
 def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
@@ -59,15 +60,14 @@ def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
 
 
 async def _create_hpke_client(
-    server: tuple[str, int, bytes],
+    server: E2EServer,
     psk: bytes,
     psk_id: bytes,
     *,
     compress: bool = False,
 ) -> AsyncIterator[HPKEClientSession]:
     """Create HPKEClientSession connected to test server."""
-    host, port, _pk = server
-    base_url = f"http://{host}:{port}"
+    base_url = f"http://{server.host}:{server.port}"
 
     async with HPKEClientSession(
         base_url=base_url,
@@ -80,7 +80,7 @@ async def _create_hpke_client(
 
 @pytest.fixture
 async def hpke_client(
-    granian_server: tuple[str, int, bytes],
+    granian_server: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
 ) -> AsyncIterator[HPKEClientSession]:
@@ -91,7 +91,7 @@ async def hpke_client(
 
 @pytest.fixture
 async def hpke_client_compressed(
-    granian_server_compressed: tuple[str, int, bytes],
+    granian_server_compressed: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
 ) -> AsyncIterator[HPKEClientSession]:
@@ -102,7 +102,7 @@ async def hpke_client_compressed(
 
 @pytest.fixture
 async def hpke_client_no_compress_server_compress(
-    granian_server_compressed: tuple[str, int, bytes],
+    granian_server_compressed: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
 ) -> AsyncIterator[HPKEClientSession]:
@@ -117,12 +117,10 @@ async def hpke_client_no_compress_server_compress(
 class TestDiscoveryEndpoint:
     """Test HPKE key discovery endpoint."""
 
-    async def test_discovery_endpoint(self, granian_server: tuple[str, int, bytes]) -> None:
+    async def test_discovery_endpoint(self, granian_server: E2EServer) -> None:
         """Discovery endpoint returns keys with proper cache headers."""
-        host, port, _ = granian_server
-
         async with aiohttp.ClientSession() as session:
-            url = f"http://{host}:{port}/.well-known/hpke-keys"
+            url = f"http://{granian_server.host}:{granian_server.port}/.well-known/hpke-keys"
             async with session.get(url) as resp:
                 assert resp.status == 200
 
@@ -242,11 +240,10 @@ class TestStandardResponseEncryption:
 
     async def test_unencrypted_request_unencrypted_response(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
     ) -> None:
         """Plain HTTP request gets plain response (backward compat)."""
-        host, port, _ = granian_server
-        base_url = f"http://{host}:{port}"
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         # Use plain aiohttp client, no encryption
         async with aiohttp.ClientSession() as session:
@@ -261,13 +258,12 @@ class TestAuthenticationFailures:
 
     async def test_wrong_psk_rejected(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
         wrong_psk: bytes,
         wrong_psk_id: bytes,
     ) -> None:
         """Server rejects requests encrypted with wrong PSK."""
-        host, port, _ = granian_server
-        base_url = f"http://{host}:{port}"
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEClientSession(
             base_url=base_url,
@@ -753,11 +749,10 @@ class TestEncryptionStateValidation:
 
     async def test_unencrypted_response_is_plaintext(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
     ) -> None:
         """Verify unencrypted response body IS readable plaintext."""
-        host, port, _ = granian_server
-        base_url = f"http://{host}:{port}"
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         # Use plain aiohttp client - no encryption
         async with aiohttp.ClientSession() as session:
@@ -779,11 +774,10 @@ class TestEncryptionStateValidation:
     async def test_encryption_header_presence_matches_content(
         self,
         hpke_client: HPKEClientSession,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
     ) -> None:
         """Verify X-HPKE-Stream header presence matches actual encryption."""
-        host, port, _ = granian_server
-        base_url = f"http://{host}:{port}"
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         # Case 1: Encrypted request → should get encrypted response with header
         resp = await hpke_client.post("/echo", json={"test": 1})
@@ -826,14 +820,13 @@ class TestEncryptionStateValidation:
 
     async def test_missing_encryption_when_expected_raises(
         self,
-        granian_server: tuple[str, int, bytes],
+        granian_server: E2EServer,
     ) -> None:
         """
         When client expects encryption but server doesn't provide it,
         the mismatch should be detectable.
         """
-        host, port, _ = granian_server
-        base_url = f"http://{host}:{port}"
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         # Plain request to /health - server will NOT encrypt
         async with aiohttp.ClientSession() as session:
