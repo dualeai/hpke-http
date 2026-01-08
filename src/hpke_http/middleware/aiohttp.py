@@ -33,31 +33,20 @@ from yarl import URL
 
 from hpke_http._logging import get_logger
 from hpke_http.constants import (
-    CHACHA20_POLY1305_KEY_SIZE,
-    CHUNK_SIZE,
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
-    HEADER_HPKE_ENC,
-    HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
-    RAW_LENGTH_PREFIX_SIZE,
-    REQUEST_KEY_LABEL,
-    RESPONSE_KEY_LABEL,
-    SSE_SESSION_KEY_LABEL,
-    ZSTD_MIN_SIZE,
     KemId,
 )
-from hpke_http.exceptions import DecryptionError, KeyDiscoveryError
-from hpke_http.headers import b64url_decode, b64url_encode
-from hpke_http.hpke import SenderContext, setup_sender_psk
-from hpke_http.streaming import (
-    ChunkDecryptor,
-    ChunkEncryptor,
-    RawFormat,
-    SSEFormat,
-    StreamingSession,
-    zstd_compress,
+from hpke_http.core import (
+    RequestEncryptor,
+    ResponseDecryptor,
+    SSEDecryptor,
+    SSELineParser,
 )
+from hpke_http.exceptions import EncryptionRequiredError, KeyDiscoveryError
+from hpke_http.headers import b64url_decode
+from hpke_http.hpke import SenderContext
 
 __all__ = [
     "DecryptedResponse",
@@ -110,50 +99,21 @@ class DecryptedResponse:
         self._decrypted: bytes | None = None
 
     async def _ensure_decrypted(self) -> bytes:
-        """Decrypt response body using streaming (memory efficient).
+        """Decrypt response body using ResponseDecryptor.
 
-        Uses O(chunk_size) memory regardless of response size by streaming
-        HTTP chunks and decrypting on-the-fly.
+        Uses the centralized ResponseDecryptor class which handles
+        header parsing, chunk boundary detection, and decryption.
         """
         if self._decrypted is not None:
             return self._decrypted
 
-        # Derive response key from HPKE context
-        response_key = self._sender_ctx.export(RESPONSE_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
-
-        # Get salt from header
-        stream_header = self._response.headers.get(HEADER_HPKE_STREAM)
-        if not stream_header:
-            raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header for encrypted response")
-
-        session_salt = bytes(b64url_decode(stream_header))
-        session = StreamingSession(session_key=response_key, session_salt=session_salt)
-
-        # Use ChunkDecryptor with RawFormat for binary chunks
-        decryptor = ChunkDecryptor(session, format=RawFormat())
-        chunks: list[bytes] = []  # Collect decrypted chunks for b"".join()
-
         # Read entire response body (cached by aiohttp, safe to call multiple times)
-        # Wire format: sequence of [length(4B) || counter(4B) || ciphertext(N+16B)]
         raw_body = await self._response.read()
 
-        # Process all encrypted chunks using memoryview + offset tracking
-        # This is O(1) per chunk vs O(n) for del buffer[:n]
-        buffer_view = memoryview(raw_body)
-        offset = 0
-        while offset + RAW_LENGTH_PREFIX_SIZE <= len(buffer_view):
-            chunk_len = int.from_bytes(buffer_view[offset : offset + RAW_LENGTH_PREFIX_SIZE], "big")
-            total_size = RAW_LENGTH_PREFIX_SIZE + chunk_len
-            if offset + total_size > len(buffer_view):
-                raise DecryptionError("Incomplete final chunk")
-            chunk_data = bytes(buffer_view[offset : offset + total_size])
-            offset += total_size
-            chunks.append(decryptor.decrypt(chunk_data))
+        # Use centralized ResponseDecryptor - handles headers, chunking, decryption
+        decryptor = ResponseDecryptor(self._response.headers, self._sender_ctx)
+        self._decrypted = decryptor.decrypt_all(raw_body)
 
-        if offset < len(buffer_view):
-            raise DecryptionError(f"Trailing data after last chunk: {len(buffer_view) - offset} bytes")
-
-        self._decrypted = b"".join(chunks)  # Single allocation, avoids bytearray resize overhead
         _logger.debug(
             "Response decrypted: url=%s size=%d",
             self._response.url,
@@ -302,6 +262,7 @@ class HPKEClientSession:
         discovery_url: str | None = None,
         *,
         compress: bool = False,
+        require_encryption: bool = False,
         **aiohttp_kwargs: Any,
     ) -> None:
         """
@@ -315,6 +276,8 @@ class HPKEClientSession:
             compress: Enable Zstd compression for request bodies (RFC 8878).
                 When enabled, requests >= 64 bytes are compressed before encryption.
                 Server must have backports.zstd installed (Python < 3.14).
+            require_encryption: If True, raise EncryptionRequiredError when
+                server responds with plaintext instead of encrypted response.
             **aiohttp_kwargs: Additional arguments passed to aiohttp.ClientSession
         """
         self.base_url = base_url.rstrip("/")
@@ -322,6 +285,7 @@ class HPKEClientSession:
         self.psk_id = psk_id or psk
         self.discovery_url = discovery_url or urljoin(self.base_url, DISCOVERY_PATH)
         self.compress = compress
+        self.require_encryption = require_encryption
 
         self._session: aiohttp.ClientSession | None = None
         self._aiohttp_kwargs = aiohttp_kwargs
@@ -435,15 +399,15 @@ class HPKEClientSession:
     async def _encrypt_request(
         self,
         body: bytes,
-    ) -> tuple[bytes, str, SenderContext, bool, bytes]:
+    ) -> tuple[bytes, dict[str, str], SenderContext]:
         """
-        Encrypt request body using chunked format.
+        Encrypt request body using RequestEncryptor.
 
-        Uses length-prefixed chunks for streaming support:
-        [length(4B BE)] [counter(4B BE)] [ciphertext(N + 16B tag)]
+        Uses the centralized RequestEncryptor class which handles
+        compression, chunking, header generation, and encryption.
 
         Returns:
-            Tuple of (encrypted_body, enc_header_value, sender_context, was_compressed, session_salt)
+            Tuple of (encrypted_body, headers_dict, sender_context)
         """
         keys = await self._ensure_keys()
 
@@ -452,48 +416,23 @@ class HPKEClientSession:
         if not pk_r:
             raise KeyDiscoveryError("No X25519 key available from platform")
 
-        # Compress if enabled and body is large enough
-        was_compressed = False
-        if self.compress and len(body) >= ZSTD_MIN_SIZE:
-            original_size = len(body)
-            body = zstd_compress(body)
-            was_compressed = True
-            _logger.debug(
-                "Request compressed: original=%d compressed=%d ratio=%.1f%%",
-                original_size,
-                len(body),
-                len(body) / original_size * 100,
-            )
-
-        # Set up sender context
-        ctx = setup_sender_psk(
-            pk_r=pk_r,
-            info=self.psk_id,
+        # Use centralized RequestEncryptor - handles compression, chunking, encryption
+        encryptor = RequestEncryptor(
+            public_key=pk_r,
             psk=self.psk,
             psk_id=self.psk_id,
+            compress=self.compress,
+        )
+        encrypted_body = encryptor.encrypt_all(body)
+        headers = encryptor.get_headers()
+
+        _logger.debug(
+            "Request encrypted: body_size=%d encrypted_size=%d",
+            len(body),
+            len(encrypted_body),
         )
 
-        # Derive request key from HPKE context
-        request_key = ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
-        session = StreamingSession.create(request_key)
-        encryptor = ChunkEncryptor(session, format=RawFormat(), compress=False)  # Already compressed
-
-        # Chunk the body
-        chunks: list[bytes] = []
-        for offset in range(0, len(body), CHUNK_SIZE):
-            chunk = body[offset : offset + CHUNK_SIZE]
-            chunks.append(encryptor.encrypt(chunk))
-
-        # Handle empty body
-        if not chunks:
-            chunks.append(encryptor.encrypt(b""))
-
-        encrypted_body = b"".join(chunks)
-
-        # Encode enc for header
-        enc_header = b64url_encode(ctx.enc)
-
-        return (encrypted_body, enc_header, ctx, was_compressed, session.session_salt)
+        return (encrypted_body, headers, encryptor.context)
 
     async def request(
         self,
@@ -536,20 +475,16 @@ class HPKEClientSession:
         headers = dict(kwargs.pop("headers", {}))
         sender_ctx: SenderContext | None = None
         if body:
-            encrypted_body, enc_header, ctx, was_compressed, session_salt = await self._encrypt_request(body)
-            headers[HEADER_HPKE_ENC] = enc_header
-            headers[HEADER_HPKE_STREAM] = b64url_encode(session_salt)  # Session salt for chunked decryption
+            encrypted_body, crypto_headers, ctx = await self._encrypt_request(body)
+            headers.update(crypto_headers)
             headers["Content-Type"] = "application/octet-stream"
-            if was_compressed:
-                headers[HEADER_HPKE_ENCODING] = "zstd"
             sender_ctx = ctx
             kwargs["data"] = encrypted_body
             _logger.debug(
-                "Request encrypted: method=%s url=%s body_size=%d compressed=%s",
+                "Request encrypted: method=%s url=%s body_size=%d",
                 method,
                 url,
                 len(body),
-                was_compressed,
             )
 
         kwargs["headers"] = headers
@@ -566,6 +501,9 @@ class HPKEClientSession:
                 if "text/event-stream" not in content_type:
                     _logger.debug("Encrypted response detected: url=%s", url)
                     return DecryptedResponse(response, sender_ctx)
+            elif self.require_encryption:
+                # We sent encrypted request but got plaintext response
+                raise EncryptionRequiredError("Response was not encrypted")
 
         return response
 
@@ -624,40 +562,16 @@ class HPKEClientSession:
         if not sender_ctx:
             raise RuntimeError("No encryption context for this response. Was the request encrypted?")
 
-        # Get session parameters from header
-        stream_header = response.headers.get(HEADER_HPKE_STREAM)
-        if not stream_header:
-            raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
-
-        # Derive session key from sender context
-        session_key = sender_ctx.export(SSE_SESSION_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
-        session_params = bytes(b64url_decode(stream_header))
-        session = StreamingSession.deserialize(session_params, session_key)
-        decryptor = ChunkDecryptor(session, format=SSEFormat())
+        # Use centralized SSEDecryptor - handles header parsing and key derivation
+        decryptor = SSEDecryptor(response.headers, sender_ctx)
         _logger.debug("SSE decryption started: url=%s", response.url)
 
-        # Parse encrypted SSE stream using line-based parsing (O(n) total)
-        # This replaces the previous regex-based approach which was O(n²) due to
-        # repeated full-buffer scans. Line-based parsing uses buffer.index(b"\n")
-        # which is O(1) amortized, giving ~10x speedup for large payloads.
-        buffer = bytearray()
+        # Use centralized line parser for O(n) streaming (vs O(n²) regex)
+        line_parser = SSELineParser()
         current_event_lines: list[bytes] = []
 
         async for chunk in response.content:
-            buffer.extend(chunk)
-
-            # Process complete lines using offset tracking (O(1) per line, O(n) once)
-            consumed = 0
-            while True:
-                # Search for newline starting from consumed position
-                try:
-                    newline_pos = buffer.index(b"\n", consumed)
-                except ValueError:
-                    break
-
-                line = bytes(buffer[consumed:newline_pos]).rstrip(b"\r")
-                consumed = newline_pos + 1
-
+            for line in line_parser.feed(chunk):
                 if not line:
                     # Empty line = event boundary (WHATWG spec)
                     data_value = _extract_sse_data(current_event_lines)
@@ -667,7 +581,3 @@ class HPKEClientSession:
                     current_event_lines = []
                 else:
                     current_event_lines.append(line)
-
-            # Single compaction after processing all available lines
-            if consumed:
-                del buffer[:consumed]

@@ -22,26 +22,45 @@ Usage (Client - aiohttp):
 from importlib.metadata import version
 
 from hpke_http.constants import AEAD_ID, KDF_ID, KEM_ID, MODE_PSK, VERSION
+from hpke_http.core import (
+    RequestDecryptor,
+    RequestEncryptor,
+    ResponseDecryptor,
+    ResponseEncryptor,
+    SSEDecryptor,
+    SSEEncryptor,
+    SSEEventParser,
+    SSELineParser,
+    is_sse_response,
+)
 from hpke_http.exceptions import (
     CryptoError,
     DecryptionError,
+    EncryptionRequiredError,
     InvalidPSKError,
 )
 
 __all__ = [
-    # Constants
     "AEAD_ID",
     "KDF_ID",
     "KEM_ID",
     "MODE_PSK",
     "VERSION",
-    # Exceptions
     "CryptoError",
     "DecryptionError",
+    "EncryptionRequiredError",
     "InvalidPSKError",
-    # Versioning
+    "RequestDecryptor",
+    "RequestEncryptor",
+    "ResponseDecryptor",
+    "ResponseEncryptor",
+    "SSEDecryptor",
+    "SSEEncryptor",
+    "SSEEventParser",
+    "SSELineParser",
     "__version__",
     "__version_full__",
+    "is_sse_response",
 ]
 
 __version__ = version("hpke_http")
