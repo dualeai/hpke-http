@@ -357,10 +357,12 @@ class HPKEMiddleware:
             # Buffer incoming body
             state.body_buffer.extend(body)
 
-            # Emit full chunks (CHUNK_SIZE bytes each)
-            while len(state.body_buffer) >= CHUNK_SIZE:
-                chunk = bytes(state.body_buffer[:CHUNK_SIZE])
-                del state.body_buffer[:CHUNK_SIZE]
+            # Emit full chunks (CHUNK_SIZE bytes each) using offset tracking
+            # O(1) per chunk, single O(n) compaction at end instead of O(n) per chunk
+            consumed = 0
+            while len(state.body_buffer) - consumed >= CHUNK_SIZE:
+                chunk = bytes(state.body_buffer[consumed : consumed + CHUNK_SIZE])
+                consumed += CHUNK_SIZE
                 encrypted = encryptor.encrypt(chunk)
                 await send(
                     {
@@ -369,6 +371,9 @@ class HPKEMiddleware:
                         "more_body": True,
                     }
                 )
+            # Single compaction after emitting all full chunks
+            if consumed:
+                del state.body_buffer[:consumed]
 
             # Final chunk (when no more body coming)
             if not more_body:
@@ -384,20 +389,27 @@ class HPKEMiddleware:
                 )
 
         async def _extract_and_send_events(encryptor: ChunkEncryptor, *, more_body: bool) -> bool:
-            """Extract complete events from buffer and send encrypted."""
+            """Extract complete events from buffer and send encrypted.
+
+            Uses offset tracking with single compaction for O(1) per event
+            instead of O(n) per event from del buffer[:n].
+            """
             sent_any = False
+            consumed = 0
             while True:
-                match = event_boundary.search(state.buffer)
+                # Search starting from consumed position (Pattern.search supports pos arg)
+                match = event_boundary.search(state.buffer, pos=consumed)
                 if not match:
                     break
 
                 # Extract complete event (including boundary)
                 event_end = match.end()
-                chunk = bytes(state.buffer[:event_end])
-                del state.buffer[:event_end]  # Zero-copy delete from front
+                chunk = bytes(state.buffer[consumed:event_end])
+                consumed = event_end
 
-                # Send with more_body=False only if final message AND buffer empty
-                is_final = not more_body and not state.buffer
+                # Send with more_body=False only if final message AND buffer empty after compaction
+                remaining_after = len(state.buffer) - consumed
+                is_final = not more_body and remaining_after == 0
                 encrypted = encryptor.encrypt(chunk)
                 await send(
                     {
@@ -407,6 +419,10 @@ class HPKEMiddleware:
                     }
                 )
                 sent_any = True
+
+            # Single compaction after extracting all events
+            if consumed:
+                del state.buffer[:consumed]
             return sent_any
 
         async def _handle_end_of_stream(encryptor: ChunkEncryptor, *, sent_any: bool) -> None:
@@ -592,15 +608,21 @@ class HPKEMiddleware:
 
             # Read and decrypt all remaining chunks
             while True:
-                # Try to extract complete chunk from buffer
-                while len(buffer) >= 4:
-                    chunk_len = int.from_bytes(buffer[:4], "big")
+                # Try to extract complete chunks from buffer using offset tracking
+                # O(1) per chunk, single O(n) compaction instead of O(n) per chunk
+                consumed = 0
+                while consumed + 4 <= len(buffer):
+                    chunk_len = int.from_bytes(buffer[consumed : consumed + 4], "big")
                     total_size = 4 + chunk_len
-                    if len(buffer) < total_size:
+                    if consumed + total_size > len(buffer):
                         break
-                    chunk_data = bytes(buffer[:total_size])
-                    del buffer[:total_size]
+                    chunk_data = bytes(buffer[consumed : consumed + total_size])
+                    consumed += total_size
                     parts.append(decryptor.decrypt(chunk_data))
+
+                # Single compaction after extracting all available chunks
+                if consumed:
+                    del buffer[:consumed]
 
                 # Need more data?
                 if http_done:

@@ -135,20 +135,22 @@ class DecryptedResponse:
         # Read entire response body (cached by aiohttp, safe to call multiple times)
         # Wire format: sequence of [length(4B) || counter(4B) || ciphertext(N+16B)]
         raw_body = await self._response.read()
-        buffer = bytearray(raw_body)
 
-        # Process all encrypted chunks
-        while len(buffer) >= 4:
-            chunk_len = int.from_bytes(buffer[:4], "big")
+        # Process all encrypted chunks using memoryview + offset tracking
+        # This is O(1) per chunk vs O(n) for del buffer[:n]
+        buffer_view = memoryview(raw_body)
+        offset = 0
+        while offset + 4 <= len(buffer_view):
+            chunk_len = int.from_bytes(buffer_view[offset : offset + 4], "big")
             total_size = 4 + chunk_len
-            if len(buffer) < total_size:
+            if offset + total_size > len(buffer_view):
                 raise DecryptionError("Incomplete final chunk")
-            chunk_data = bytes(buffer[:total_size])
-            del buffer[:total_size]
+            chunk_data = bytes(buffer_view[offset : offset + total_size])
+            offset += total_size
             chunks.append(decryptor.decrypt(chunk_data))
 
-        if buffer:
-            raise DecryptionError(f"Trailing data after last chunk: {len(buffer)} bytes")
+        if offset < len(buffer_view):
+            raise DecryptionError(f"Trailing data after last chunk: {len(buffer_view) - offset} bytes")
 
         self._decrypted = b"".join(chunks)  # Single allocation, avoids bytearray resize overhead
         _logger.debug(
@@ -630,11 +632,17 @@ class HPKEClientSession:
         async for chunk in response.content:
             buffer.extend(chunk)
 
-            # Process complete lines
-            while b"\n" in buffer:
-                line_end = buffer.index(b"\n")
-                line = bytes(buffer[:line_end]).rstrip(b"\r")
-                del buffer[: line_end + 1]
+            # Process complete lines using offset tracking (O(1) per line, O(n) once)
+            consumed = 0
+            while True:
+                # Search for newline starting from consumed position
+                try:
+                    newline_pos = buffer.index(b"\n", consumed)
+                except ValueError:
+                    break
+
+                line = bytes(buffer[consumed:newline_pos]).rstrip(b"\r")
+                consumed = newline_pos + 1
 
                 if not line:
                     # Empty line = event boundary (WHATWG spec)
@@ -650,3 +658,7 @@ class HPKEClientSession:
                         current_event_lines = []
                 else:
                     current_event_lines.append(line)
+
+            # Single compaction after processing all available lines
+            if consumed:
+                del buffer[:consumed]
