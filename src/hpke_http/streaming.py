@@ -284,13 +284,14 @@ class SSEFormat:
         """Encode as SSE event with base64 payload.
 
         Uses pre-compiled struct for ~2x faster counter encoding.
+        Uses b"".join() for single-allocation output (vs 2 concat copies).
         """
         # Build payload: counter(4B BE) || ciphertext
         payload = bytearray(SSE_COUNTER_SIZE + len(ciphertext))
         _SSE_COUNTER_STRUCT.pack_into(payload, 0, counter)
         payload[SSE_COUNTER_SIZE:] = ciphertext
-        encoded = base64.b64encode(payload)
-        return self._PREFIX + encoded + self._SUFFIX
+        # Single allocation via join (Python pre-calculates total size)
+        return b"".join((self._PREFIX, base64.b64encode(payload), self._SUFFIX))
 
     def decode(self, data: bytes | str) -> tuple[int, memoryview]:
         """Decode base64 payload from SSE data field.
@@ -480,6 +481,11 @@ class ChunkEncryptor:
         # Build payload outside lock: encoding_id (1B) || data
         # Uses bytes concat (5x faster than bytearray + slice copy for 64KB chunks)
         # Note: bytes + memoryview works and creates new bytes object
+        #
+        # TODO(perf): This copies entire chunk to prepend 1-byte encoding_id (~64KB copy).
+        # Could eliminate by using AAD: encrypt(chunk, aad=encoding_id), then transmit
+        # encoding_id || ciphertext. This authenticates encoding_id without encrypting it.
+        # However, this requires wire format change (breaking). See RFC 9180 §5.2.
         if self._compressor is not None and len(chunk) >= ZSTD_MIN_SIZE:
             zstd = import_zstd()
             compressed = self._compressor.compress(chunk, mode=zstd.ZstdCompressor.FLUSH_BLOCK)
