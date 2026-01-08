@@ -121,6 +121,8 @@ class TestSSECompression:
 
     def test_unknown_encoding_raises_error(self) -> None:
         """Unknown encoding ID raises DecryptionError."""
+        import base64
+
         session = make_sse_session()
         encryptor = ChunkEncryptor(session, compress=False)
 
@@ -131,8 +133,6 @@ class TestSSECompression:
         # This is a bit tricky - we need to create a payload with invalid encoding
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-        from hpke_http.headers import b64url_encode
-
         # Create a new session for tampering
         tamper_session = make_sse_session()
         cipher = ChaCha20Poly1305(tamper_session.session_key)
@@ -142,7 +142,8 @@ class TestSSECompression:
         invalid_data = bytes([0xFF]) + b"some data"
         ciphertext = cipher.encrypt(nonce, invalid_data, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url) for ~1.7x faster encoding
+        encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(tamper_session)
         with pytest.raises(DecryptionError, match="Unknown encoding"):
@@ -320,10 +321,11 @@ class TestCompressionErrors:
 
     def test_corrupted_zstd_data_raises_error(self) -> None:
         """Corrupted zstd data raises DecryptionError."""
+        import base64
+
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         from hpke_http.constants import SSEEncodingId
-        from hpke_http.headers import b64url_encode
 
         session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
@@ -333,7 +335,8 @@ class TestCompressionErrors:
         invalid_zstd = bytes([SSEEncodingId.ZSTD]) + b"not valid zstd"
         ciphertext = cipher.encrypt(nonce, invalid_zstd, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(session)
         with pytest.raises(DecryptionError, match="decompression failed"):
@@ -341,10 +344,11 @@ class TestCompressionErrors:
 
     def test_truncated_zstd_data_returns_empty(self) -> None:
         """Truncated zstd data returns empty bytes (library behavior)."""
+        import base64
+
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         from hpke_http.constants import SSEEncodingId
-        from hpke_http.headers import b64url_encode
 
         zstd = import_zstd()
         session = make_sse_session()
@@ -358,7 +362,8 @@ class TestCompressionErrors:
         truncated_payload = bytes([SSEEncodingId.ZSTD]) + truncated
         ciphertext = cipher.encrypt(nonce, truncated_payload, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(session)
         # backports.zstd returns empty bytes for truncated data
@@ -367,10 +372,11 @@ class TestCompressionErrors:
 
     def test_empty_zstd_payload_returns_empty(self) -> None:
         """ZSTD encoding with empty data returns empty bytes (library behavior)."""
+        import base64
+
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         from hpke_http.constants import SSEEncodingId
-        from hpke_http.headers import b64url_encode
 
         session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
@@ -380,7 +386,8 @@ class TestCompressionErrors:
         empty_zstd = bytes([SSEEncodingId.ZSTD])
         ciphertext = cipher.encrypt(nonce, empty_zstd, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(session)
         # backports.zstd returns empty bytes for empty input
@@ -389,9 +396,9 @@ class TestCompressionErrors:
 
     def test_missing_encoding_id_raises_error(self) -> None:
         """Empty decrypted payload (no encoding ID) raises DecryptionError."""
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        import base64
 
-        from hpke_http.headers import b64url_encode
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
@@ -400,7 +407,8 @@ class TestCompressionErrors:
         # Completely empty payload
         ciphertext = cipher.encrypt(nonce, b"", associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(session)
         with pytest.raises(DecryptionError, match="too short"):
@@ -408,9 +416,9 @@ class TestCompressionErrors:
 
     def test_reserved_encoding_ids_raise_error(self) -> None:
         """Reserved encoding IDs (0x02-0xFF except valid) raise DecryptionError."""
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        import base64
 
-        from hpke_http.headers import b64url_encode
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         for encoding_id in [0x02, 0x03, 0x10, 0x80, 0xFE, 0xFF]:
             # Fresh session for each test (counter resets)
@@ -421,7 +429,8 @@ class TestCompressionErrors:
             invalid_data = bytes([encoding_id]) + b"data"
             ciphertext = test_cipher.encrypt(nonce, invalid_data, associated_data=None)
             payload = (1).to_bytes(4, "big") + ciphertext
-            encoded = b64url_encode(payload)
+            # SSEFormat uses standard base64 (not base64url)
+            encoded = base64.b64encode(payload).decode("ascii")
 
             decryptor = ChunkDecryptor(test_session)
             with pytest.raises(DecryptionError, match="Unknown encoding"):

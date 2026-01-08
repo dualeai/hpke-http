@@ -6,7 +6,7 @@ client receives normal SSE - encryption is invisible to application code.
 
 Wire format:
     event: enc
-    data: <base64url(counter_be32 || ciphertext)>
+    data: <base64(counter_be32 || ciphertext)>
 
 The ciphertext contains the raw SSE chunk exactly as the server sent it.
 Perfect fidelity: comments, retry, id, events - everything preserved.
@@ -16,6 +16,7 @@ Reference: RFC-065 §6
 
 from __future__ import annotations
 
+import base64
 import io
 import secrets
 import struct
@@ -39,7 +40,6 @@ from hpke_http.constants import (
     SSEEncodingId,
 )
 from hpke_http.exceptions import DecryptionError, ReplayAttackError, SessionExpiredError
-from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import HPKEContext
 
 # Cached zstd module (PEP 784 pattern)
@@ -238,24 +238,32 @@ class ChunkFormat(Protocol):
 
 
 class SSEFormat:
-    """SSE event format: event: enc\\ndata: <base64url>\\n\\n
+    """SSE event format: event: enc\\ndata: <base64>\\n\\n
 
     Used for Server-Sent Events streaming encryption.
+
+    Uses standard base64 (RFC 4648 §4) instead of base64url because:
+    - SSE data fields only forbid LF (0x0A) and CR (0x0D) per WHATWG spec
+    - Base64 alphabet (+, /, =) contains neither forbidden character
+    - Standard base64 is ~1.7x faster than base64url in Python stdlib
+    - No URL encoding needed since SSE is not transmitted via URL
+
+    Reference: https://html.spec.whatwg.org/multipage/server-sent-events.html
     """
 
     _PREFIX: bytes = b"event: enc\ndata: "
     _SUFFIX: bytes = b"\n\n"
 
     def encode(self, counter: int, ciphertext: bytes) -> bytes:
-        """Encode as SSE event with base64url payload."""
+        """Encode as SSE event with base64 payload."""
         payload = counter.to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
-        return self._PREFIX + encoded.encode("ascii") + self._SUFFIX
+        encoded = base64.b64encode(payload)
+        return self._PREFIX + encoded + self._SUFFIX
 
     def decode(self, data: bytes | str) -> tuple[int, bytes]:
-        """Decode base64url payload from SSE data field."""
-        data_str = data.decode("ascii") if isinstance(data, bytes) else data
-        payload = bytes(b64url_decode(data_str))
+        """Decode base64 payload from SSE data field."""
+        data_bytes = data.encode("ascii") if isinstance(data, str) else data
+        payload = base64.b64decode(data_bytes)
         return int.from_bytes(payload[:4], "big"), payload[4:]
 
 

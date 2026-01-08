@@ -3,10 +3,11 @@
 Tests all error paths in SSE encryption/decryption.
 """
 
+import base64
+
 import pytest
 
 from hpke_http.exceptions import DecryptionError, ReplayAttackError, SessionExpiredError
-from hpke_http.headers import b64url_encode
 from hpke_http.streaming import (
     ChunkDecryptor,
     ChunkEncryptor,
@@ -19,7 +20,7 @@ class TestDecryptionErrors:
     """Test DecryptionError paths in ChunkDecryptor."""
 
     def test_invalid_base64_raises(self) -> None:
-        """Invalid base64url should raise DecryptionError."""
+        """Invalid base64 should raise DecryptionError."""
         session = make_sse_session()
         decryptor = ChunkDecryptor(session)
 
@@ -33,7 +34,8 @@ class TestDecryptionErrors:
         decryptor = ChunkDecryptor(session)
 
         # 4-byte counter + 16-byte tag minimum = 20 bytes
-        short_payload = b64url_encode(b"short")  # Only 5 bytes
+        # SSEFormat uses standard base64 (not base64url)
+        short_payload = base64.b64encode(b"short").decode("ascii")  # Only 5 bytes
 
         with pytest.raises(DecryptionError, match="Ciphertext too short"):
             decryptor.decrypt(short_payload)
@@ -48,12 +50,10 @@ class TestDecryptionErrors:
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
         encoded = extract_sse_data_field(encrypted)
 
-        # Decode, corrupt, re-encode
-        from hpke_http.headers import b64url_decode
-
-        payload = bytearray(b64url_decode(encoded))
+        # Decode, corrupt, re-encode (SSEFormat uses standard base64)
+        payload = bytearray(base64.b64decode(encoded))
         payload[10] ^= 0xFF  # Flip bits in ciphertext
-        corrupted = b64url_encode(bytes(payload))
+        corrupted = base64.b64encode(bytes(payload)).decode("ascii")
 
         with pytest.raises(DecryptionError, match="Decryption failed"):
             decryptor.decrypt(corrupted)

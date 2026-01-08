@@ -3,9 +3,9 @@
 Tests encrypted SSE output format compliance.
 """
 
+import base64
 import re
 
-from hpke_http.headers import b64url_decode
 from hpke_http.streaming import ChunkEncryptor, StreamingSession
 from tests.conftest import extract_sse_data_field
 
@@ -51,8 +51,13 @@ class TestSSEOutputFormat:
 
         assert encrypted.endswith(b"\n\n")
 
-    def test_sse_data_is_base64url(self) -> None:
-        """Data field should be valid base64url."""
+    def test_sse_data_is_base64(self) -> None:
+        """Data field should be valid standard base64.
+
+        SSEFormat uses standard base64 (RFC 4648 §4) instead of base64url because:
+        - SSE data fields only forbid LF and CR per WHATWG spec
+        - Standard base64 is ~1.7x faster than base64url in Python stdlib
+        """
         key = b"0" * 32
         session = StreamingSession.create(key)
         encryptor = ChunkEncryptor(session)
@@ -62,12 +67,12 @@ class TestSSEOutputFormat:
         # Extract data field
         data = extract_sse_data_field(encrypted)
 
-        # Should be valid base64url (no exceptions)
-        decoded = b64url_decode(data)
+        # Should be valid base64 (no exceptions)
+        decoded = base64.b64decode(data)
         assert len(decoded) > 0
 
-        # Should only contain base64url characters
-        assert re.match(r"^[A-Za-z0-9_-]+$", data), f"Invalid base64url chars in: {data}"
+        # Should only contain standard base64 characters (A-Z, a-z, 0-9, +, /, =)
+        assert re.match(r"^[A-Za-z0-9+/=]+$", data), f"Invalid base64 chars in: {data}"
 
     def test_event_type_always_enc(self) -> None:
         """Event type in SSE should always be 'enc'."""

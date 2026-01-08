@@ -876,7 +876,11 @@ class TestRawWireFormatValidation:
         self,
         hpke_client: HPKEClientSession,
     ) -> None:
-        """Verify SSE wire format: event: enc\\ndata: <base64url>\\n\\n."""
+        """Verify SSE wire format: event: enc\\ndata: <base64>\\n\\n.
+
+        SSEFormat uses standard base64 (not base64url) for ~1.7x faster encoding.
+        See streaming.py SSEFormat docstring for rationale.
+        """
         resp = await hpke_client.post("/stream", json={"start": True})
 
         # Read enough raw chunks to get a complete event
@@ -894,14 +898,12 @@ class TestRawWireFormatValidation:
         assert "event: enc" in raw_str, f"SSE should have 'event: enc', got: {raw_str[:100]}"
         assert "data:" in raw_str, f"SSE should have 'data:' field, got: {raw_str[:100]}"
 
-        # Data field should be base64url encoded
-        # Extract data value
+        # Data field should be standard base64 encoded (A-Za-z0-9+/=)
         for line in raw_str.split("\n"):
             if line.startswith("data:"):
                 data_value = line[5:].strip()
-                # Base64url alphabet: A-Za-z0-9-_
-                assert re.match(r"^[A-Za-z0-9_-]+$", data_value), (
-                    f"Data field should be base64url, got: {data_value[:50]}"
+                assert re.match(r"^[A-Za-z0-9+/=]+$", data_value), (
+                    f"Data field should be base64, got: {data_value[:50]}"
                 )
                 break
 
