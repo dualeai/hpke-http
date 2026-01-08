@@ -27,6 +27,33 @@ from hpke_http.streaming import ChunkDecryptor, ChunkEncryptor, StreamingSession
 logging.getLogger("hpke_http").setLevel(logging.DEBUG)
 logging.getLogger("hpke_http").addHandler(logging.StreamHandler())
 
+
+# === Cryptographic Analysis Helpers ===
+
+
+def calculate_shannon_entropy(data: bytes) -> float:
+    """Calculate Shannon entropy in bits per byte (0-8 scale)."""
+    import math
+    from collections import Counter
+
+    if not data:
+        return 0.0
+    freq = Counter(data)
+    total = len(data)
+    return -sum((c / total) * math.log2(c / total) for c in freq.values())
+
+
+def chi_square_byte_uniformity(data: bytes) -> tuple[float, float]:
+    """Test if byte distribution is uniform. Returns (chi2, p_value)."""
+    import numpy as np
+    from scipy import stats  # type: ignore[import-untyped]
+
+    observed = np.bincount(np.frombuffer(data, dtype=np.uint8), minlength=256)
+    expected = len(data) / 256
+    chi2_result = stats.chisquare(observed, f_exp=[expected] * 256)  # type: ignore[reportUnknownMemberType]
+    return float(chi2_result.statistic), float(chi2_result.pvalue)  # type: ignore[reportUnknownMemberType]
+
+
 # === Key Fixtures ===
 
 

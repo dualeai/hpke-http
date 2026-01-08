@@ -113,6 +113,28 @@ async def stream_many(request: Request) -> StreamingResponse:
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
+async def echo_chunks(request: Request) -> JSONResponse:
+    """Diagnostic endpoint reporting how request body arrived in chunks."""
+    import time
+
+    start_time = time.monotonic()
+    chunks_received: list[dict[str, int | float]] = []
+
+    async for chunk in request.stream():
+        offset_ms = (time.monotonic() - start_time) * 1000
+        chunks_received.append({"size": len(chunk), "offset_ms": round(offset_ms, 2)})
+
+    total_bytes = sum(int(c["size"]) for c in chunks_received)
+    return JSONResponse(
+        {
+            "chunk_count": len(chunks_received),
+            "total_bytes": total_bytes,
+            "chunks": chunks_received,
+            "appears_streamed": len(chunks_received) > 1,
+        }
+    )
+
+
 def _create_app() -> HPKEMiddleware:
     """Create ASGI app wrapped with HPKEMiddleware.
 
@@ -139,6 +161,7 @@ def _create_app() -> HPKEMiddleware:
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/echo", echo, methods=["POST"]),
+        Route("/echo-chunks", echo_chunks, methods=["POST"]),
         Route("/stream", stream, methods=["POST"]),
         Route("/stream-delayed", stream_delayed, methods=["POST"]),
         Route("/stream-large", stream_large, methods=["POST"]),

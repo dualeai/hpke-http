@@ -14,6 +14,7 @@ Fixtures are shared via conftest.py.
 
 import json
 import re
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -23,7 +24,7 @@ from typing_extensions import assert_type
 
 from hpke_http.constants import HEADER_HPKE_STREAM
 from hpke_http.middleware.aiohttp import DecryptedResponse, HPKEClientSession
-from tests.conftest import E2EServer
+from tests.conftest import E2EServer, calculate_shannon_entropy, chi_square_byte_uniformity
 
 
 def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
@@ -1345,3 +1346,182 @@ class TestLargePayloadAutoChunking:
         assert "[00005000]" in echo, "Middle block marker missing"
         last_idx = (size_bytes // block_size) - 1
         assert f"[{last_idx:08d}]" in echo, "Last block marker missing"
+
+
+# =============================================================================
+# Cryptographic Properties Verification
+# =============================================================================
+
+
+class TestCryptographicProperties:
+    """Tests that verify encryption is ACTUALLY happening at the wire level."""
+
+    async def test_encrypted_body_has_cryptographic_entropy(
+        self,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify encrypted output has high Shannon entropy (> 7.0 bits/byte)."""
+        payload = {"data": "A" * 10000, "secret": "password123"}
+
+        resp = await hpke_client.post("/echo", json=payload)
+        assert resp.status == 200
+        assert isinstance(resp, DecryptedResponse)
+
+        raw_body = await resp.unwrap().read()
+        assert len(raw_body) > 256, "Response too short for entropy analysis"
+
+        entropy = calculate_shannon_entropy(raw_body)
+        assert entropy > 7.0, (
+            f"Entropy {entropy:.2f} bits/byte too low for encrypted data. "
+            f"Expected > 7.0. May indicate encryption bypass."
+        )
+
+    async def test_encrypted_body_uniform_distribution(
+        self,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify encrypted data has uniform byte distribution (chi-square p > 0.01)."""
+        payload = {"message": "Hello World " * 1000}
+
+        resp = await hpke_client.post("/echo", json=payload)
+        assert resp.status == 200
+        assert isinstance(resp, DecryptedResponse)
+
+        raw_body = await resp.unwrap().read()
+        assert len(raw_body) >= 1000, "Response too short for chi-square test"
+
+        chi2, p_value = chi_square_byte_uniformity(raw_body)
+        assert p_value > 0.01, (
+            f"Chi-square p-value {p_value:.4f} indicates non-uniform distribution. "
+            f"Encrypted data should appear random (chi2={chi2:.2f})."
+        )
+
+    async def test_known_plaintext_not_visible_on_wire(
+        self,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify known plaintext values never appear in encrypted wire data."""
+        canary = "CANARY_SECRET_12345_XYZ"
+        payload = {"secret": canary, "data": "Hello World Test Message"}
+
+        resp = await hpke_client.post("/echo", json=payload)
+        assert resp.status == 200
+        assert isinstance(resp, DecryptedResponse)
+
+        raw_body = await resp.unwrap().read()
+
+        forbidden_patterns = [
+            canary.encode(),
+            b'"secret"',
+            b'"echo"',
+            b"Hello World",
+        ]
+
+        for pattern in forbidden_patterns:
+            assert pattern not in raw_body, (
+                f"Known plaintext '{pattern.decode(errors='replace')}' found in "
+                f"encrypted wire data! Encryption may be bypassed."
+            )
+
+    async def test_wire_format_cryptographic_structure(
+        self,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify wire format has valid cryptographic structure."""
+        resp = await hpke_client.post("/echo", json={"test": "structure"})
+        assert resp.status == 200
+        assert isinstance(resp, DecryptedResponse)
+
+        raw_body = await resp.unwrap().read()
+        assert len(raw_body) >= 25, f"Response too short: {len(raw_body)} bytes"
+
+        chunk_len = int.from_bytes(raw_body[:4], "big")
+        assert chunk_len >= 21, f"Chunk length {chunk_len} too short"
+
+        counter = int.from_bytes(raw_body[4:8], "big")
+        assert counter >= 1, f"Counter {counter} invalid - must start at 1"
+
+
+# =============================================================================
+# Streaming Behavior Verification
+# =============================================================================
+
+
+class TestStreamingBehavior:
+    """Tests that verify chunking/streaming is ACTUALLY happening."""
+
+    async def test_sse_chunks_arrive_progressively(
+        self,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify SSE chunks arrive with inter-arrival timing gaps."""
+        resp = await hpke_client.post("/stream-delayed", json={"start": True})
+        assert resp.status == 200
+
+        arrival_times: list[float] = []
+        async for _chunk in resp.content:
+            arrival_times.append(time.monotonic())
+            if len(arrival_times) >= 6:
+                break
+
+        assert len(arrival_times) >= 5, f"Expected 5+ chunks, got {len(arrival_times)}"
+
+        gaps = [arrival_times[i + 1] - arrival_times[i] for i in range(len(arrival_times) - 1)]
+        significant_gaps = sum(1 for g in gaps if g > 0.05)
+
+        # At least one significant gap proves progressive delivery (not all buffered until end).
+        # TCP and encryption layer may batch adjacent events, so we only require 1 gap.
+        assert significant_gaps >= 1, (
+            f"No gaps > 50ms found. All chunks arrived instantly - not streaming. "
+            f"Gaps: {[f'{g * 1000:.0f}ms' for g in gaps]}"
+        )
+
+    async def test_large_request_is_chunked(
+        self,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify large requests are sent in multiple chunks."""
+        size_mb = 10
+        large_content = "X" * (size_mb * 1024 * 1024)
+
+        resp = await hpke_client.post("/echo-chunks", data=large_content.encode())
+        assert resp.status == 200
+
+        data = await resp.json()
+
+        assert data["chunk_count"] > 1, f"Large {size_mb}MB request sent as single chunk!"
+
+        min_expected = (size_mb * 1024 * 1024) // (64 * 1024) // 2
+        assert data["chunk_count"] >= min_expected, (
+            f"Expected >= {min_expected} chunks for {size_mb}MB, got {data['chunk_count']}"
+        )
+
+    async def test_response_chunk_boundaries_valid(
+        self,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify response chunk boundaries align with length prefix format."""
+        size_mb = 5
+        large_content = "Y" * (size_mb * 1024 * 1024)
+
+        resp = await hpke_client.post("/echo", data=large_content.encode())
+        assert resp.status == 200
+        assert isinstance(resp, DecryptedResponse)
+
+        raw_body = await resp.unwrap().read()
+
+        offset = 0
+        counters: list[int] = []
+
+        while offset < len(raw_body):
+            assert offset + 4 <= len(raw_body), f"Truncated length at offset {offset}"
+            chunk_len = int.from_bytes(raw_body[offset : offset + 4], "big")
+            assert chunk_len > 0, f"Zero-length chunk at offset {offset}"
+            assert offset + 4 + chunk_len <= len(raw_body), f"Chunk overflow at offset {offset}"
+
+            counter = int.from_bytes(raw_body[offset + 4 : offset + 8], "big")
+            counters.append(counter)
+            offset += 4 + chunk_len
+
+        assert offset == len(raw_body), f"Chunk boundaries misaligned: {offset} vs {len(raw_body)}"
+        assert counters == list(range(1, len(counters) + 1)), f"Counters not monotonic: {counters[:10]}"
