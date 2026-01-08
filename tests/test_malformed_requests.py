@@ -7,10 +7,16 @@ Uses raw aiohttp (not HPKEClientSession) to send intentionally broken requests.
 import aiohttp
 import pytest
 
-from hpke_http.constants import HEADER_HPKE_ENC, HEADER_HPKE_ENCODING
-from hpke_http.envelope import encode_envelope
+from hpke_http.constants import (
+    CHACHA20_POLY1305_KEY_SIZE,
+    HEADER_HPKE_ENC,
+    HEADER_HPKE_ENCODING,
+    HEADER_HPKE_STREAM,
+    REQUEST_KEY_LABEL,
+)
 from hpke_http.headers import b64url_encode
 from hpke_http.hpke import setup_sender_psk
+from hpke_http.streaming import ChunkEncryptor, RawFormat, StreamingSession
 
 from .conftest import E2EServer
 
@@ -84,11 +90,11 @@ def _encrypt_request(
     pk_r: bytes,
     psk: bytes,
     psk_id: bytes,
-) -> tuple[bytes, str]:
-    """Encrypt request body for testing.
+) -> tuple[bytes, str, str]:
+    """Encrypt request body for testing using chunked streaming format.
 
     Returns:
-        Tuple of (encrypted_envelope, enc_header_value)
+        Tuple of (encrypted_body, enc_header_value, stream_header_value)
     """
     ctx = setup_sender_psk(
         pk_r=pk_r,
@@ -96,10 +102,16 @@ def _encrypt_request(
         psk=psk,
         psk_id=psk_id,
     )
-    ciphertext = ctx.seal(aad=b"", plaintext=body)
-    envelope = encode_envelope(ciphertext)
+    # Derive request key from HPKE context (matches HPKEClientSession)
+    request_key = ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
+    session = StreamingSession.create(request_key)
+    encryptor = ChunkEncryptor(session, format=RawFormat(), compress=False)
+
+    # Encrypt body as single chunk
+    encrypted_body = encryptor.encrypt(body) if body else encryptor.encrypt(b"")
     enc_header = b64url_encode(ctx.enc)
-    return (envelope, enc_header)
+    stream_header = b64url_encode(session.session_salt)
+    return (encrypted_body, enc_header, stream_header)
 
 
 class TestMalformedCompressionHeaders:
@@ -133,13 +145,14 @@ class TestMalformedCompressionHeaders:
         host, port, pk = granian_server.host, granian_server.port, granian_server.public_key
         body = b'{"test": "compression header test"}'
 
-        encrypted_body, enc_header = _encrypt_request(body, pk, test_psk, test_psk_id)
+        encrypted_body, enc_header, stream_header = _encrypt_request(body, pk, test_psk, test_psk_id)
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"http://{host}:{port}/echo",
                 headers={
                     HEADER_HPKE_ENC: enc_header,
+                    HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_ENCODING: encoding_value,
                     "Content-Type": "application/octet-stream",
                 },

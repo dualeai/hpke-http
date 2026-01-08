@@ -56,8 +56,7 @@ from hpke_http.constants import (
     SSE_MAX_EVENT_SIZE,
     KemId,
 )
-from hpke_http.envelope import decode_envelope
-from hpke_http.exceptions import CryptoError, DecryptionError, EnvelopeError
+from hpke_http.exceptions import CryptoError, DecryptionError
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import setup_recipient_psk
 from hpke_http.streaming import (
@@ -198,13 +197,25 @@ class HPKEMiddleware:
         _logger.debug("Encrypted request received: method=%s path=%s", method, path)
 
         # Decrypt request AND wrap send for response encryption
+        # Track if response has started so we know if we can send error responses
+        response_started = False
+
+        async def tracked_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
         try:
             decrypted_receive = await self._create_decrypted_receive(scope, receive, enc_header)
-            encrypting_send = self._create_encrypting_send(scope, send)
+            encrypting_send = self._create_encrypting_send(scope, tracked_send)
             await self.app(scope, decrypted_receive, encrypting_send)
         except CryptoError as e:
             # Don't expose internal error details to clients
             _logger.debug("Decryption failed: method=%s path=%s error_type=%s", method, path, type(e).__name__)
+            if response_started:
+                # Response already started, can't send error - re-raise to close connection
+                raise
             await self._send_error(send, 400, "Request decryption failed")
 
     def _create_encrypting_send(  # noqa: PLR0915
@@ -497,7 +508,7 @@ class HPKEMiddleware:
             enc = bytes(b64url_decode(enc_header.decode("ascii")))
             session_salt = bytes(b64url_decode(stream_header.decode("ascii")))
         except Exception as e:
-            raise DecryptionError(f"Invalid header encoding") from e
+            raise DecryptionError("Invalid header encoding") from e
 
         # Get PSK from resolver
         try:
@@ -543,63 +554,110 @@ class HPKEMiddleware:
             is_compressed,
         )
 
+        # Early validation: read and decrypt first chunk to validate PSK/key before app starts.
+        # This ensures decryption errors return 400 (Bad Request) instead of 500 (Server Error).
+        # Buffer data until we have a complete first encrypted chunk.
+        first_plaintext: bytes | None = None
+        while True:
+            if len(buffer) >= 4:
+                chunk_len = int.from_bytes(buffer[:4], "big")
+                total_size = 4 + chunk_len
+                if len(buffer) >= total_size:
+                    # Have complete first chunk - decrypt to validate key
+                    chunk_data = bytes(buffer[:total_size])
+                    del buffer[:total_size]
+                    first_plaintext = decryptor.decrypt(chunk_data)  # Raises if PSK wrong
+                    break
+
+            # Need more data
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                raise DecryptionError("Client disconnected during request validation")
+            buffer.extend(message.get("body", b""))
+            if not message.get("more_body", False):
+                http_done = True
+                if len(buffer) == 0:
+                    # Empty body - nothing to validate
+                    first_plaintext = b""
+                    break
+                # Still need to decrypt whatever we have
+                continue
+
         # For compressed requests, we must buffer all chunks and decompress at end
         # (client compresses full body before chunking)
+        # Do all decryption and decompression during setup to catch errors early (return 400)
         if is_compressed:
-            decrypted_parts: list[bytes] = []
+            # Start with pre-validated first chunk (if any)
+            parts: list[bytes] = [first_plaintext] if first_plaintext else []
+
+            # Read and decrypt all remaining chunks
+            while True:
+                # Try to extract complete chunk from buffer
+                while len(buffer) >= 4:
+                    chunk_len = int.from_bytes(buffer[:4], "big")
+                    total_size = 4 + chunk_len
+                    if len(buffer) < total_size:
+                        break
+                    chunk_data = bytes(buffer[:total_size])
+                    del buffer[:total_size]
+                    parts.append(decryptor.decrypt(chunk_data))
+
+                # Need more data?
+                if http_done:
+                    break
+
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    raise DecryptionError("Client disconnected during request")
+                buffer.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    http_done = True
+
+            # Decompress full body (raises DecryptionError if invalid, caught by __call__)
+            compressed_body = b"".join(parts)
+            try:
+                decompressed_body = zstd_decompress(compressed_body)
+                _logger.debug(
+                    "Request decompressed: compressed=%d decompressed=%d",
+                    len(compressed_body),
+                    len(decompressed_body),
+                )
+            except Exception as e:
+                raise DecryptionError(f"Zstd decompression failed: {e}") from e
+
+            # Return decompressed body and wait for disconnect
+            body_returned_compressed = False
 
             async def decrypted_receive_compressed() -> dict[str, Any]:
-                nonlocal http_done, decrypted_parts
+                nonlocal body_returned_compressed
 
-                # First call: read all chunks, decrypt, decompress, return all
-                if decrypted_parts is not None:
-                    # Read and decrypt all chunks
-                    parts: list[bytes] = []
-                    while True:
-                        # Try to extract complete chunk from buffer
-                        while len(buffer) >= 4:
-                            chunk_len = int.from_bytes(buffer[:4], "big")
-                            total_size = 4 + chunk_len
-                            if len(buffer) < total_size:
-                                break
-                            chunk_data = bytes(buffer[:total_size])
-                            del buffer[:total_size]
-                            parts.append(decryptor.decrypt(chunk_data))
-
-                        # Need more data?
-                        if http_done:
-                            break
-
-                        message = await receive()
-                        if message["type"] == "http.disconnect":
-                            raise DecryptionError("Client disconnected during request")
-                        buffer.extend(message.get("body", b""))
-                        if not message.get("more_body", False):
-                            http_done = True
-
-                    # Decompress full body
-                    compressed_body = b"".join(parts)
-                    try:
-                        plaintext = zstd_decompress(compressed_body)
-                        _logger.debug(
-                            "Request decompressed: compressed=%d decompressed=%d",
-                            len(compressed_body),
-                            len(plaintext),
-                        )
-                    except Exception as e:
-                        raise DecryptionError(f"Zstd decompression failed: {e}") from e
-
-                    decrypted_parts = []  # Mark as consumed
-                    return {"type": "http.request", "body": plaintext, "more_body": False}
-
+                if not body_returned_compressed:
+                    body_returned_compressed = True
+                    return {"type": "http.request", "body": decompressed_body, "more_body": False}
                 # Subsequent calls: wait for disconnect
                 return await receive()
 
             return decrypted_receive_compressed
 
         # Non-compressed: stream chunks directly
+        body_returned = False  # Track if we've returned the final body
+        first_chunk_returned = False  # Track if we've returned the pre-validated first chunk
+
         async def decrypted_receive() -> dict[str, Any]:
-            nonlocal http_done
+            nonlocal http_done, body_returned, first_chunk_returned
+
+            # After returning more_body=False, wait for disconnect
+            if body_returned:
+                return await receive()
+
+            # Return pre-validated first chunk on first call
+            if not first_chunk_returned:
+                first_chunk_returned = True
+                if first_plaintext is not None:
+                    more_body = not (http_done and len(buffer) == 0)
+                    if not more_body:
+                        body_returned = True
+                    return {"type": "http.request", "body": first_plaintext, "more_body": more_body}
 
             while True:
                 # Try to extract complete chunk from buffer
@@ -614,11 +672,14 @@ class HPKEMiddleware:
                         plaintext = decryptor.decrypt(chunk_data)
 
                         more_body = not (http_done and len(buffer) == 0)
+                        if not more_body:
+                            body_returned = True
                         return {"type": "http.request", "body": plaintext, "more_body": more_body}
 
                 # Need more data from HTTP layer
                 if http_done:
                     # No more HTTP data available
+                    body_returned = True
                     return {"type": "http.request", "body": b"", "more_body": False}
 
                 # Fetch more from underlying receive
