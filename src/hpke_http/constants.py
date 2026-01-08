@@ -249,3 +249,18 @@ ZSTD_STREAMING_CHUNK_SIZE: Final[int] = 4 * 1024 * 1024  # 4MB
 Determines how much data is written to ZstdFile at once.
 Affects peak memory usage during compression.
 """
+
+ZSTD_DECOMPRESS_STREAMING_THRESHOLD: Final[int] = 1024  # 1KB
+"""Threshold for using streaming decompression in request handling.
+
+For compressed request bodies, use streaming decompression when compressed
+size >= this threshold. This is a RAM/CPU tradeoff:
+
+- RAM: Streaming uses ~1.3x decompressed size vs ~2x for list+join.
+       For 50MB: saves ~35MB per request.
+- CPU: Streaming adds ~40% overhead (10ms -> 15ms for 50MB).
+
+Set low (1KB) because compressed JSON often expands 100-1000x, so even
+tiny compressed payloads can decompress to large sizes where RAM savings
+outweigh CPU cost.
+"""

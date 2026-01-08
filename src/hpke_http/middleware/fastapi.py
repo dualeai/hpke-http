@@ -55,6 +55,7 @@ from hpke_http.constants import (
     RESPONSE_KEY_LABEL,
     SCOPE_HPKE_CONTEXT,
     SSE_MAX_EVENT_SIZE,
+    ZSTD_DECOMPRESS_STREAMING_THRESHOLD,
     KemId,
 )
 from hpke_http.exceptions import CryptoError, DecryptionError
@@ -649,10 +650,13 @@ class HPKEMiddleware:
             if not message.get("more_body", False):
                 state.http_done = True
 
-        # Decompress full body
+        # Decompress full body using streaming for memory efficiency
         compressed_body = b"".join(parts)
         try:
-            decompressed = zstd_decompress(compressed_body)
+            decompressed = zstd_decompress(
+                compressed_body,
+                streaming_threshold=ZSTD_DECOMPRESS_STREAMING_THRESHOLD,
+            )
             _logger.debug(
                 "Request decompressed: compressed=%d decompressed=%d",
                 len(compressed_body),
