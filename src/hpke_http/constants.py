@@ -140,16 +140,6 @@ def build_suite_id(kem_id: int = KEM_ID, kdf_id: int = KDF_ID, aead_id: int = AE
 SUITE_ID: Final[bytes] = build_suite_id()
 
 # =============================================================================
-# Wire Format Constants
-# =============================================================================
-
-# Envelope header size: version(1) + kem_id(2) + kdf_id(2) + aead_id(2) + mode(1) = 8 bytes
-ENVELOPE_HEADER_SIZE: Final[int] = 8
-
-# Current envelope version
-ENVELOPE_VERSION: Final[int] = 0x01
-
-# =============================================================================
 # HTTP Header Names
 # =============================================================================
 
