@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import secrets
+import struct
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -43,6 +44,10 @@ from hpke_http.hpke import HPKEContext
 
 # Cached zstd module (PEP 784 pattern)
 _zstd_module: Any = None
+
+# Pre-compiled struct for nonce counter (little-endian uint32)
+# Used by ChunkEncryptor/ChunkDecryptor._compute_nonce for faster packing
+_COUNTER_STRUCT = struct.Struct("<I")
 
 
 def import_zstd() -> Any:
@@ -220,14 +225,14 @@ class ChunkFormat(Protocol):
         """
         ...
 
-    def decode(self, data: bytes | str) -> tuple[int, bytes]:
+    def decode(self, data: bytes | str) -> tuple[int, bytes | memoryview]:
         """Parse wire data into (counter, ciphertext).
 
         Args:
             data: Wire-formatted data
 
         Returns:
-            Tuple of (counter, ciphertext)
+            Tuple of (counter, ciphertext) - ciphertext may be memoryview for zero-copy
         """
         ...
 
@@ -265,18 +270,26 @@ class RawFormat:
     """
 
     def encode(self, counter: int, ciphertext: bytes) -> bytes:
-        """Encode as raw binary: length || counter || ciphertext."""
-        chunk = counter.to_bytes(4, "big") + ciphertext
-        length = len(chunk)
-        return length.to_bytes(4, "big") + chunk
+        """Encode as raw binary: length || counter || ciphertext.
 
-    def decode(self, data: bytes | str) -> tuple[int, bytes]:
+        Uses single allocation instead of two concatenations for better performance.
+        """
+        # Single allocation: length(4B) + counter(4B) + ciphertext
+        total_len = 4 + len(ciphertext)  # counter(4B) + ciphertext
+        result = bytearray(4 + total_len)  # length(4B) + total_len
+        result[0:4] = total_len.to_bytes(4, "big")
+        result[4:8] = counter.to_bytes(4, "big")
+        result[8:] = ciphertext
+        return bytes(result)
+
+    def decode(self, data: bytes | str) -> tuple[int, memoryview]:
         """Decode raw binary: length(4B) || counter(4B) || ciphertext.
 
+        Returns memoryview for zero-copy slicing of ciphertext.
         The length prefix is read and validated, then counter and ciphertext
         are extracted from the remaining bytes.
         """
-        raw = data if isinstance(data, bytes) else data.encode("latin-1")
+        raw = memoryview(data if isinstance(data, bytes) else data.encode("latin-1"))
         # Skip length prefix (4 bytes), read counter and ciphertext
         return int.from_bytes(raw[4:8], "big"), raw[8:]
 
@@ -378,20 +391,29 @@ class ChunkEncryptor:
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
     _lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)
     _compressor: Any = field(init=False, repr=False, default=None)  # Reused per session
+    _nonce_buf: bytearray = field(init=False, repr=False)  # Pre-allocated 12-byte nonce buffer
 
     def __post_init__(self) -> None:
         self._cipher = ChaCha20Poly1305(self.session.session_key)
+        # Pre-allocate nonce buffer: salt(4B) + zeros(4B) + counter(4B)
+        self._nonce_buf = bytearray(12)
+        self._nonce_buf[:4] = self.session.session_salt
+        # Bytes 4-7 remain zeros (default bytearray value)
         if self.compress:
             zstd = import_zstd()
             self._compressor = zstd.ZstdCompressor(level=ZSTD_COMPRESSION_LEVEL)
 
-    def _compute_nonce(self, counter: int) -> bytes:
+    def _compute_nonce(self, counter: int) -> memoryview:
         """
-        Compute 12-byte nonce from salt and counter.
+        Compute 12-byte nonce from salt and counter (zero-copy).
 
         nonce = session_salt (4B) || zero_pad (4B) || counter_le32 (4B)
+
+        Uses pre-allocated buffer and struct.pack_into for ~2x faster
+        than counter.to_bytes() in hot paths.
         """
-        return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
+        _COUNTER_STRUCT.pack_into(self._nonce_buf, 8, counter)
+        return memoryview(self._nonce_buf)
 
     def encrypt(self, chunk: bytes) -> bytes:
         """
@@ -406,30 +428,38 @@ class ChunkEncryptor:
         Raises:
             SessionExpiredError: If counter exhausted
         """
+        # Build payload outside lock: encoding_id (1B) || data
+        # Compression is expensive, so moving it outside the lock reduces contention
+        if self._compressor is not None and len(chunk) >= ZSTD_MIN_SIZE:
+            zstd = import_zstd()
+            compressed = self._compressor.compress(chunk, mode=zstd.ZstdCompressor.FLUSH_BLOCK)
+            data = bytearray(1 + len(compressed))
+            data[0] = SSEEncodingId.ZSTD
+            data[1:] = compressed
+        else:
+            data = bytearray(1 + len(chunk))
+            data[0] = SSEEncodingId.IDENTITY
+            data[1:] = chunk
+
+        # Lock only for counter operations and nonce computation
+        # (nonce buffer is shared, so must be protected)
         with self._lock:
             if self.counter > SSE_MAX_COUNTER:
                 raise SessionExpiredError("Session counter exhausted")
 
-            # Build payload: encoding_id (1B) || data
-            # Compress if enabled and chunk is large enough
-            if self._compressor is not None and len(chunk) >= ZSTD_MIN_SIZE:
-                zstd = import_zstd()
-                compressed = self._compressor.compress(chunk, mode=zstd.ZstdCompressor.FLUSH_BLOCK)
-                data = bytes([SSEEncodingId.ZSTD]) + compressed
-            else:
-                data = bytes([SSEEncodingId.IDENTITY]) + chunk
-
-            # Encrypt with counter nonce
-            nonce = self._compute_nonce(self.counter)
-            ciphertext = self._cipher.encrypt(nonce, data, associated_data=None)
-
-            # Format output via strategy
-            result = self.format.encode(self.counter, ciphertext)
-
-            # Increment counter for next chunk
+            current_counter = self.counter
             self.counter += 1
 
-        return result
+            # Compute nonce inside lock (modifies shared _nonce_buf)
+            nonce = self._compute_nonce(current_counter)
+            # Convert to bytes so we can release lock before encryption
+            nonce_bytes = bytes(nonce)
+
+        # Encrypt outside lock (ChaCha20Poly1305 is thread-safe with unique nonces)
+        ciphertext = self._cipher.encrypt(nonce_bytes, data, associated_data=None)
+
+        # Format output via strategy
+        return self.format.encode(current_counter, ciphertext)
 
 
 @dataclass
@@ -452,13 +482,19 @@ class ChunkDecryptor:
     expected_counter: int = field(default=1)  # Expect counter starting at 1
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
     _decompressor: Any = field(init=False, repr=False, default=None)  # Lazy init, reused
+    _nonce_buf: bytearray = field(init=False, repr=False)  # Pre-allocated 12-byte nonce buffer
 
     def __post_init__(self) -> None:
         self._cipher = ChaCha20Poly1305(self.session.session_key)
+        # Pre-allocate nonce buffer: salt(4B) + zeros(4B) + counter(4B)
+        self._nonce_buf = bytearray(12)
+        self._nonce_buf[:4] = self.session.session_salt
+        # Bytes 4-7 remain zeros (default bytearray value)
 
-    def _compute_nonce(self, counter: int) -> bytes:
-        """Compute 12-byte nonce from salt and counter."""
-        return self.session.session_salt + b"\x00\x00\x00\x00" + counter.to_bytes(4, "little")
+    def _compute_nonce(self, counter: int) -> memoryview:
+        """Compute 12-byte nonce from salt and counter (zero-copy)."""
+        _COUNTER_STRUCT.pack_into(self._nonce_buf, 8, counter)
+        return memoryview(self._nonce_buf)
 
     def _get_decompressor(self) -> Any:
         """Get or create decompressor (lazy, reused per session)."""
