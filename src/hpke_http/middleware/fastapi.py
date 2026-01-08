@@ -43,12 +43,14 @@ from hpke_http._logging import get_logger
 from hpke_http.constants import (
     AEAD_ID,
     CHACHA20_POLY1305_KEY_SIZE,
+    CHUNK_SIZE,
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
     KDF_ID,
+    REQUEST_KEY_LABEL,
     RESPONSE_KEY_LABEL,
     SCOPE_HPKE_CONTEXT,
     SSE_MAX_EVENT_SIZE,
@@ -59,6 +61,7 @@ from hpke_http.exceptions import CryptoError, DecryptionError, EnvelopeError
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import setup_recipient_psk
 from hpke_http.streaming import (
+    ChunkDecryptor,
     ChunkEncryptor,
     RawFormat,
     StreamingSession,
@@ -88,6 +91,9 @@ class ResponseEncryptionState:
 
     buffer: bytearray = field(default_factory=bytearray)
     """Buffer for incomplete SSE events awaiting boundary detection (zero-copy)."""
+
+    body_buffer: bytearray = field(default_factory=bytearray)
+    """Buffer for standard response body to enforce consistent chunk sizes."""
 
     headers_sent: bool = False
     """Whether response headers have been sent."""
@@ -330,30 +336,38 @@ class HPKEMiddleware:
                 await _handle_end_of_stream(encryptor, sent_any=sent_any)
 
         async def _handle_standard_body(message: dict[str, Any]) -> None:
-            """Handle standard response body - encrypt chunks with RawFormat."""
+            """Handle standard response body - buffer and emit fixed-size chunks."""
             body: bytes = message.get("body", b"")
             more_body = message.get("more_body", False)
             encryptor = state.encryptor
             if encryptor is None:
                 raise CryptoError("Response encryption state corrupted: encryptor is None")
 
-            if body:
-                # Encrypt chunk with RawFormat -> binary output
-                encrypted_chunk = encryptor.encrypt(body)
+            # Buffer incoming body
+            state.body_buffer.extend(body)
+
+            # Emit full chunks (CHUNK_SIZE bytes each)
+            while len(state.body_buffer) >= CHUNK_SIZE:
+                chunk = bytes(state.body_buffer[:CHUNK_SIZE])
+                del state.body_buffer[:CHUNK_SIZE]
+                encrypted = encryptor.encrypt(chunk)
                 await send(
                     {
                         "type": "http.response.body",
-                        "body": encrypted_chunk,
+                        "body": encrypted,
                         "more_body": True,
                     }
                 )
 
+            # Final chunk (when no more body coming)
             if not more_body:
-                # Send final empty body to signal end
+                # Emit remaining buffer (may be smaller than CHUNK_SIZE)
+                encrypted = encryptor.encrypt(bytes(state.body_buffer))
+                state.body_buffer.clear()
                 await send(
                     {
                         "type": "http.response.body",
-                        "body": b"",
+                        "body": encrypted,
                         "more_body": False,
                     }
                 )
@@ -464,33 +478,26 @@ class HPKEMiddleware:
         enc_header: bytes,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         """
-        Create a receive wrapper that decrypts the request body.
+        Create a receive wrapper that decrypts chunked request body.
 
-        Returns a new receive callable that yields the decrypted body.
+        Uses streaming decryption - reads chunks from HTTP layer and decrypts
+        on-demand. Memory usage is O(chunk_size) regardless of body size.
+
+        Wire format: [length(4B BE)] [counter(4B BE)] [ciphertext(N + 16B tag)]
         """
-        # Decode encapsulated key from header
+        headers = dict(scope.get("headers", []))
+
+        # Get session salt from X-HPKE-Stream header (required for chunked format)
+        stream_header = headers.get(HEADER_HPKE_STREAM.lower().encode())
+        if not stream_header:
+            raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
+
+        # Decode encapsulated key and session salt
         try:
             enc = bytes(b64url_decode(enc_header.decode("ascii")))
+            session_salt = bytes(b64url_decode(stream_header.decode("ascii")))
         except Exception as e:
-            raise DecryptionError(f"Invalid {HEADER_HPKE_ENC} header encoding") from e
-
-        # Collect encrypted body (zero-copy with bytearray)
-        body_buffer = bytearray()
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                raise DecryptionError("Client disconnected before sending body")
-            body_buffer.extend(message.get("body", b""))
-            if not message.get("more_body", False):
-                break
-
-        encrypted_body = bytes(body_buffer)
-
-        # Parse envelope
-        try:
-            header, ciphertext = decode_envelope(encrypted_body)
-        except EnvelopeError as e:
-            raise DecryptionError(f"Invalid envelope: {e}") from e
+            raise DecryptionError(f"Invalid header encoding") from e
 
         # Get PSK from resolver
         try:
@@ -498,67 +505,130 @@ class HPKEMiddleware:
         except Exception as e:
             raise DecryptionError(f"PSK resolution failed: {e}") from e
 
-        # Get private key for the KEM
-        kem_id = KemId(header.kem_id)
+        # Get private key for the KEM (default X25519)
+        kem_id = KemId.DHKEM_X25519_HKDF_SHA256
         if kem_id not in self.private_keys:
             raise DecryptionError(f"Unsupported KEM: 0x{kem_id:04x}")
         sk_r = self.private_keys[kem_id]
 
-        # Decrypt
+        # Set up HPKE context
         ctx = setup_recipient_psk(
             enc=enc,
             sk_r=sk_r,
-            info=psk_id,  # Use psk_id as info for domain separation
+            info=psk_id,
             psk=psk,
             psk_id=psk_id,
         )
 
-        plaintext = ctx.open(aad=b"", ciphertext=ciphertext)
-        _logger.debug(
-            "Request decrypted: path=%s kem_id=0x%04x body_size=%d",
-            scope.get("path", ""),
-            kem_id,
-            len(plaintext),
-        )
+        # Derive request key from HPKE context
+        request_key = ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
+        session = StreamingSession(session_key=request_key, session_salt=session_salt)
+        decryptor = ChunkDecryptor(session, format=RawFormat())
 
-        # Decompress if X-HPKE-Encoding header indicates compression
-        headers = dict(scope.get("headers", []))
-        encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
-        if encoding_header == b"zstd":
-            try:
-                compressed_size = len(plaintext)
-                plaintext = zstd_decompress(plaintext)
-                _logger.debug(
-                    "Request decompressed: compressed=%d decompressed=%d ratio=%.1f%%",
-                    compressed_size,
-                    len(plaintext),
-                    compressed_size / len(plaintext) * 100 if plaintext else 0,
-                )
-            except ImportError as e:
-                raise DecryptionError(f"Zstd decompression unavailable: {e}") from e
-            except Exception as e:
-                raise DecryptionError(f"Zstd decompression failed: {e}") from e
-
-        # Store context in scope for SSE response encryption
+        # Store context in scope for response encryption
         scope[SCOPE_HPKE_CONTEXT] = ctx
 
-        # Create receive wrapper that returns decrypted body
-        # After body is sent, we need to wait for actual disconnect from client
-        # NOT return http.disconnect immediately (which aborts streaming responses)
-        body_sent = False
+        # Check for compression (body-level, not chunk-level)
+        encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
+        is_compressed = encoding_header == b"zstd"
 
-        async def decrypted_receive() -> dict[str, Any]:
-            nonlocal body_sent
-            if body_sent:
-                # After body is delivered, wait for actual client disconnect
-                # This is called by StreamingResponse to check for client abort
+        # State for streaming decryption
+        buffer = bytearray()
+        http_done = False
+
+        _logger.debug(
+            "Request decryption started: path=%s kem_id=0x%04x compress=%s",
+            scope.get("path", ""),
+            kem_id,
+            is_compressed,
+        )
+
+        # For compressed requests, we must buffer all chunks and decompress at end
+        # (client compresses full body before chunking)
+        if is_compressed:
+            decrypted_parts: list[bytes] = []
+
+            async def decrypted_receive_compressed() -> dict[str, Any]:
+                nonlocal http_done, decrypted_parts
+
+                # First call: read all chunks, decrypt, decompress, return all
+                if decrypted_parts is not None:
+                    # Read and decrypt all chunks
+                    parts: list[bytes] = []
+                    while True:
+                        # Try to extract complete chunk from buffer
+                        while len(buffer) >= 4:
+                            chunk_len = int.from_bytes(buffer[:4], "big")
+                            total_size = 4 + chunk_len
+                            if len(buffer) < total_size:
+                                break
+                            chunk_data = bytes(buffer[:total_size])
+                            del buffer[:total_size]
+                            parts.append(decryptor.decrypt(chunk_data))
+
+                        # Need more data?
+                        if http_done:
+                            break
+
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            raise DecryptionError("Client disconnected during request")
+                        buffer.extend(message.get("body", b""))
+                        if not message.get("more_body", False):
+                            http_done = True
+
+                    # Decompress full body
+                    compressed_body = b"".join(parts)
+                    try:
+                        plaintext = zstd_decompress(compressed_body)
+                        _logger.debug(
+                            "Request decompressed: compressed=%d decompressed=%d",
+                            len(compressed_body),
+                            len(plaintext),
+                        )
+                    except Exception as e:
+                        raise DecryptionError(f"Zstd decompression failed: {e}") from e
+
+                    decrypted_parts = []  # Mark as consumed
+                    return {"type": "http.request", "body": plaintext, "more_body": False}
+
+                # Subsequent calls: wait for disconnect
                 return await receive()
-            body_sent = True
-            return {
-                "type": "http.request",
-                "body": plaintext,
-                "more_body": False,
-            }
+
+            return decrypted_receive_compressed
+
+        # Non-compressed: stream chunks directly
+        async def decrypted_receive() -> dict[str, Any]:
+            nonlocal http_done
+
+            while True:
+                # Try to extract complete chunk from buffer
+                if len(buffer) >= 4:
+                    chunk_len = int.from_bytes(buffer[:4], "big")
+                    total_size = 4 + chunk_len
+
+                    if len(buffer) >= total_size:
+                        # Extract and decrypt chunk
+                        chunk_data = bytes(buffer[:total_size])
+                        del buffer[:total_size]
+                        plaintext = decryptor.decrypt(chunk_data)
+
+                        more_body = not (http_done and len(buffer) == 0)
+                        return {"type": "http.request", "body": plaintext, "more_body": more_body}
+
+                # Need more data from HTTP layer
+                if http_done:
+                    # No more HTTP data available
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                # Fetch more from underlying receive
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    raise DecryptionError("Client disconnected during chunked request")
+
+                buffer.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    http_done = True
 
         return decrypted_receive
 

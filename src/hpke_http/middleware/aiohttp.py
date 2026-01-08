@@ -35,11 +35,13 @@ from yarl import URL
 from hpke_http._logging import get_logger
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
+    CHUNK_SIZE,
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
+    REQUEST_KEY_LABEL,
     RESPONSE_KEY_LABEL,
     SSE_SESSION_KEY_LABEL,
     ZSTD_MIN_SIZE,
@@ -51,6 +53,7 @@ from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.hpke import SenderContext, setup_sender_psk
 from hpke_http.streaming import (
     ChunkDecryptor,
+    ChunkEncryptor,
     RawFormat,
     SSEFormat,
     StreamingSession,
@@ -108,7 +111,11 @@ class DecryptedResponse:
         self._decrypted: bytes | None = None
 
     async def _ensure_decrypted(self) -> bytes:
-        """Decrypt response body (lazy, cached)."""
+        """Decrypt response body using streaming (memory efficient).
+
+        Uses O(chunk_size) memory regardless of response size by streaming
+        HTTP chunks and decrypting on-the-fly.
+        """
         if self._decrypted is not None:
             return self._decrypted
 
@@ -126,35 +133,38 @@ class DecryptedResponse:
         # Use ChunkDecryptor with RawFormat for binary chunks
         decryptor = ChunkDecryptor(session, format=RawFormat())
         result = bytearray()
+        buffer = bytearray()
 
-        # Read entire response and decrypt chunks
-        # Wire format: sequence of [length(4B) || counter(4B) || ciphertext(N+17B)]
-        raw_body = await self._response.read()
-        offset = 0
+        # Stream HTTP chunks and decrypt on-the-fly
+        # Wire format: sequence of [length(4B) || counter(4B) || ciphertext(N+16B)]
+        async for raw_chunk in self._response.content.iter_any():
+            buffer.extend(raw_chunk)
 
-        # Length prefix size
-        length_prefix_size = 4
+            # Process complete encrypted chunks
+            while len(buffer) >= 4:
+                chunk_len = int.from_bytes(buffer[:4], "big")
+                total_size = 4 + chunk_len
 
-        while offset < len(raw_body):
-            # Read length prefix (4 bytes, big-endian)
-            if len(raw_body) - offset < length_prefix_size:
-                raise DecryptionError(f"Incomplete length prefix at offset {offset}")
+                if len(buffer) < total_size:
+                    break  # Need more data
 
-            chunk_len = int.from_bytes(raw_body[offset : offset + length_prefix_size], "big")
+                # Extract and decrypt chunk
+                chunk_data = bytes(buffer[:total_size])
+                del buffer[:total_size]
+                result.extend(decryptor.decrypt(chunk_data))
 
-            # Validate chunk length
-            if chunk_len <= 0:
-                raise DecryptionError(f"Invalid chunk length {chunk_len} at offset {offset}")
+        # Process any remaining complete chunks in buffer
+        while len(buffer) >= 4:
+            chunk_len = int.from_bytes(buffer[:4], "big")
+            total_size = 4 + chunk_len
+            if len(buffer) < total_size:
+                raise DecryptionError("Incomplete final chunk")
+            chunk_data = bytes(buffer[:total_size])
+            del buffer[:total_size]
+            result.extend(decryptor.decrypt(chunk_data))
 
-            total_chunk_size = length_prefix_size + chunk_len
-            if len(raw_body) - offset < total_chunk_size:
-                raise DecryptionError(f"Incomplete chunk at offset {offset}, expected {total_chunk_size} bytes")
-
-            # Extract full chunk (length || counter || ciphertext) and decrypt
-            chunk_data = raw_body[offset : offset + total_chunk_size]
-            plaintext = decryptor.decrypt(chunk_data)
-            result.extend(plaintext)
-            offset += total_chunk_size
+        if buffer:
+            raise DecryptionError(f"Trailing data after last chunk: {len(buffer)} bytes")
 
         self._decrypted = bytes(result)
         _logger.debug(
@@ -425,12 +435,15 @@ class HPKEClientSession:
     async def _encrypt_request(
         self,
         body: bytes,
-    ) -> tuple[bytes, str, SenderContext, bool]:
+    ) -> tuple[bytes, str, SenderContext, bool, bytes]:
         """
-        Encrypt request body with HPKE.
+        Encrypt request body using chunked format.
+
+        Uses length-prefixed chunks for streaming support:
+        [length(4B BE)] [counter(4B BE)] [ciphertext(N + 16B tag)]
 
         Returns:
-            Tuple of (encrypted_body, enc_header_value, sender_context, was_compressed)
+            Tuple of (encrypted_body, enc_header_value, sender_context, was_compressed, session_salt)
         """
         keys = await self._ensure_keys()
 
@@ -460,16 +473,27 @@ class HPKEClientSession:
             psk_id=self.psk_id,
         )
 
-        # Encrypt body
-        ciphertext = ctx.seal(aad=b"", plaintext=body)
+        # Derive request key from HPKE context
+        request_key = ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
+        session = StreamingSession.create(request_key)
+        encryptor = ChunkEncryptor(session, format=RawFormat(), compress=False)  # Already compressed
 
-        # Encode as envelope
-        envelope = encode_envelope(ciphertext)
+        # Chunk the body
+        chunks = []
+        for offset in range(0, len(body), CHUNK_SIZE):
+            chunk = body[offset : offset + CHUNK_SIZE]
+            chunks.append(encryptor.encrypt(chunk))
+
+        # Handle empty body
+        if not chunks:
+            chunks.append(encryptor.encrypt(b""))
+
+        encrypted_body = b"".join(chunks)
 
         # Encode enc for header
         enc_header = b64url_encode(ctx.enc)
 
-        return (envelope, enc_header, ctx, was_compressed)
+        return (encrypted_body, enc_header, ctx, was_compressed, session.session_salt)
 
     async def request(
         self,
@@ -512,8 +536,9 @@ class HPKEClientSession:
         headers = dict(kwargs.pop("headers", {}))
         sender_ctx: SenderContext | None = None
         if body:
-            encrypted_body, enc_header, ctx, was_compressed = await self._encrypt_request(body)
+            encrypted_body, enc_header, ctx, was_compressed, session_salt = await self._encrypt_request(body)
             headers[HEADER_HPKE_ENC] = enc_header
+            headers[HEADER_HPKE_STREAM] = b64url_encode(session_salt)  # Session salt for chunked decryption
             headers["Content-Type"] = "application/octet-stream"
             if was_compressed:
                 headers[HEADER_HPKE_ENCODING] = "zstd"

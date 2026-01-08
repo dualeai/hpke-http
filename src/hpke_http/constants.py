@@ -165,6 +165,12 @@ HEADER_HPKE_ENCODING: Final[str] = "X-HPKE-Encoding"
 RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"
 """Export label for deriving response encryption key from HPKE context."""
 
+REQUEST_KEY_LABEL: Final[bytes] = b"request-stream-key"
+"""Export label for deriving request encryption key from HPKE context."""
+
+CHUNK_SIZE: Final[int] = 64 * 1024  # 64KB
+"""Chunk size for streaming encryption (age/libsodium standard)."""
+
 # =============================================================================
 # ASGI Scope Keys
 # =============================================================================
