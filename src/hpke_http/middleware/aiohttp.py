@@ -132,7 +132,7 @@ class DecryptedResponse:
 
         # Use ChunkDecryptor with RawFormat for binary chunks
         decryptor = ChunkDecryptor(session, format=RawFormat())
-        result = bytearray()
+        chunks: list[bytes] = []  # Collect decrypted chunks for b"".join()
         buffer = bytearray()
 
         # Stream HTTP chunks and decrypt on-the-fly
@@ -151,7 +151,7 @@ class DecryptedResponse:
                 # Extract and decrypt chunk
                 chunk_data = bytes(buffer[:total_size])
                 del buffer[:total_size]
-                result.extend(decryptor.decrypt(chunk_data))
+                chunks.append(decryptor.decrypt(chunk_data))
 
         # Process any remaining complete chunks in buffer
         while len(buffer) >= 4:
@@ -161,12 +161,12 @@ class DecryptedResponse:
                 raise DecryptionError("Incomplete final chunk")
             chunk_data = bytes(buffer[:total_size])
             del buffer[:total_size]
-            result.extend(decryptor.decrypt(chunk_data))
+            chunks.append(decryptor.decrypt(chunk_data))
 
         if buffer:
             raise DecryptionError(f"Trailing data after last chunk: {len(buffer)} bytes")
 
-        self._decrypted = bytes(result)
+        self._decrypted = b"".join(chunks)  # Single allocation, avoids bytearray resize overhead
         _logger.debug(
             "Response decrypted: url=%s size=%d",
             self._response.url,
