@@ -25,9 +25,7 @@ from hpke_http.constants import AEAD_ID, KDF_ID, KEM_ID, MODE_PSK, VERSION
 from hpke_http.exceptions import (
     CryptoError,
     DecryptionError,
-    EnvelopeError,
     InvalidPSKError,
-    UnsupportedSuiteError,
 )
 
 __all__ = [
@@ -40,9 +38,7 @@ __all__ = [
     # Exceptions
     "CryptoError",
     "DecryptionError",
-    "EnvelopeError",
     "InvalidPSKError",
-    "UnsupportedSuiteError",
     # Versioning
     "__version__",
     "__version_full__",

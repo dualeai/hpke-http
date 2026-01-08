@@ -3,28 +3,21 @@
 Tests encrypted SSE output format compliance.
 """
 
+import base64
 import re
 
-from hpke_http.headers import b64url_decode
-from hpke_http.streaming import SSEEncryptor, StreamingSession
+from hpke_http.streaming import ChunkEncryptor, StreamingSession
+from tests.conftest import extract_sse_data_field
 
 
 class TestSSEOutputFormat:
-    """Test SSEEncryptor output format compliance."""
-
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found")
+    """Test ChunkEncryptor output format compliance."""
 
     def test_sse_format_basic(self) -> None:
         """Encrypted SSE should have correct format."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
@@ -39,7 +32,7 @@ class TestSSEOutputFormat:
         """SSE output should use LF (not CRLF)."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\n\n")
 
@@ -52,35 +45,40 @@ class TestSSEOutputFormat:
         """SSE event should end with \\n\\n."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\n\n")
 
         assert encrypted.endswith(b"\n\n")
 
-    def test_sse_data_is_base64url(self) -> None:
-        """Data field should be valid base64url."""
+    def test_sse_data_is_base64(self) -> None:
+        """Data field should be valid standard base64.
+
+        SSEFormat uses standard base64 (RFC 4648 §4) instead of base64url because:
+        - SSE data fields only forbid LF and CR per WHATWG spec
+        - Standard base64 is ~1.7x faster than base64url in Python stdlib
+        """
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
         # Extract data field
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
 
-        # Should be valid base64url (no exceptions)
-        decoded = b64url_decode(data)
+        # Should be valid base64 (no exceptions)
+        decoded = base64.b64decode(data)
         assert len(decoded) > 0
 
-        # Should only contain base64url characters
-        assert re.match(r"^[A-Za-z0-9_-]+$", data), f"Invalid base64url chars in: {data}"
+        # Should only contain standard base64 characters (A-Z, a-z, 0-9, +, /, =)
+        assert re.match(r"^[A-Za-z0-9+/=]+$", data), f"Invalid base64 chars in: {data}"
 
     def test_event_type_always_enc(self) -> None:
         """Event type in SSE should always be 'enc'."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         # Different content types
         for content in [
@@ -94,12 +92,12 @@ class TestSSEOutputFormat:
 
     def test_raw_passthrough_preserves_content(self) -> None:
         """Raw content should roundtrip exactly."""
-        from hpke_http.streaming import SSEDecryptor
+        from hpke_http.streaming import ChunkDecryptor
 
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         # Various SSE chunk types
         chunks = [
@@ -112,6 +110,6 @@ class TestSSEOutputFormat:
 
         for original in chunks:
             encrypted = encryptor.encrypt(original)
-            data = self._extract_data_field(encrypted)
+            data = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data)
             assert decrypted == original, f"Failed for: {original!r}"

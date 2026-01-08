@@ -52,6 +52,7 @@ dev = [
     "pytest-xdist[psutil]~=3.8",
     "pytest~=8.3",
     "ruff~=0.7",
+    "scipy~=1.14",               # Statistical tests for encryption verification
     "twine~=6.1",                # Package verification before PyPI upload
     "typing_extensions~=4.12",   # assert_type for API contract tests (Python 3.10)
     "vulture~=2.14",
@@ -109,9 +110,12 @@ addopts = [
 markers = [
     "vectors: RFC 9180 test vector validation (slow, 74MB JSON)",
     "fuzz: Property-based fuzz tests using Hypothesis",
+    "requires_root: Tests requiring root/sudo for tcpdump network capture",
 ]
 
 # Subprocess coverage for granian E2E tests (pytest-cov 7.x)
+# Note: "_exit" patch ensures coverage data is written when subprocesses exit
+# via os._exit(). Orphaned process cleanup is handled by process groups in conftest.py.
 [tool.coverage.run]
 patch = ["subprocess", "fork", "_exit"]
 parallel = true
@@ -123,7 +127,7 @@ sigterm = true
 typeCheckingMode = "strict"
 venv = ".venv"
 venvPath = "."
-exclude = [".venv", "vulture_whitelist.py"]
+exclude = [".venv", "vulture_whitelist.py", "tests/bench*.py", "tests/benchmark*.py"]
 
 [tool.ruff]
 line-length = 120
@@ -160,12 +164,14 @@ select = [
 ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use secrets)
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["PLR2004", "S101", "S603", "ASYNC109", "ASYNC220", "SIM117", "F841", "RUF059", "PLC0415"]  # Tests: magic values, assert, subprocess, async patterns, nested with, unused vars, local imports
+"tests/**/*.py" = ["PLR2004", "PLR0915", "S101", "S603", "S607", "SIM115", "ASYNC109", "ASYNC220", "ASYNC230", "SIM117", "F841", "RUF059", "PLC0415"]  # Tests: magic values, too many statements, assert, subprocess, async patterns, nested with, unused vars, local imports
 "tests/**/test_rfc9180*.py" = ["SLF001"]  # Vector tests need internal state access
 "tests/**/test_fuzz.py" = ["SLF001"]  # Fuzz tests need internal state access for overflow testing
 "tests/**/test_aiohttp_client.py" = ["SLF001"]  # Unit tests for private parsing methods
 "tests/**/test_streaming_errors.py" = ["SLF001"]  # Error tests need internal cipher access
-"src/**/streaming.py" = ["PLW0603", "PLC0415"]  # Optional zstd: module caching requires global, lazy import for optional deps
+"tests/**/bench*.py" = ["T201", "BLE001", "SIM102", "PERF401", "PERF402"]  # Benchmark scripts: print, broad except, nested if, list patterns
+"tests/**/benchmark*.py" = ["T201", "F401", "RET505"]  # Benchmark scripts: print, unused imports, elif after return
+"src/**/streaming.py" = ["PLW0603", "PLC0415", "RUF002"]  # Optional zstd: module caching requires global, lazy import for optional deps, unicode multiplication sign
 
 [tool.vulture]
 exclude = [".venv/"]  # Exclude deps

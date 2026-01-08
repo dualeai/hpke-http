@@ -41,5 +41,11 @@ jobs:
       - name: Download test vectors
         run: make download-vectors
 
+      - name: Run static checks
+        run: make test-static
+
       - name: Run tests
-        run: make test
+        run: make test-func-ci
+
+      - name: Run root-required tests (tcpdump network capture)
+        run: sudo env "PATH=$PATH" make test-func-root

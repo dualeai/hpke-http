@@ -140,16 +140,6 @@ def build_suite_id(kem_id: int = KEM_ID, kdf_id: int = KDF_ID, aead_id: int = AE
 SUITE_ID: Final[bytes] = build_suite_id()
 
 # =============================================================================
-# Wire Format Constants
-# =============================================================================
-
-# Envelope header size: version(1) + kem_id(2) + kdf_id(2) + aead_id(2) + mode(1) = 8 bytes
-ENVELOPE_HEADER_SIZE: Final[int] = 8
-
-# Current envelope version
-ENVELOPE_VERSION: Final[int] = 0x01
-
-# =============================================================================
 # HTTP Header Names
 # =============================================================================
 
@@ -161,6 +151,15 @@ HEADER_HPKE_STREAM: Final[str] = "X-HPKE-Stream"
 
 HEADER_HPKE_ENCODING: Final[str] = "X-HPKE-Encoding"
 """Header specifying compression algorithm for request body (RFC 8878)."""
+
+RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"
+"""Export label for deriving response encryption key from HPKE context."""
+
+REQUEST_KEY_LABEL: Final[bytes] = b"request-stream-key"
+"""Export label for deriving request encryption key from HPKE context."""
+
+CHUNK_SIZE: Final[int] = 64 * 1024  # 64KB
+"""Chunk size for streaming encryption (age/libsodium standard)."""
 
 # =============================================================================
 # ASGI Scope Keys
@@ -178,6 +177,12 @@ SSE_SESSION_SALT_SIZE: Final[int] = 4
 
 SSE_COUNTER_SIZE: Final[int] = 4
 """Counter size in wire format (4 bytes, big-endian)."""
+
+RAW_LENGTH_PREFIX_SIZE: Final[int] = 4
+"""Length prefix size in RawFormat wire encoding (4 bytes, big-endian).
+
+Used for O(1) chunk boundary detection when parsing concatenated chunks.
+"""
 
 SSE_MAX_COUNTER: Final[int] = 2**32 - 1
 """Maximum counter value (4 billion events per session)."""
@@ -230,3 +235,32 @@ ZSTD_COMPRESSION_LEVEL: Final[int] = 3
 
 ZSTD_MIN_SIZE: Final[int] = 64
 """Minimum payload size for compression. Smaller payloads skip compression."""
+
+ZSTD_STREAMING_THRESHOLD: Final[int] = 1024 * 1024  # 1MB
+"""Threshold for using streaming compression vs in-memory.
+
+Payloads >= this size use streaming compression with constant memory (~4MB).
+Smaller payloads use in-memory compression for better performance.
+"""
+
+ZSTD_STREAMING_CHUNK_SIZE: Final[int] = 4 * 1024 * 1024  # 4MB
+"""Chunk size for streaming compression write operations.
+
+Determines how much data is written to ZstdFile at once.
+Affects peak memory usage during compression.
+"""
+
+ZSTD_DECOMPRESS_STREAMING_THRESHOLD: Final[int] = 1024  # 1KB
+"""Threshold for using streaming decompression in request handling.
+
+For compressed request bodies, use streaming decompression when compressed
+size >= this threshold. This is a RAM/CPU tradeoff:
+
+- RAM: Streaming uses ~1.3x decompressed size vs ~2x for list+join.
+       For 50MB: saves ~35MB per request.
+- CPU: Streaming adds ~40% overhead (10ms -> 15ms for 50MB).
+
+Set low (1KB) because compressed JSON often expands 100-1000x, so even
+tiny compressed payloads can decompress to large sizes where RAM savings
+outweigh CPU cost.
+"""

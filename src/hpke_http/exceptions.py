@@ -27,29 +27,6 @@ class InvalidPSKError(CryptoError):
     """
 
 
-class UnsupportedSuiteError(CryptoError):
-    """Cipher suite not supported.
-
-    The envelope uses a KEM/KDF/AEAD combination this implementation doesn't support.
-    """
-
-    def __init__(self, kem_id: int, kdf_id: int, aead_id: int) -> None:
-        self.kem_id = kem_id
-        self.kdf_id = kdf_id
-        self.aead_id = aead_id
-        super().__init__(f"Unsupported suite: kem=0x{kem_id:04x}, kdf=0x{kdf_id:04x}, aead=0x{aead_id:04x}")
-
-
-class EnvelopeError(CryptoError):
-    """Invalid envelope format.
-
-    The encrypted envelope is malformed:
-    - Too short
-    - Invalid version
-    - Corrupted header
-    """
-
-
 class KeyDiscoveryError(CryptoError):
     """Failed to fetch or parse HPKE keys from discovery endpoint."""
 

@@ -5,11 +5,12 @@ import pytest
 from hpke_http.exceptions import ReplayAttackError
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
 from hpke_http.streaming import (
-    SSEDecryptor,
-    SSEEncryptor,
+    ChunkDecryptor,
+    ChunkEncryptor,
     StreamingSession,
     create_session_from_context,
 )
+from tests.conftest import extract_sse_data_field
 
 
 class TestStreamingSession:
@@ -38,21 +39,13 @@ class TestStreamingSession:
 class TestSSEEncryption:
     """Test SSE chunk encryption/decryption."""
 
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output (bytes)."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found in SSE event")
-
     def test_encrypt_decrypt_chunk(self) -> None:
         """Test basic chunk encryption/decryption."""
         key = b"0" * 32
         session = StreamingSession.create(key)
 
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         # Raw SSE chunk (bytes)
         original = b'event: progress\ndata: {"step": 1}\n\n'
@@ -61,7 +54,7 @@ class TestSSEEncryption:
         encrypted = encryptor.encrypt(original)
 
         # Extract data field and decrypt
-        data_field = self._extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == original
@@ -71,8 +64,8 @@ class TestSSEEncryption:
         key = b"0" * 32
         session = StreamingSession.create(key)
 
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         chunks = [
             b"event: start\ndata: {}\n\n",
@@ -83,7 +76,7 @@ class TestSSEEncryption:
 
         for original in chunks:
             encrypted = encryptor.encrypt(original)
-            data_field = self._extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data_field)
             assert decrypted == original
 
@@ -92,16 +85,16 @@ class TestSSEEncryption:
         key = b"0" * 32
         session = StreamingSession.create(key)
 
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         # Encrypt two chunks
         enc1 = encryptor.encrypt(b"event: first\n\n")
         enc2 = encryptor.encrypt(b"event: second\n\n")
 
         # Extract data fields
-        data1 = self._extract_data_field(enc1)
-        _ = self._extract_data_field(enc2)
+        data1 = extract_sse_data_field(enc1)
+        _ = extract_sse_data_field(enc2)
 
         # Decrypt first - works
         decryptor.decrypt(data1)
@@ -117,7 +110,7 @@ class TestSSEEncryption:
         """Test that encrypted output is WHATWG compliant SSE."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"event: test\ndata: {}\n\n")
 
@@ -130,14 +123,6 @@ class TestSSEEncryption:
 class TestCounterBoundaries:
     """Test counter boundary conditions."""
 
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found")
-
     def test_counter_starts_at_1(self) -> None:
         """First chunk should have counter=1."""
         from hpke_http.constants import SSE_COUNTER_SIZE
@@ -145,10 +130,10 @@ class TestCounterBoundaries:
 
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         encrypted = encryptor.encrypt(b"test")
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
         payload = b64url_decode(data)
 
         counter = int.from_bytes(payload[:SSE_COUNTER_SIZE], "big")
@@ -161,11 +146,11 @@ class TestCounterBoundaries:
 
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         for expected_counter in range(1, 6):
             encrypted = encryptor.encrypt(f"chunk {expected_counter}".encode())
-            data = self._extract_data_field(encrypted)
+            data = extract_sse_data_field(encrypted)
             payload = b64url_decode(data)
             counter = int.from_bytes(payload[:SSE_COUNTER_SIZE], "big")
             assert counter == expected_counter
@@ -177,7 +162,7 @@ class TestCounterBoundaries:
 
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
+        encryptor = ChunkEncryptor(session)
 
         # Set counter to max
         encryptor.counter = SSE_MAX_COUNTER
@@ -210,27 +195,19 @@ class TestSessionSaltRandomness:
 class TestPayloadVariations:
     """Test various payload types and sizes."""
 
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found")
-
     def test_large_chunk(self) -> None:
         """Large SSE chunk (~100KB) should encrypt/decrypt correctly."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         # Create ~100KB chunk
         large_data = "x" * 100000
         original = f"event: large\ndata: {large_data}\n\n".encode()
 
         encrypted = encryptor.encrypt(original)
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data)
 
         assert decrypted == original
@@ -239,13 +216,13 @@ class TestPayloadVariations:
         """Unicode (Chinese, emoji, RTL) should work."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         original = "event: unicode\ndata: 你好世界 🔐 مرحبا\n\n".encode()
 
         encrypted = encryptor.encrypt(original)
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data)
 
         assert decrypted == original
@@ -254,13 +231,13 @@ class TestPayloadVariations:
         """Empty bytes should work."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         original = b""
 
         encrypted = encryptor.encrypt(original)
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data)
 
         assert decrypted == original
@@ -269,13 +246,13 @@ class TestPayloadVariations:
         """SSE comment chunks should work."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         original = b":keepalive\n\n"
 
         encrypted = encryptor.encrypt(original)
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data)
 
         assert decrypted == original
@@ -284,13 +261,13 @@ class TestPayloadVariations:
         """SSE retry directive should work."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         original = b"retry: 5000\n\n"
 
         encrypted = encryptor.encrypt(original)
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data)
 
         assert decrypted == original
@@ -299,15 +276,15 @@ class TestPayloadVariations:
         """Newlines, tabs, quotes should be handled."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         # Note: The chunk itself has controlled line endings,
         # but the data can contain escaped special chars
         original = b'event: special\ndata: {"msg": "line1\\nline2\\ttab"}\n\n'
 
         encrypted = encryptor.encrypt(original)
-        data = self._extract_data_field(encrypted)
+        data = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data)
 
         assert decrypted == original
@@ -316,25 +293,17 @@ class TestPayloadVariations:
 class TestEventVolume:
     """Test high volume of events."""
 
-    @staticmethod
-    def _extract_data_field(sse: bytes) -> str:
-        """Extract data field from encrypted SSE output."""
-        for line in sse.decode("ascii").split("\n"):
-            if line.startswith("data: "):
-                return line[6:]
-        raise ValueError("No data field found")
-
     def test_many_chunks_100(self) -> None:
         """100 sequential chunks should work."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         for i in range(100):
             original = f"event: item\ndata: {i}\n\n".encode()
             encrypted = encryptor.encrypt(original)
-            data = self._extract_data_field(encrypted)
+            data = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data)
             assert decrypted == original
 
@@ -342,13 +311,13 @@ class TestEventVolume:
         """1000 chunks should work with correct counters."""
         key = b"0" * 32
         session = StreamingSession.create(key)
-        encryptor = SSEEncryptor(session)
-        decryptor = SSEDecryptor(session)
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
 
         for i in range(1000):
             original = f"event: bulk\ndata: {i}\n\n".encode()
             encrypted = encryptor.encrypt(original)
-            data = self._extract_data_field(encrypted)
+            data = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data)
             assert decrypted == original
 

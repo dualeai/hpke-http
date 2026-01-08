@@ -19,11 +19,11 @@ from hpke_http.constants import (
 )
 from hpke_http.exceptions import DecryptionError
 from hpke_http.streaming import (
-    SSEDecryptor,
-    SSEEncryptor,
-    StreamingSession,
+    ChunkDecryptor,
+    ChunkEncryptor,
     import_zstd,
 )
+from tests.conftest import extract_sse_data_field, make_sse_session
 
 
 def _zstd_available() -> bool:
@@ -42,80 +42,67 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_session() -> StreamingSession:
-    """Create a test streaming session."""
-    return StreamingSession(session_key=b"k" * 32, session_salt=b"salt")
-
-
-def _extract_data_field(sse: bytes) -> str:
-    """Extract data field from encrypted SSE output."""
-    for line in sse.decode("ascii").split("\n"):
-        if line.startswith("data: "):
-            return line[6:]
-    raise ValueError("No data field found")
-
-
 class TestSSECompression:
     """Zstd compression for SSE streaming."""
 
     def test_compress_sse_roundtrip(self) -> None:
         """Compressed SSE encrypt/decrypt roundtrip works."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         # Large JSON chunk (compressible)
         chunk = json.dumps({"data": "x" * 1000, "id": 123}).encode()
 
         encrypted = encryptor.encrypt(chunk)
-        data_field = _extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
 
     def test_encoding_id_zstd_in_payload(self) -> None:
         """Encoding ID ZSTD is correctly set for large chunks."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
 
         # Large chunk - should be compressed
         chunk = b"x" * 100
 
         encrypted = encryptor.encrypt(chunk)
         # Verify it decrypts correctly (encoding ID is parsed internally)
-        decryptor = SSEDecryptor(session)
-        data_field = _extract_data_field(encrypted)
+        decryptor = ChunkDecryptor(session)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
 
     def test_encoding_id_identity_for_small_chunks(self) -> None:
         """Small chunks use IDENTITY encoding (no compression)."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         # Small chunk - should NOT be compressed
         chunk = b"small"
         assert len(chunk) < ZSTD_MIN_SIZE
 
         encrypted = encryptor.encrypt(chunk)
-        data_field = _extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
 
     def test_compression_disabled_uses_identity(self) -> None:
         """compress=False always uses IDENTITY encoding."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=False)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=False)
+        decryptor = ChunkDecryptor(session)
 
         # Large chunk - but compression disabled
         chunk = b"x" * 1000
 
         encrypted = encryptor.encrypt(chunk)
-        data_field = _extract_data_field(encrypted)
+        data_field = extract_sse_data_field(encrypted)
         decrypted = decryptor.decrypt(data_field)
 
         assert decrypted == chunk
@@ -134,8 +121,10 @@ class TestSSECompression:
 
     def test_unknown_encoding_raises_error(self) -> None:
         """Unknown encoding ID raises DecryptionError."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=False)
+        import base64
+
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=False)
 
         # Encrypt with IDENTITY encoding (not used - we manually craft invalid payload below)
         _ = encryptor.encrypt(b"test data here")
@@ -144,10 +133,8 @@ class TestSSECompression:
         # This is a bit tricky - we need to create a payload with invalid encoding
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-        from hpke_http.headers import b64url_encode
-
         # Create a new session for tampering
-        tamper_session = _make_session()
+        tamper_session = make_sse_session()
         cipher = ChaCha20Poly1305(tamper_session.session_key)
         nonce = tamper_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -155,17 +142,18 @@ class TestSSECompression:
         invalid_data = bytes([0xFF]) + b"some data"
         ciphertext = cipher.encrypt(nonce, invalid_data, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url) for ~1.7x faster encoding
+        encoded = base64.b64encode(payload).decode("ascii")
 
-        decryptor = SSEDecryptor(tamper_session)
+        decryptor = ChunkDecryptor(tamper_session)
         with pytest.raises(DecryptionError, match="Unknown encoding"):
             decryptor.decrypt(encoded)
 
     def test_multiple_chunks_compressed(self) -> None:
         """Multiple chunks compress/decompress correctly in sequence."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         chunks = [json.dumps({"event": "start", "data": "x" * 100}).encode()]
         chunks.extend(json.dumps({"event": "progress", "step": i, "data": "y" * 100}).encode() for i in range(5))
@@ -173,7 +161,7 @@ class TestSSECompression:
 
         for chunk in chunks:
             encrypted = encryptor.encrypt(chunk)
-            data_field = _extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data_field)
             assert decrypted == chunk
 
@@ -237,29 +225,29 @@ class TestCompressionMemory:
 
     def test_streaming_no_memory_leak(self) -> None:
         """1000 compress/decompress cycles don't leak memory."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
         chunk = json.dumps({"data": "x" * 200}).encode()
 
         # Warmup
         for _ in range(100):
             encrypted = encryptor.encrypt(chunk)
-            data_field = _extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decryptor.decrypt(data_field)
         gc.collect()
 
         # Reset for fresh measurement
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         tracemalloc.start()
         snapshot1 = tracemalloc.take_snapshot()
 
         for _ in range(1000):
             encrypted = encryptor.encrypt(chunk)
-            data_field = _extract_data_field(encrypted)
+            data_field = extract_sse_data_field(encrypted)
             decrypted = decryptor.decrypt(data_field)
             assert decrypted == chunk
 
@@ -301,8 +289,8 @@ class TestCompressionMemory:
 
     def test_instance_reuse_memory_stable(self) -> None:
         """Reusing compressor/decompressor keeps memory stable."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
         chunk = json.dumps({"data": "x" * 200}).encode()
 
         # Warmup - creates compressor
@@ -333,12 +321,13 @@ class TestCompressionErrors:
 
     def test_corrupted_zstd_data_raises_error(self) -> None:
         """Corrupted zstd data raises DecryptionError."""
+        import base64
+
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         from hpke_http.constants import SSEEncodingId
-        from hpke_http.headers import b64url_encode
 
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -346,21 +335,23 @@ class TestCompressionErrors:
         invalid_zstd = bytes([SSEEncodingId.ZSTD]) + b"not valid zstd"
         ciphertext = cipher.encrypt(nonce, invalid_zstd, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
-        decryptor = SSEDecryptor(session)
+        decryptor = ChunkDecryptor(session)
         with pytest.raises(DecryptionError, match="decompression failed"):
             decryptor.decrypt(encoded)
 
     def test_truncated_zstd_data_returns_empty(self) -> None:
         """Truncated zstd data returns empty bytes (library behavior)."""
+        import base64
+
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         from hpke_http.constants import SSEEncodingId
-        from hpke_http.headers import b64url_encode
 
         zstd = import_zstd()
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -371,21 +362,23 @@ class TestCompressionErrors:
         truncated_payload = bytes([SSEEncodingId.ZSTD]) + truncated
         ciphertext = cipher.encrypt(nonce, truncated_payload, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
-        decryptor = SSEDecryptor(session)
+        decryptor = ChunkDecryptor(session)
         # backports.zstd returns empty bytes for truncated data
         result = decryptor.decrypt(encoded)
         assert result == b""
 
     def test_empty_zstd_payload_returns_empty(self) -> None:
         """ZSTD encoding with empty data returns empty bytes (library behavior)."""
+        import base64
+
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         from hpke_http.constants import SSEEncodingId
-        from hpke_http.headers import b64url_encode
 
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
@@ -393,50 +386,53 @@ class TestCompressionErrors:
         empty_zstd = bytes([SSEEncodingId.ZSTD])
         ciphertext = cipher.encrypt(nonce, empty_zstd, associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
-        decryptor = SSEDecryptor(session)
+        decryptor = ChunkDecryptor(session)
         # backports.zstd returns empty bytes for empty input
         result = decryptor.decrypt(encoded)
         assert result == b""
 
     def test_missing_encoding_id_raises_error(self) -> None:
         """Empty decrypted payload (no encoding ID) raises DecryptionError."""
+        import base64
+
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-        from hpke_http.headers import b64url_encode
-
-        session = _make_session()
+        session = make_sse_session()
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
         # Completely empty payload
         ciphertext = cipher.encrypt(nonce, b"", associated_data=None)
         payload = (1).to_bytes(4, "big") + ciphertext
-        encoded = b64url_encode(payload)
+        # SSEFormat uses standard base64 (not base64url)
+        encoded = base64.b64encode(payload).decode("ascii")
 
-        decryptor = SSEDecryptor(session)
+        decryptor = ChunkDecryptor(session)
         with pytest.raises(DecryptionError, match="too short"):
             decryptor.decrypt(encoded)
 
     def test_reserved_encoding_ids_raise_error(self) -> None:
         """Reserved encoding IDs (0x02-0xFF except valid) raise DecryptionError."""
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        import base64
 
-        from hpke_http.headers import b64url_encode
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         for encoding_id in [0x02, 0x03, 0x10, 0x80, 0xFE, 0xFF]:
             # Fresh session for each test (counter resets)
-            test_session = _make_session()
+            test_session = make_sse_session()
             test_cipher = ChaCha20Poly1305(test_session.session_key)
             nonce = test_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
             invalid_data = bytes([encoding_id]) + b"data"
             ciphertext = test_cipher.encrypt(nonce, invalid_data, associated_data=None)
             payload = (1).to_bytes(4, "big") + ciphertext
-            encoded = b64url_encode(payload)
+            # SSEFormat uses standard base64 (not base64url)
+            encoded = base64.b64encode(payload).decode("ascii")
 
-            decryptor = SSEDecryptor(test_session)
+            decryptor = ChunkDecryptor(test_session)
             with pytest.raises(DecryptionError, match="Unknown encoding"):
                 decryptor.decrypt(encoded)
 
@@ -446,31 +442,31 @@ class TestCompressionBoundaries:
 
     def test_exactly_min_size_compressed(self) -> None:
         """Chunk exactly at ZSTD_MIN_SIZE gets compressed."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         chunk = b"x" * ZSTD_MIN_SIZE
         encrypted = encryptor.encrypt(chunk)
-        decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+        decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
         assert decrypted == chunk
 
     def test_below_min_size_not_compressed(self) -> None:
         """Chunk below ZSTD_MIN_SIZE uses IDENTITY."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         chunk = b"x" * (ZSTD_MIN_SIZE - 1)
         encrypted = encryptor.encrypt(chunk)
-        decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+        decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
         assert decrypted == chunk
 
     def test_mixed_sizes_in_stream(self) -> None:
         """Stream with mixed sizes handles compression correctly."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         chunks = [
             b"tiny",  # < min, IDENTITY
@@ -481,18 +477,18 @@ class TestCompressionBoundaries:
 
         for chunk in chunks:
             encrypted = encryptor.encrypt(chunk)
-            decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+            decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
             assert decrypted == chunk
 
     def test_incompressible_data_works(self) -> None:
         """Random (incompressible) data still works."""
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
-        decryptor = SSEDecryptor(session)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
+        decryptor = ChunkDecryptor(session)
 
         chunk = secrets.token_bytes(200)
         encrypted = encryptor.encrypt(chunk)
-        decrypted = decryptor.decrypt(_extract_data_field(encrypted))
+        decrypted = decryptor.decrypt(extract_sse_data_field(encrypted))
         assert decrypted == chunk
 
 
@@ -500,11 +496,11 @@ class TestCompressionThreadSafety:
     """Thread safety for compression."""
 
     def test_encryptor_concurrent_access(self) -> None:
-        """SSEEncryptor handles concurrent encryption safely."""
+        """ChunkEncryptor handles concurrent encryption safely."""
         import threading
 
-        session = _make_session()
-        encryptor = SSEEncryptor(session, compress=True)
+        session = make_sse_session()
+        encryptor = ChunkEncryptor(session, compress=True)
         results: list[bytes] = []
         lock = threading.Lock()
 
@@ -539,8 +535,8 @@ class TestCompressionRatiosRealisticData:
 
     def _sse_wire_size(self, chunks: list[bytes], *, compress: bool) -> int:
         """Total encrypted SSE wire size."""
-        session = _make_session()
-        enc = SSEEncryptor(session, compress=compress)
+        session = make_sse_session()
+        enc = ChunkEncryptor(session, compress=compress)
         return sum(len(enc.encrypt(c)) for c in chunks)
 
     # --- JSON Patterns ---
@@ -762,11 +758,242 @@ async def fetch(url, timeout=30):
             secrets.token_bytes(100),  # Raw binary
         ]
 
-        session = _make_session()
-        enc = SSEEncryptor(session, compress=True)
-        dec = SSEDecryptor(session)
+        session = make_sse_session()
+        enc = ChunkEncryptor(session, compress=True)
+        dec = ChunkDecryptor(session)
 
         for p in patterns:
             encrypted = enc.encrypt(p)
-            decrypted = dec.decrypt(_extract_data_field(encrypted))
+            decrypted = dec.decrypt(extract_sse_data_field(encrypted))
             assert decrypted == p
+
+
+class TestUnifiedCompression:
+    """Unified compression functions with auto-selection."""
+
+    def test_compress_decompress_roundtrip(self) -> None:
+        """Unified compress/decompress returns original data."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        original = b"Hello, unified compression!" * 1000
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+    def test_empty_input_compress(self) -> None:
+        """Empty input returns empty bytes (compress)."""
+        from hpke_http.streaming import zstd_compress
+
+        result = zstd_compress(b"")
+        assert result == b""
+
+    def test_empty_input_decompress(self) -> None:
+        """Empty input returns empty bytes (decompress)."""
+        from hpke_http.streaming import zstd_decompress
+
+        result = zstd_decompress(b"")
+        assert result == b""
+
+    def test_compression_level_parameter(self) -> None:
+        """Compression level affects output size."""
+        from hpke_http.streaming import zstd_compress
+
+        data = b"x" * 100000
+        compressed_level1 = zstd_compress(data, level=1)
+        compressed_level22 = zstd_compress(data, level=22)
+
+        # Higher level should produce smaller output (for compressible data)
+        assert len(compressed_level22) <= len(compressed_level1)
+
+    def test_small_payload_uses_inmemory(self) -> None:
+        """Small payloads (< threshold) use in-memory compression."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        # Small payload - below default 1MB threshold
+        original = b"small payload " * 100
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+    def test_large_payload_uses_streaming(self) -> None:
+        """Large payloads (>= threshold) use streaming compression."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        # Large payload - above default 1MB threshold
+        original = b"x" * (2 * 1024 * 1024)  # 2MB
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+    def test_custom_threshold(self) -> None:
+        """Custom streaming_threshold parameter works."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        original = b"data " * 1000  # ~5KB
+        # Set threshold to 1KB to force streaming
+        compressed = zstd_compress(original, streaming_threshold=1024)
+        decompressed = zstd_decompress(compressed, streaming_threshold=1024)
+
+        assert decompressed == original
+
+    def test_interop_with_raw_zstd(self) -> None:
+        """Unified functions interop with raw zstd module."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        zstd = import_zstd()
+        original = b"test data " * 1000
+
+        # Unified compress -> raw decompress
+        compressed = zstd_compress(original)
+        decompressed = zstd.decompress(compressed)
+        assert decompressed == original
+
+        # Raw compress -> unified decompress
+        compressed = zstd.compress(original, level=ZSTD_COMPRESSION_LEVEL)
+        decompressed = zstd_decompress(compressed)
+        assert decompressed == original
+
+    def test_incompressible_data(self) -> None:
+        """Random (incompressible) data still works."""
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        original = secrets.token_bytes(100000)
+        compressed = zstd_compress(original)
+        decompressed = zstd_decompress(compressed)
+
+        assert decompressed == original
+
+
+class TestUnifiedCompressionMemory:
+    """Memory usage tests for unified compression.
+
+    Validates that streaming compression/decompression uses bounded memory
+    overhead (~4MB) regardless of payload size. Tests multiple payload sizes
+    to ensure consistent behavior.
+    """
+
+    # Maximum allowed overhead for streaming operations (4MB)
+    MAX_OVERHEAD_BYTES = 4 * 1024 * 1024
+
+    @pytest.mark.parametrize(
+        "payload_size_mb",
+        [5, 10, 50],
+        ids=["5MB", "10MB", "50MB"],
+    )
+    def test_compress_memory_overhead_bounded(self, payload_size_mb: int) -> None:
+        """Compression overhead stays under 4MB regardless of payload size."""
+        from hpke_http.streaming import zstd_compress
+
+        payload_size = payload_size_mb * 1024 * 1024
+        payload = b"x" * payload_size
+
+        # Warmup - first call may allocate internal buffers
+        _ = zstd_compress(payload[:1024])
+
+        gc.collect()
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        compressed = zstd_compress(payload)
+
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        peak_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Overhead = peak - input - output (compressed is much smaller for repetitive data)
+        overhead = peak_allocated - payload_size - len(compressed)
+
+        assert overhead < self.MAX_OVERHEAD_BYTES, (
+            f"Compression overhead {overhead / 1024 / 1024:.1f}MB exceeds 4MB limit "
+            f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
+        )
+
+    @pytest.mark.parametrize(
+        "payload_size_mb",
+        [5, 10, 50],
+        ids=["5MB", "10MB", "50MB"],
+    )
+    def test_decompress_memory_overhead_bounded(self, payload_size_mb: int) -> None:
+        """Decompression overhead stays under 4MB regardless of payload size.
+
+        Note: Uses low streaming_threshold to force streaming mode, since
+        repetitive test data compresses extremely well (<2KB for 50MB).
+        """
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        payload_size = payload_size_mb * 1024 * 1024
+        original = b"y" * payload_size
+        compressed = zstd_compress(original)
+
+        # Warmup - first call may allocate internal buffers
+        _ = zstd_decompress(zstd_compress(b"warmup" * 100), streaming_threshold=1)
+
+        gc.collect()
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        # Force streaming mode with low threshold (compressed data is tiny)
+        decompressed = zstd_decompress(compressed, streaming_threshold=1)
+
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        peak_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Overhead = peak - input (compressed) - output (decompressed)
+        overhead = peak_allocated - len(compressed) - len(decompressed)
+
+        assert overhead < self.MAX_OVERHEAD_BYTES, (
+            f"Decompression overhead {overhead / 1024 / 1024:.1f}MB exceeds 4MB limit "
+            f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
+        )
+
+    @pytest.mark.parametrize(
+        "payload_size_mb",
+        [5, 10, 50],
+        ids=["5MB", "10MB", "50MB"],
+    )
+    def test_roundtrip_memory_overhead_bounded(self, payload_size_mb: int) -> None:
+        """Full compress+decompress roundtrip overhead stays under 4MB.
+
+        Note: Uses low streaming_threshold for decompression to force streaming
+        mode, since repetitive test data compresses extremely well.
+        """
+        from hpke_http.streaming import zstd_compress, zstd_decompress
+
+        payload_size = payload_size_mb * 1024 * 1024
+        original = b"z" * payload_size
+
+        # Warmup
+        _ = zstd_decompress(zstd_compress(b"warmup" * 100), streaming_threshold=1)
+
+        gc.collect()
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        compressed = zstd_compress(original)
+        # Force streaming decompression with low threshold
+        decompressed = zstd_decompress(compressed, streaming_threshold=1)
+
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        assert decompressed == original
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        peak_allocated = sum(stat.size_diff for stat in diff if stat.size_diff > 0)
+
+        # Overhead = peak - input - compressed - output
+        # Note: input and output are same size, compressed is small
+        overhead = peak_allocated - payload_size - len(compressed) - payload_size
+
+        assert overhead < self.MAX_OVERHEAD_BYTES, (
+            f"Roundtrip overhead {overhead / 1024 / 1024:.1f}MB exceeds 4MB limit "
+            f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
+        )
