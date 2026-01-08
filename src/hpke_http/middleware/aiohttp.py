@@ -266,6 +266,19 @@ class DecryptedResponse:
         return getattr(self._response, name)
 
 
+def _extract_sse_data(event_lines: list[bytes]) -> str | None:
+    """Extract data field value from SSE event lines.
+
+    Per WHATWG spec, the data field is prefixed with "data: ".
+    Returns stripped value if non-empty, None otherwise.
+    """
+    for line in event_lines:
+        if line.startswith(b"data: "):
+            value = line[6:].decode("ascii").strip()
+            return value if value else None
+    return None
+
+
 class HPKEClientSession:
     """
     aiohttp-compatible client session with transparent HPKE encryption.
@@ -647,16 +660,11 @@ class HPKEClientSession:
 
                 if not line:
                     # Empty line = event boundary (WHATWG spec)
-                    if current_event_lines:
-                        # Extract data field from accumulated event lines
-                        for event_line in current_event_lines:
-                            if event_line.startswith(b"data: "):
-                                data_value = event_line[6:].decode("ascii")
-                                if data_value.strip():
-                                    raw_chunk = decryptor.decrypt(data_value.strip())
-                                    yield raw_chunk
-                                break
-                        current_event_lines = []
+                    data_value = _extract_sse_data(current_event_lines)
+                    if data_value:
+                        raw_chunk = decryptor.decrypt(data_value)
+                        yield raw_chunk
+                    current_event_lines = []
                 else:
                     current_event_lines.append(line)
 
