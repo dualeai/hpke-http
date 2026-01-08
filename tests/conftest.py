@@ -1,9 +1,11 @@
 """Shared test fixtures for hpke_http tests."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -291,6 +293,8 @@ async def _start_granian_server(
     if compress:
         env["TEST_COMPRESS"] = "true"
 
+    # Use start_new_session=True to create a new process group.
+    # This allows us to kill granian and all its child workers together.
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -311,17 +315,24 @@ async def _start_granian_server(
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+
+    def _kill_process_group(sig: int) -> None:
+        """Kill the entire process group (granian + workers)."""
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(proc.pid), sig)
 
     try:
         await wait_for_server(host, port)
         yield (host, port, pk)
     finally:
-        proc.terminate()
+        # Kill entire process group to avoid orphaned workers
+        _kill_process_group(signal.SIGTERM)
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _kill_process_group(signal.SIGKILL)
             proc.wait()
 
 

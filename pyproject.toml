@@ -112,6 +112,8 @@ markers = [
 ]
 
 # Subprocess coverage for granian E2E tests (pytest-cov 7.x)
+# Note: "_exit" patch ensures coverage data is written when subprocesses exit
+# via os._exit(). Orphaned process cleanup is handled by process groups in conftest.py.
 [tool.coverage.run]
 patch = ["subprocess", "fork", "_exit"]
 parallel = true
