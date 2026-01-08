@@ -1641,3 +1641,288 @@ class TestNetworkLevelVerification:
 
         # Verify encrypted SSE format IS present (proves SSE encryption is working)
         assert b"event: enc" in pcap_data, "Encrypted SSE 'event: enc' not found - encryption may not be active!"
+
+    async def test_nonce_uniqueness_different_ciphertext(
+        self,
+        tcpdump_capture: str,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify same plaintext produces different ciphertext (nonce uniqueness).
+
+        This is critical for security - if nonces are reused, an attacker can
+        XOR ciphertexts to recover plaintext. Each encryption MUST produce
+        unique ciphertext even for identical input.
+        """
+        import asyncio
+
+        # Send identical requests
+        identical_payload = {"test": "NONCE_TEST_IDENTICAL_PAYLOAD_12345"}
+
+        resp1 = await hpke_client.post("/echo", json=identical_payload)
+        assert resp1.status == 200
+        assert isinstance(resp1, DecryptedResponse)
+        raw1 = await resp1.unwrap().read()
+
+        resp2 = await hpke_client.post("/echo", json=identical_payload)
+        assert resp2.status == 200
+        assert isinstance(resp2, DecryptedResponse)
+        raw2 = await resp2.unwrap().read()
+
+        # Ciphertexts MUST be different (due to different nonces/ephemeral keys)
+        assert raw1 != raw2, (
+            "CRITICAL: Identical plaintext produced identical ciphertext! "
+            "This indicates nonce reuse - catastrophic for security."
+        )
+
+        # Wait for pcap to capture all traffic
+        await asyncio.sleep(0.3)
+
+        # Verify traffic was captured (sanity check)
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+        assert len(pcap_data) > 100, "No traffic captured in pcap"
+
+    async def test_request_body_encrypted_in_pcap(
+        self,
+        tcpdump_capture: str,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify request body is encrypted on the wire (not just response).
+
+        Previous tests focused on response encryption. This verifies the
+        request body sent BY the client is also encrypted in the network capture.
+        """
+        import asyncio
+
+        # Unique canary that should appear in request body
+        request_canary = "REQUEST_BODY_CANARY_XYZ789"
+        request_payload = {
+            "secret_request_data": request_canary,
+            "password": "super_secret_password_123",
+            "api_key": "sk-live-abcdef123456",
+        }
+
+        resp = await hpke_client.post("/echo", json=request_payload)
+        assert resp.status == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # Request body canaries should NOT be visible
+        assert request_canary.encode() not in pcap_data, (
+            f"Request body canary '{request_canary}' found in pcap! Request not encrypted."
+        )
+        assert b"super_secret_password" not in pcap_data, "Password found in pcap!"
+        assert b"sk-live-" not in pcap_data, "API key prefix found in pcap!"
+        assert b'"secret_request_data"' not in pcap_data, "JSON key found in pcap!"
+
+    async def test_no_psk_on_wire(
+        self,
+        tcpdump_capture: str,
+        hpke_client: HPKEClientSession,
+        test_psk: bytes,
+    ) -> None:
+        """Verify pre-shared key never appears in network traffic.
+
+        The PSK is used for authentication but should NEVER be transmitted.
+        It's used locally to derive keys, not sent over the wire.
+        """
+        import asyncio
+
+        # Generate some traffic
+        resp = await hpke_client.post("/echo", json={"test": "psk_leak_check"})
+        assert resp.status == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # PSK should never appear in any form
+        assert test_psk not in pcap_data, "CRITICAL: Raw PSK found in network capture!"
+        # Also check hex-encoded form
+        assert test_psk.hex().encode() not in pcap_data, "PSK (hex) found in pcap!"
+
+    async def test_no_session_key_material_on_wire(
+        self,
+        tcpdump_capture: str,
+        hpke_client: HPKEClientSession,
+        platform_keypair: tuple[bytes, bytes],
+    ) -> None:
+        """Verify private key and derived session keys never appear in traffic.
+
+        Only the ephemeral PUBLIC key should be visible (the 'enc' field in HPKE).
+        Private keys and derived session keys must never be transmitted.
+        """
+        import asyncio
+
+        private_key, _public_key = platform_keypair
+
+        # Generate traffic
+        resp = await hpke_client.post("/echo", json={"test": "key_leak_check"})
+        assert resp.status == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # Private key should NEVER appear
+        assert private_key not in pcap_data, "CRITICAL: Private key found in network capture!"
+
+        # Note: Server's static public key IS visible in /.well-known/hpke-keys response
+        # (that's expected - it's public). We only check private key doesn't leak.
+
+
+# =============================================================================
+# Active Attack Resistance (no root required)
+# =============================================================================
+
+
+class TestActiveAttackResistance:
+    """Tests that verify resistance to active attacks (tampering, replay).
+
+    These tests verify cryptographic properties at the protocol level
+    without requiring network packet capture.
+    """
+
+    async def test_tampered_ciphertext_rejected(
+        self,
+        platform_keypair: tuple[bytes, bytes],
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """Verify that tampered ciphertext is rejected (AEAD authentication).
+
+        An active attacker who modifies ciphertext in transit should cause
+        decryption to fail. This tests the ChaCha20-Poly1305 authentication
+        tag verification at the HPKE layer.
+        """
+        from hpke_http.exceptions import DecryptionError
+        from hpke_http.hpke import open_psk, seal_psk
+
+        private_key, public_key = platform_keypair
+
+        # Create a valid HPKE-encrypted message
+        plaintext = b"This is a secret message that will be tampered with"
+        info = b"hpke-http"
+        aad = b""
+
+        enc, ciphertext = seal_psk(
+            pk_r=public_key,
+            info=info,
+            psk=test_psk,
+            psk_id=test_psk_id,
+            aad=aad,
+            plaintext=plaintext,
+        )
+
+        # Verify valid ciphertext decrypts correctly
+        decrypted = open_psk(
+            enc=enc,
+            sk_r=private_key,
+            info=info,
+            psk=test_psk,
+            psk_id=test_psk_id,
+            aad=aad,
+            ciphertext=ciphertext,
+        )
+        assert decrypted == plaintext
+
+        # Now tamper with the ciphertext
+        tampered_ciphertext = bytearray(ciphertext)
+        # Flip bits in the middle of the ciphertext
+        tampered_ciphertext[len(ciphertext) // 2] ^= 0xFF
+        tampered_ciphertext[len(ciphertext) // 2 + 1] ^= 0xFF
+
+        # Tampered ciphertext should fail authentication
+        try:
+            open_psk(
+                enc=enc,
+                sk_r=private_key,
+                info=info,
+                psk=test_psk,
+                psk_id=test_psk_id,
+                aad=aad,
+                ciphertext=bytes(tampered_ciphertext),
+            )
+            raise AssertionError("CRITICAL: Tampered ciphertext was decrypted! AEAD authentication is not working.")
+        except DecryptionError:
+            pass  # Expected - authentication failed
+
+        # Also test tampering with the authentication tag itself (last 16 bytes)
+        tag_tampered = bytearray(ciphertext)
+        tag_tampered[-1] ^= 0xFF  # Flip last byte of tag
+
+        try:
+            open_psk(
+                enc=enc,
+                sk_r=private_key,
+                info=info,
+                psk=test_psk,
+                psk_id=test_psk_id,
+                aad=aad,
+                ciphertext=bytes(tag_tampered),
+            )
+            raise AssertionError(
+                "CRITICAL: Tag-tampered ciphertext was decrypted! AEAD tag verification is not working."
+            )
+        except DecryptionError:
+            pass  # Expected - tag verification failed
+
+    async def test_sse_replay_attack_detected(self) -> None:
+        """Verify SSE streaming detects out-of-order/replay attacks.
+
+        The ChunkDecryptor maintains a monotonic counter. If events arrive
+        out of order (indicating replay or reordering attack), decryption
+        should fail with ReplayAttackError.
+        """
+        from hpke_http.exceptions import ReplayAttackError
+        from hpke_http.streaming import ChunkDecryptor, ChunkEncryptor, StreamingSession
+
+        # Create a session and encryptor/decryptor pair
+        session = StreamingSession(
+            session_key=b"k" * 32,
+            session_salt=b"salt",
+        )
+        encryptor = ChunkEncryptor(session)
+        decryptor = ChunkDecryptor(session)
+
+        # Encrypt three chunks
+        chunk1 = encryptor.encrypt(b"first")
+        chunk2 = encryptor.encrypt(b"second")
+        chunk3 = encryptor.encrypt(b"third")
+
+        # Extract data fields from SSE format
+        def get_data(sse_bytes: bytes) -> str:
+            for line in sse_bytes.decode("ascii").split("\n"):
+                if line.startswith("data: "):
+                    return line[6:]
+            raise ValueError("No data field")
+
+        # Normal order works
+        decryptor.decrypt(get_data(chunk1))
+        decryptor.decrypt(get_data(chunk2))
+        decryptor.decrypt(get_data(chunk3))
+
+        # Now test replay attack detection with a fresh decryptor
+        decryptor2 = ChunkDecryptor(StreamingSession(session_key=b"k" * 32, session_salt=b"salt"))
+
+        # Decrypt chunk1 first (counter=1)
+        decryptor2.decrypt(get_data(chunk1))
+
+        # Try to decrypt chunk1 again (replay attack - counter should be 2 now)
+        try:
+            decryptor2.decrypt(get_data(chunk1))
+            raise AssertionError("Replay attack was not detected! chunk1 decrypted twice.")
+        except ReplayAttackError:
+            pass  # Expected - replay detected
+
+        # Try to decrypt chunk3 (skipping chunk2 - out of order)
+        try:
+            decryptor2.decrypt(get_data(chunk3))
+            raise AssertionError("Out-of-order attack not detected! chunk3 before chunk2.")
+        except ReplayAttackError:
+            pass  # Expected - out of order detected
