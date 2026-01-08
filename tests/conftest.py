@@ -339,7 +339,7 @@ async def _start_granian_server(
 
     # Capture server logs to temp file for per-test debugging
     # Note: intentionally not using context manager - file must stay open across yield
-    log_file = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
+    log_file = tempfile.TemporaryFile(mode="w+b")
 
     # Use start_new_session=True to create a new process group.
     # This allows us to kill granian and all its child workers together.
