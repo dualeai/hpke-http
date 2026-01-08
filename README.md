@@ -1,18 +1,28 @@
 # hpke-http
 
-End-to-end encryption for HTTP APIs.
+End-to-end encryption for HTTP APIs using RFC 9180 HPKE.
 
-```bash
-uv add git+https://github.com/duale-ai/hpke-http
-```
+[![CI](https://github.com/dualeai/hpke-http/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/hpke-http/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/hpke-http)](https://pypi.org/project/hpke-http/)
+[![Downloads](https://img.shields.io/pypi/dm/hpke-http)](https://pypi.org/project/hpke-http/)
+[![Python](https://img.shields.io/pypi/pyversions/hpke-http)](https://pypi.org/project/hpke-http/)
+[![License](https://img.shields.io/pypi/l/hpke-http)](https://opensource.org/licenses/Apache-2.0)
 
 ## Highlights
 
 - **Transparent** - Drop-in middleware, no application code changes
 - **E2E encryption** - Protects data even with TLS termination at CDN/LB
 - **PSK binding** - Each request cryptographically bound to API key
-- **Replay protection** - SSE counter prevents replay attacks
+- **Replay protection** - Counter-based nonces prevent replay attacks
 - **RFC 9180 compliant** - Auditable, interoperable standard
+
+## Installation
+
+```bash
+uv add "hpke-http[fastapi]"       # Server
+uv add "hpke-http[aiohttp]"       # Client
+uv add "hpke-http[fastapi,zstd]"  # + compression
+```
 
 ## Quick Start
 
@@ -34,19 +44,16 @@ app.add_middleware(
     HPKEMiddleware,
     private_keys={KemId.DHKEM_X25519_HKDF_SHA256: private_key},
     psk_resolver=resolve_psk,
-    # compress=True,  # Optional: Zstd compression for SSE responses
-    # max_sse_event_size=128 * 1024 * 1024,  # Optional: 128MB for large payloads
 )
 
 @app.post("/chat")
 async def chat(request: Request):
-    data = await request.json()  # Decrypted by middleware
+    data = await request.json()  # Decrypted automatically
 
     async def generate():
         yield b"event: progress\ndata: {\"step\": 1}\n\n"
         yield b"event: complete\ndata: {\"result\": \"done\"}\n\n"
 
-    # Just use StreamingResponse - encryption is automatic!
     return StreamingResponse(generate(), media_type="text/event-stream")
 ```
 
@@ -59,11 +66,9 @@ async with HPKEClientSession(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
-    # compress=True,    # Optional: Zstd compression for requests
 ) as session:
     resp = await session.post("/chat", json={"prompt": "Hello"})
     async for chunk in session.iter_sse(resp):
-        # bytes - matches native aiohttp response.content iteration
         print(chunk)  # b"event: progress\ndata: {...}\n\n"
 ```
 
@@ -75,10 +80,36 @@ async with HPKEClientSession(
 - [RFC 8439 - ChaCha20-Poly1305](https://datatracker.ietf.org/doc/rfc8439/)
 - [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (optional compression)
 
+## Security
+
+Uses OpenSSL constant-time implementations via `cryptography` library.
+
+- [Security Policy](./SECURITY.md) - Vulnerability reporting
+- [SBOM](https://github.com/dualeai/hpke-http/releases) - CycloneDX attached to releases
+
+## Contributing
+
+Contributions welcome! Please open an issue first to discuss changes.
+
+```bash
+make install      # Setup venv
+make test         # Run tests
+make lint         # Format and lint
+```
+
+## License
+
+[Apache-2.0](https://opensource.org/licenses/Apache-2.0)
+
+---
+
+<details>
+<summary>Technical Details</summary>
+
 ## Cipher Suite
 
 | Component | Algorithm | ID |
-|-----------|-----------|------|
+| --------- | --------- | ------ |
 | KEM | DHKEM(X25519, HKDF-SHA256) | 0x0020 |
 | KDF | HKDF-SHA256 | 0x0001 |
 | AEAD | ChaCha20-Poly1305 | 0x0003 |
@@ -111,79 +142,46 @@ Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 
 Uses standard base64 (not base64url) - SSE data fields allow +/= characters.
 
-## How SSE Auto-Encryption Works
+## SSE Auto-Encryption
 
 The middleware automatically encrypts SSE responses when **both** conditions are met:
 
-1. **Request was encrypted** - `SCOPE_HPKE_CONTEXT` exists in scope (from decrypted request)
-2. **Response is SSE** - `Content-Type: text/event-stream` header detected
+1. **Request was encrypted** - `SCOPE_HPKE_CONTEXT` exists in scope
+2. **Response is SSE** - `Content-Type: text/event-stream` detected
 
-```python
-# Middleware detection logic (simplified)
-from hpke_http.constants import SCOPE_HPKE_CONTEXT
-
-if scope.get(SCOPE_HPKE_CONTEXT) and b"text/event-stream" in content_type:
-    # Auto-encrypt this streaming response
-```
-
-This is why `media_type="text/event-stream"` is required - it's the WHATWG-standard MIME type that signals "this is an SSE stream" to both browsers and the middleware.
+This is why `media_type="text/event-stream"` is required.
 
 ## Compression (Optional)
 
-Zstd compression reduces bandwidth by **40-95%** for JSON/text. Events <64B are sent uncompressed automatically.
+Zstd compression reduces bandwidth by **40-95%** for JSON/text.
 
 ```python
-HPKEMiddleware(..., compress=True)      # Server: compress SSE responses
-HPKEClientSession(..., compress=True)   # Client: compress requests
+HPKEMiddleware(..., compress=True)      # Server
+HPKEClientSession(..., compress=True)   # Client
 ```
-
-### Design
 
 | Choice | Rationale |
-|--------|-----------|
-| **Compress-then-encrypt** | Encrypted data is incompressible |
-| **Zstd (RFC 8878)** | Best ratio/speed. Python 3.14 native. |
-| **64B threshold** | Smaller payloads skip compression |
-| **Per-chunk** | Each SSE event independent for streaming |
-
-### Expected Savings
-
-| Data Type | Savings |
-|-----------|---------|
-| Large JSON (>1KB) | 80-95% |
-| Medium JSON (200B-1KB) | 40-70% |
-| HTML/XML | 70-85% |
-| Logs, code | 40-60% |
-| Small events (64-200B) | 0-20% |
-| Base64, random | 0-25% |
-
-### Wire Format
-
-```text
-Plaintext:  encoding_id (1B) || compressed_data
-Encoding:   0x00 = identity, 0x01 = zstd
-```
+| ------ | --------- |
+| Compress-then-encrypt | Encrypted data is incompressible |
+| Zstd (RFC 8878) | Best ratio/speed, Python 3.14 native |
+| 64B threshold | Smaller payloads skip compression |
 
 ## Pitfalls
 
 ```python
 # PSK too short
-HPKEClientSession(psk=b"short")                 # ❌ InvalidPSKError
-HPKEClientSession(psk=secrets.token_bytes(32))  # ✅ >= 32 bytes
+HPKEClientSession(psk=b"short")                 # InvalidPSKError
+HPKEClientSession(psk=secrets.token_bytes(32))  # >= 32 bytes
 
-# SSE without proper content-type (won't auto-encrypt)
-return StreamingResponse(gen())                                    # ❌ No encryption
-return StreamingResponse(gen(), media_type="text/event-stream")    # ✅ Auto-encrypted
-
-# Out-of-order decryption (multi-message context)
-recipient.open(aad, ct2)  # ❌ Expects seq=0
-recipient.open(aad, ct1)  # ✅ Decrypt in order
+# Missing content-type (won't auto-encrypt)
+return StreamingResponse(gen())                                  # No encryption
+return StreamingResponse(gen(), media_type="text/event-stream")  # Auto-encrypted
 ```
 
 ## Limits
 
 | Resource | Limit |
-|----------|-------|
+| -------- | ----- |
 | HPKE messages/context | 2^96-1 |
 | SSE events/session | 2^32-1 |
 | SSE event buffer | 64MB (configurable) |
@@ -193,26 +191,7 @@ recipient.open(aad, ct1)  # ✅ Decrypt in order
 
 > **Note:** SSE is text-only (UTF-8). Binary data must be base64-encoded (+33% overhead).
 
-## Security
-
-Uses OpenSSL constant-time implementations via `cryptography` library.
-
-## Development
-
-```bash
-# Install with extras
-uv add "hpke-http[fastapi] @ git+https://github.com/duale-ai/hpke-http"        # Server
-uv add "hpke-http[aiohttp] @ git+https://github.com/duale-ai/hpke-http"        # Client
-uv add "hpke-http[fastapi,zstd] @ git+https://github.com/duale-ai/hpke-http"   # Server + compression
-
-# Local development
-make install      # Setup venv
-make test         # Run tests (1273 tests, 93% coverage)
-make test-fuzz    # Property-based fuzz tests
-make lint         # Format and lint
-```
-
-### Low-Level API
+## Low-Level API
 
 ```python
 from hpke_http.hpke import seal_psk, open_psk
@@ -220,3 +199,5 @@ from hpke_http.hpke import seal_psk, open_psk
 enc, ct = seal_psk(pk_r, b"info", psk, psk_id, b"aad", b"plaintext")
 pt = open_psk(enc, sk_r, b"info", psk, psk_id, b"aad", ct)
 ```
+
+</details>
