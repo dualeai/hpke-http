@@ -465,7 +465,7 @@ class HPKEClientSession:
         encryptor = ChunkEncryptor(session, format=RawFormat(), compress=False)  # Already compressed
 
         # Chunk the body
-        chunks = []
+        chunks: list[bytes] = []
         for offset in range(0, len(body), CHUNK_SIZE):
             chunk = body[offset : offset + CHUNK_SIZE]
             chunks.append(encryptor.encrypt(chunk))

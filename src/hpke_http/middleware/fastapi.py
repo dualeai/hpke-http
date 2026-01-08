@@ -673,13 +673,13 @@ class HPKEMiddleware:
                 return await receive()
 
             # Return pre-validated first chunk on first call
+            # (first_plaintext is always assigned before the validation loop exits)
             if not first_chunk_returned:
                 first_chunk_returned = True
-                if first_plaintext is not None:
-                    more_body = not (http_done and len(buffer) == 0)
-                    if not more_body:
-                        body_returned = True
-                    return {"type": "http.request", "body": first_plaintext, "more_body": more_body}
+                more_body = not (http_done and len(buffer) == 0)
+                if not more_body:
+                    body_returned = True
+                return {"type": "http.request", "body": first_plaintext, "more_body": more_body}
 
             while True:
                 # Try to extract complete chunk from buffer
