@@ -93,6 +93,15 @@ test-static:
 test-func:
 	uv run pytest tests/ -v -n auto
 
+# CI-friendly tests (no root required, parallel execution)
+test-func-ci:
+	uv run pytest tests/ -v -n auto -m "not requires_root"
+
+# Root-required tests only (tcpdump network capture, must run serial)
+# Usage: sudo make test-func-root
+test-func-root:
+	uv run pytest tests/ -v -n 0 -m "requires_root" --no-cov
+
 # Property-based fuzz tests (slower, more thorough)
 test-fuzz:
 	uv run pytest tests/ -v -m "fuzz" --hypothesis-show-statistics

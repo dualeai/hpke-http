@@ -1525,3 +1525,119 @@ class TestStreamingBehavior:
 
         assert offset == len(raw_body), f"Chunk boundaries misaligned: {offset} vs {len(raw_body)}"
         assert counters == list(range(1, len(counters) + 1)), f"Counters not monotonic: {counters[:10]}"
+
+
+# =============================================================================
+# Network-Level Verification
+# =============================================================================
+
+
+@pytest.mark.requires_root
+class TestNetworkLevelVerification:
+    """Tests that verify encryption at the network packet level.
+
+    These tests require root/sudo to run tcpdump for packet capture.
+    They must run serially (-n 0) due to timing sensitivity.
+    """
+
+    async def test_unencrypted_traffic_is_visible_in_capture(
+        self,
+        tcpdump_capture: str,
+        granian_server: E2EServer,
+    ) -> None:
+        """Verify tcpdump actually captures traffic (sanity check for false negatives).
+
+        This test sends UNENCRYPTED requests and verifies they ARE visible in the
+        capture. If this fails, the tcpdump setup is broken and other tests in this
+        class would give false confidence.
+        """
+        import asyncio
+
+        # Send plain HTTP request (not through HPKE client) with unique canary
+        canary = "UNENCRYPTED_SANITY_CHECK_12345"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{granian_server.host}:{granian_server.port}/health?canary={canary}"
+            ) as resp:
+                assert resp.status == 200
+
+        # Wait for tcpdump to flush packets to disk
+        await asyncio.sleep(0.5)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # Verify unencrypted canary IS visible (proves tcpdump is working)
+        assert canary.encode() in pcap_data, (
+            f"Unencrypted canary '{canary}' not found in capture (pcap size: {len(pcap_data)} bytes). "
+            "tcpdump may not be capturing traffic correctly."
+        )
+
+    async def test_wire_traffic_contains_no_plaintext(
+        self,
+        tcpdump_capture: str,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify captured network traffic contains no plaintext."""
+        import asyncio
+
+        canaries = ["WIRE_CANARY_VALUE_ABC123", "NETWORK_TEST_SECRET_XYZ"]
+
+        for canary in canaries:
+            resp = await hpke_client.post("/echo", json={"secret": canary})
+            assert resp.status == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        for canary in canaries:
+            assert canary.encode() not in pcap_data, f"Plaintext canary '{canary}' found in network capture!"
+        assert b'"secret"' not in pcap_data, "JSON key found in network capture"
+
+    async def test_sse_wire_traffic_is_encrypted(
+        self,
+        tcpdump_capture: str,
+        hpke_client: HPKEClientSession,
+    ) -> None:
+        """Verify SSE streaming content is encrypted on the wire.
+
+        The SSE transport format (event:, data:) is visible on the wire, but
+        the actual event content must be encrypted. Original event types and
+        data should NOT appear - only 'event: enc' with base64 ciphertext.
+        """
+        import asyncio
+
+        # Trigger SSE stream with unique canary values
+        sse_canary = "SSE_WIRE_CANARY_ENCRYPTED_789"
+        resp = await hpke_client.post("/stream", json={"canary": sse_canary})
+        assert resp.status == 200
+
+        # Consume the SSE stream to generate wire traffic
+        event_count = 0
+        async for _chunk in resp.content:
+            event_count += 1
+            if event_count >= 5:
+                break
+
+        # Wait for packets to flush
+        await asyncio.sleep(0.5)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # Original event types should NEVER appear (they're encrypted)
+        # The wire should only show "event: enc" not "event: tick" or "event: done"
+        assert b"event: tick" not in pcap_data, "Raw SSE event type 'tick' found in network capture!"
+        assert b"event: done" not in pcap_data, "Raw SSE event type 'done' found in network capture!"
+
+        # Original JSON data keys should NOT be visible
+        assert b'"count"' not in pcap_data, "SSE data key 'count' found in network capture!"
+        assert b'"timestamp"' not in pcap_data, "SSE data key 'timestamp' found in network capture!"
+
+        # Canary value should NOT be visible
+        assert sse_canary.encode() not in pcap_data, f"SSE canary '{sse_canary}' found in network capture!"
+
+        # Verify encrypted SSE format IS present (proves SSE encryption is working)
+        assert b"event: enc" in pcap_data, "Encrypted SSE 'event: enc' not found - encryption may not be active!"

@@ -435,3 +435,95 @@ async def granian_server_compressed(
             sys.stdout.write(logs)
             sys.stdout.write(f"\n{'=' * 60}\n\n")
             sys.stdout.flush()
+
+
+# === Network Traffic Capture ===
+
+
+@pytest_asyncio.fixture
+async def tcpdump_capture(granian_server: E2EServer) -> AsyncIterator[str]:
+    """Capture network traffic during test using tcpdump.
+
+    Auto-skips if tcpdump is not available or lacks permissions.
+    """
+    pcap_file = tempfile.NamedTemporaryFile(suffix=".pcap", delete=False)
+    pcap_path = pcap_file.name
+    pcap_file.close()
+
+    try:
+        # Use "tcp port X" to match both IPv4 and IPv6 TCP traffic
+        proc = subprocess.Popen(
+            [
+                "tcpdump",
+                "-i",
+                "lo0" if sys.platform == "darwin" else "lo",
+                "-U",  # Packet-buffered output (flush after each packet)
+                "-l",  # Line-buffered output to stderr
+                "--immediate-mode",  # Deliver packets immediately, don't buffer
+                "-w",
+                pcap_path,
+                "tcp",
+                "port",
+                str(granian_server.port),
+                "-c",
+                "1000",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        os.unlink(pcap_path)
+        pytest.skip("tcpdump not installed")
+    except PermissionError:
+        os.unlink(pcap_path)
+        pytest.skip("tcpdump requires root or CAP_NET_RAW capability")
+
+    # Wait for tcpdump to output "listening on" which means BPF filter is ready
+    # Set stderr to non-blocking mode
+    import fcntl
+
+    stderr_fd = proc.stderr.fileno()  # type: ignore[union-attr]
+    flags = fcntl.fcntl(stderr_fd, fcntl.F_GETFL)
+    fcntl.fcntl(stderr_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    stderr_output = b""
+    for _ in range(30):  # Up to 3 seconds
+        await asyncio.sleep(0.1)
+        try:
+            chunk = os.read(stderr_fd, 4096)
+            if chunk:
+                stderr_output += chunk
+                if b"listening on" in stderr_output:
+                    # BPF filter is being set up, wait a bit for it to be fully active
+                    # This is a known timing issue with tcpdump startup
+                    await asyncio.sleep(0.3)
+                    break
+        except BlockingIOError:
+            pass  # No data available yet
+
+        if proc.poll() is not None:
+            # Process exited - check for error
+            with contextlib.suppress(BlockingIOError):
+                stderr_output += os.read(stderr_fd, 4096)
+            with contextlib.suppress(OSError):
+                os.unlink(pcap_path)
+            pytest.skip(f"tcpdump failed: {stderr_output.decode(errors='replace').strip()}")
+    else:
+        # Timeout
+        proc.terminate()
+        proc.wait(timeout=1)
+        with contextlib.suppress(OSError):
+            os.unlink(pcap_path)
+        pytest.skip(f"tcpdump did not start within timeout. Output: {stderr_output.decode(errors='replace')}")
+
+    try:
+        yield pcap_path
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        with contextlib.suppress(OSError):
+            os.unlink(pcap_path)
