@@ -50,6 +50,7 @@ from hpke_http.constants import (
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
     KDF_ID,
+    RAW_LENGTH_PREFIX_SIZE,
     REQUEST_KEY_LABEL,
     RESPONSE_KEY_LABEL,
     SCOPE_HPKE_CONTEXT,
@@ -575,9 +576,9 @@ class HPKEMiddleware:
         # Buffer data until we have a complete first encrypted chunk.
         first_plaintext: bytes | None = None
         while True:
-            if len(buffer) >= 4:
-                chunk_len = int.from_bytes(buffer[:4], "big")
-                total_size = 4 + chunk_len
+            if len(buffer) >= RAW_LENGTH_PREFIX_SIZE:
+                chunk_len = int.from_bytes(buffer[:RAW_LENGTH_PREFIX_SIZE], "big")
+                total_size = RAW_LENGTH_PREFIX_SIZE + chunk_len
                 if len(buffer) >= total_size:
                     # Have complete first chunk - decrypt to validate key
                     chunk_data = bytes(buffer[:total_size])
@@ -611,9 +612,9 @@ class HPKEMiddleware:
                 # Try to extract complete chunks from buffer using offset tracking
                 # O(1) per chunk, single O(n) compaction instead of O(n) per chunk
                 consumed = 0
-                while consumed + 4 <= len(buffer):
-                    chunk_len = int.from_bytes(buffer[consumed : consumed + 4], "big")
-                    total_size = 4 + chunk_len
+                while consumed + RAW_LENGTH_PREFIX_SIZE <= len(buffer):
+                    chunk_len = int.from_bytes(buffer[consumed : consumed + RAW_LENGTH_PREFIX_SIZE], "big")
+                    total_size = RAW_LENGTH_PREFIX_SIZE + chunk_len
                     if consumed + total_size > len(buffer):
                         break
                     chunk_data = bytes(buffer[consumed : consumed + total_size])
@@ -683,9 +684,9 @@ class HPKEMiddleware:
 
             while True:
                 # Try to extract complete chunk from buffer
-                if len(buffer) >= 4:
-                    chunk_len = int.from_bytes(buffer[:4], "big")
-                    total_size = 4 + chunk_len
+                if len(buffer) >= RAW_LENGTH_PREFIX_SIZE:
+                    chunk_len = int.from_bytes(buffer[:RAW_LENGTH_PREFIX_SIZE], "big")
+                    total_size = RAW_LENGTH_PREFIX_SIZE + chunk_len
 
                     if len(buffer) >= total_size:
                         # Extract and decrypt chunk

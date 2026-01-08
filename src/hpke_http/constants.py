@@ -178,6 +178,12 @@ SSE_SESSION_SALT_SIZE: Final[int] = 4
 SSE_COUNTER_SIZE: Final[int] = 4
 """Counter size in wire format (4 bytes, big-endian)."""
 
+RAW_LENGTH_PREFIX_SIZE: Final[int] = 4
+"""Length prefix size in RawFormat wire encoding (4 bytes, big-endian).
+
+Used for O(1) chunk boundary detection when parsing concatenated chunks.
+"""
+
 SSE_MAX_COUNTER: Final[int] = 2**32 - 1
 """Maximum counter value (4 billion events per session)."""
 

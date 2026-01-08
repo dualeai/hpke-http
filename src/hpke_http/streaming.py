@@ -30,6 +30,8 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     CHACHA20_POLY1305_TAG_SIZE,
+    RAW_LENGTH_PREFIX_SIZE,
+    SSE_COUNTER_SIZE,
     SSE_MAX_COUNTER,
     SSE_SESSION_KEY_LABEL,
     SSE_SESSION_SALT_SIZE,
@@ -256,7 +258,7 @@ class SSEFormat:
 
     def encode(self, counter: int, ciphertext: bytes) -> bytes:
         """Encode as SSE event with base64 payload."""
-        payload = counter.to_bytes(4, "big") + ciphertext
+        payload = counter.to_bytes(SSE_COUNTER_SIZE, "big") + ciphertext
         encoded = base64.b64encode(payload)
         return self._PREFIX + encoded + self._SUFFIX
 
@@ -264,7 +266,7 @@ class SSEFormat:
         """Decode base64 payload from SSE data field."""
         data_bytes = data.encode("ascii") if isinstance(data, str) else data
         payload = base64.b64decode(data_bytes)
-        return int.from_bytes(payload[:4], "big"), payload[4:]
+        return int.from_bytes(payload[:SSE_COUNTER_SIZE], "big"), payload[SSE_COUNTER_SIZE:]
 
 
 class RawFormat:
@@ -277,17 +279,22 @@ class RawFormat:
     counter + ciphertext (excludes the length field itself).
     """
 
+    # Precompute offsets for wire format parsing
+    _COUNTER_START: int = RAW_LENGTH_PREFIX_SIZE
+    _COUNTER_END: int = RAW_LENGTH_PREFIX_SIZE + SSE_COUNTER_SIZE
+    _CIPHERTEXT_START: int = RAW_LENGTH_PREFIX_SIZE + SSE_COUNTER_SIZE
+
     def encode(self, counter: int, ciphertext: bytes) -> bytes:
         """Encode as raw binary: length || counter || ciphertext.
 
         Uses single allocation instead of two concatenations for better performance.
         """
-        # Single allocation: length(4B) + counter(4B) + ciphertext
-        total_len = 4 + len(ciphertext)  # counter(4B) + ciphertext
-        result = bytearray(4 + total_len)  # length(4B) + total_len
-        result[0:4] = total_len.to_bytes(4, "big")
-        result[4:8] = counter.to_bytes(4, "big")
-        result[8:] = ciphertext
+        # Single allocation: length + counter + ciphertext
+        total_len = SSE_COUNTER_SIZE + len(ciphertext)
+        result = bytearray(RAW_LENGTH_PREFIX_SIZE + total_len)
+        result[0:RAW_LENGTH_PREFIX_SIZE] = total_len.to_bytes(RAW_LENGTH_PREFIX_SIZE, "big")
+        result[self._COUNTER_START : self._COUNTER_END] = counter.to_bytes(SSE_COUNTER_SIZE, "big")
+        result[self._CIPHERTEXT_START :] = ciphertext
         return bytes(result)
 
     def decode(self, data: bytes | str) -> tuple[int, memoryview]:
@@ -298,8 +305,8 @@ class RawFormat:
         are extracted from the remaining bytes.
         """
         raw = memoryview(data if isinstance(data, bytes) else data.encode("latin-1"))
-        # Skip length prefix (4 bytes), read counter and ciphertext
-        return int.from_bytes(raw[4:8], "big"), raw[8:]
+        # Skip length prefix, read counter and ciphertext
+        return int.from_bytes(raw[self._COUNTER_START : self._COUNTER_END], "big"), raw[self._CIPHERTEXT_START :]
 
 
 @dataclass

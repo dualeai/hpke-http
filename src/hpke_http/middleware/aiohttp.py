@@ -40,6 +40,7 @@ from hpke_http.constants import (
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
+    RAW_LENGTH_PREFIX_SIZE,
     REQUEST_KEY_LABEL,
     RESPONSE_KEY_LABEL,
     SSE_SESSION_KEY_LABEL,
@@ -140,9 +141,9 @@ class DecryptedResponse:
         # This is O(1) per chunk vs O(n) for del buffer[:n]
         buffer_view = memoryview(raw_body)
         offset = 0
-        while offset + 4 <= len(buffer_view):
-            chunk_len = int.from_bytes(buffer_view[offset : offset + 4], "big")
-            total_size = 4 + chunk_len
+        while offset + RAW_LENGTH_PREFIX_SIZE <= len(buffer_view):
+            chunk_len = int.from_bytes(buffer_view[offset : offset + RAW_LENGTH_PREFIX_SIZE], "big")
+            total_size = RAW_LENGTH_PREFIX_SIZE + chunk_len
             if offset + total_size > len(buffer_view):
                 raise DecryptionError("Incomplete final chunk")
             chunk_data = bytes(buffer_view[offset : offset + total_size])
