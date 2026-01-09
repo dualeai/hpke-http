@@ -643,7 +643,11 @@ class RequestEncryptor:
         request_key = self._ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
         self._session = StreamingSession.create(request_key)
 
-        # Create chunk encryptor (never per-chunk compression for requests)
+        # Requests use whole-body compression (compress → chunk → encrypt), NOT per-chunk.
+        # This gives better compression ratio since zstd sees the full body context.
+        # Consequence: each chunk's encoding ID byte is always 0x00 (IDENTITY), so we
+        # need X-HPKE-Encoding header to signal compression (vs responses/SSE which
+        # use per-chunk compression where encoding ID is self-describing).
         self._encryptor = ChunkEncryptor(self._session, format=RawFormat(), compress=False)
 
     def get_headers(self) -> dict[str, str]:
@@ -657,6 +661,7 @@ class RequestEncryptor:
             HEADER_HPKE_ENC: _b64url_encode(self._ctx.enc),
             HEADER_HPKE_STREAM: _b64url_encode(self._session.session_salt),
         }
+        # Signal whole-body compression via header (chunks have 0x00 encoding ID)
         if self._was_compressed:
             headers[HEADER_HPKE_ENCODING] = "zstd"
         return headers
@@ -700,7 +705,8 @@ class RequestEncryptor:
                     yield chunk
             await session.post(url, data=stream())
         """
-        # Compress whole body first (better ratio than per-chunk)
+        # Whole-body compression before chunking (better ratio than per-chunk).
+        # Header X-HPKE-Encoding signals this since chunk encoding IDs are 0x00.
         if self._compress and len(body) >= ZSTD_MIN_SIZE:
             body = zstd_compress(body)
             self._was_compressed = True
@@ -970,7 +976,10 @@ class RequestDecryptor:
             raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
         session_salt = _b64url_decode(stream_header)
 
-        # Check for compression
+        # Check for whole-body compression via header. Requests use whole-body compression
+        # (compress → chunk → encrypt) so chunk encoding IDs are always 0x00 (IDENTITY).
+        # Header X-HPKE-Encoding signals compression, unlike responses/SSE where per-chunk
+        # compression makes encoding ID self-describing.
         encoding_header = _get_header(headers, HEADER_HPKE_ENCODING)
         self._is_compressed = encoding_header == "zstd"
 
@@ -1075,7 +1084,8 @@ class RequestDecryptor:
         """
         plaintext = b"".join(self.decrypt_iter(body))
 
-        # Decompress if needed (whole-body compression)
+        # Decompress whole body if X-HPKE-Encoding: zstd was set.
+        # Chunks were compressed as a unit before chunking, not per-chunk.
         if self._is_compressed:
             plaintext = zstd_decompress(plaintext)
 
