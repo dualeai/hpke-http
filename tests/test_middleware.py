@@ -36,9 +36,12 @@ from tests.conftest import (
     CHI_SQUARE_MIN_PASS,
     CHI_SQUARE_P_THRESHOLD,
     CHI_SQUARE_TRIALS,
+    LARGE_PAYLOAD_SIZES_IDS,
+    LARGE_PAYLOAD_SIZES_MB,
     E2EServer,
     calculate_shannon_entropy,
     chi_square_byte_uniformity,
+    skip_on_314t_gc_bug,
 )
 
 
@@ -1521,9 +1524,11 @@ class TestDecryptedResponseAiohttpCompat:
         assert isinstance(resp.unwrap(), aiohttp.ClientResponse)
 
 
+@pytest.mark.slow
+@skip_on_314t_gc_bug
 class TestLargePayloadAutoChunking:
     """
-    Test auto-chunking for large payloads (10MB, 50MB, 100MB, 250MB).
+    Test auto-chunking for large payloads (10MB, 50MB, 100MB, 250MB, 500MB, 1GB).
 
     These tests verify that the length-prefix wire format correctly handles
     multi-chunk encryption/decryption for very large request/response bodies.
@@ -1531,11 +1536,7 @@ class TestLargePayloadAutoChunking:
     Wire format per chunk: length(4B) || counter(4B) || ciphertext
     """
 
-    @pytest.mark.parametrize(
-        "size_mb",
-        [10, 50, 100, 250],
-        ids=["10MB", "50MB", "100MB", "250MB"],
-    )
+    @pytest.mark.parametrize("size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     async def test_large_request_roundtrip(
         self,
         aiohttp_client: HPKEClientSession,
@@ -1554,11 +1555,7 @@ class TestLargePayloadAutoChunking:
         # Verify content length (echo returns the raw body as string)
         assert len(data["echo"]) == len(large_content)
 
-    @pytest.mark.parametrize(
-        "size_mb",
-        [10, 50, 100, 250],
-        ids=["10MB", "50MB", "100MB", "250MB"],
-    )
+    @pytest.mark.parametrize("size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     async def test_large_response_decryption(
         self,
         aiohttp_client: HPKEClientSession,
@@ -1577,11 +1574,7 @@ class TestLargePayloadAutoChunking:
         data = await resp.json()
         assert data["echo"] == large_content
 
-    @pytest.mark.parametrize(
-        "size_mb",
-        [10, 50, 100, 250],
-        ids=["10MB", "50MB", "100MB", "250MB"],
-    )
+    @pytest.mark.parametrize("size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     async def test_large_payload_wire_format(
         self,
         aiohttp_client: HPKEClientSession,
@@ -3607,7 +3600,7 @@ class TestHttpxConnectionLeaksCompressed:
 
 
 def _build_100_parts() -> tuple[dict[str, tuple[str, bytes, str]], dict[str, str]]:
-    """Build 100 x 10MB parts with random data."""
+    """Build 100 x 10MB parts with random data (1GB total)."""
     import os
 
     files: dict[str, tuple[str, bytes, str]] = {}
@@ -3620,9 +3613,23 @@ def _build_100_parts() -> tuple[dict[str, tuple[str, bytes, str]], dict[str, str
     return files, expected_hashes
 
 
+def _build_100_parts_aiohttp() -> tuple[aiohttp.FormData, dict[str, str]]:
+    """Build 100 x 10MB parts as aiohttp FormData (1GB total)."""
+    import os
+
+    form = aiohttp.FormData()
+    expected_hashes: dict[str, str] = {}
+    for i in range(100):
+        content = os.urandom(10 * 1024 * 1024)  # 10MB random bytes
+        field = f"part_{i}"
+        form.add_field(field, content, filename=f"{field}.bin", content_type="application/octet-stream")
+        expected_hashes[field] = hashlib.sha256(content).hexdigest()
+    return form, expected_hashes
+
+
 def _validate_parts(data: dict[str, Any], expected_hashes: dict[str, str]) -> None:
     """Validate all parts have correct hash and size."""
-    assert len(data["parts"]) == 100
+    assert len(data["parts"]) == len(expected_hashes)
     for part in data["parts"]:
         field = part["field"]
         assert part["sha256"] == expected_hashes[field], f"Hash mismatch for {field}"
@@ -3670,11 +3677,12 @@ class TestMultipartUploadHttpx:
         assert data["parts"][0]["size"] == 10 * 1024 * 1024
         assert data["parts"][0]["sha256"] == hashlib.sha256(content).hexdigest()
 
+    @pytest.mark.slow
     async def test_multipart_100_parts_10mb_httpx(
         self,
         httpx_client: HPKEAsyncClient,
     ) -> None:
-        """httpx: 100 parts x 10MB - client validates hashes."""
+        """httpx: 100 parts x 10MB (1GB) - client validates hashes."""
         files, expected_hashes = _build_100_parts()
 
         resp = await httpx_client.post("/upload", files=files)
@@ -3728,21 +3736,13 @@ class TestMultipartUploadAiohttp:
         assert data["parts"][0]["size"] == 10 * 1024 * 1024
         assert data["parts"][0]["sha256"] == hashlib.sha256(content).hexdigest()
 
+    @pytest.mark.slow
     async def test_multipart_100_parts_10mb_aiohttp(
         self,
         aiohttp_client: HPKEClientSession,
     ) -> None:
-        """aiohttp: 100 parts x 10MB via FormData - client validates hashes."""
-        import os
-
-        form = aiohttp.FormData()
-        expected_hashes: dict[str, str] = {}
-
-        for i in range(100):
-            content = os.urandom(10 * 1024 * 1024)  # 10MB random bytes
-            field = f"part_{i}"
-            form.add_field(field, content, filename=f"{field}.bin", content_type="application/octet-stream")
-            expected_hashes[field] = hashlib.sha256(content).hexdigest()
+        """aiohttp: 100 parts x 10MB (1GB) via FormData - client validates hashes."""
+        form, expected_hashes = _build_100_parts_aiohttp()
 
         resp = await aiohttp_client.post("/upload", data=form)
         assert resp.status == 200

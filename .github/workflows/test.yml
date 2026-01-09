@@ -8,12 +8,13 @@ on:
 
 jobs:
   test:
-    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
+    runs-on: linux-${{ matrix.arch }}-ubuntu2404-${{ matrix.test-step == 'slow' && 'large' || 'small' }}-private
     strategy:
       fail-fast: false
       matrix:
         arch: [x64, arm64]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
+        test-step: [standard, root, slow]
 
     steps:
       - uses: actions/checkout@v6.0.1
@@ -33,10 +34,17 @@ jobs:
         run: make install-deps
 
       - name: Run static checks
+        if: matrix.test-step == 'standard'
         run: make test-static
 
       - name: Run tests
+        if: matrix.test-step == 'standard'
         run: make test-func-ci
 
       - name: Run root-required tests (tcpdump network capture)
+        if: matrix.test-step == 'root'
         run: sudo env "PATH=$PATH" make test-func-root
+
+      - name: Run slow tests (large payloads)
+        if: matrix.test-step == 'slow'
+        run: make test-func-slow

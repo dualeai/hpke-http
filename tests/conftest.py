@@ -29,6 +29,37 @@ logging.getLogger("hpke_http").setLevel(logging.DEBUG)
 logging.getLogger("hpke_http").addHandler(logging.StreamHandler())
 
 
+# === Large Payload Test Constants ===
+
+# Parametrized test sizes for large payload tests (slow tests, require large CI runners)
+LARGE_PAYLOAD_SIZES_MB = [10, 50, 100, 250, 500, 1024]
+LARGE_PAYLOAD_SIZES_IDS = ["10MB", "50MB", "100MB", "250MB", "500MB", "1GB"]
+
+
+def _is_python_314t_gc_bug() -> bool:
+    """Check if running Python 3.14.0-3.14.2 free-threaded (has GC regression).
+
+    Python 3.14t versions before 3.14.3 have a severe GC performance regression
+    causing quadratic behavior with large allocations. The fix (gh-142531) was
+    merged Dec 12, 2025, after 3.14.2 was released (Dec 5, 2025).
+
+    See: https://github.com/python/cpython/issues/142531
+    """
+    if sys.version_info[:2] != (3, 14):
+        return False
+    if sys.version_info.micro > 2:  # 3.14.3+ has the fix
+        return False
+    # Check if free-threaded (GIL disabled) - _is_gil_enabled only exists in 3.13t+
+    return hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled()  # noqa: SLF001  # pyright: ignore
+
+
+# pytest marker for skipping slow tests on Python 3.14.0-3.14.2t
+skip_on_314t_gc_bug = pytest.mark.skipif(
+    _is_python_314t_gc_bug(),
+    reason="Python 3.14.0-3.14.2t has GC regression (gh-142531), fixed in 3.14.3",
+)
+
+
 # === Cryptographic Analysis Helpers ===
 
 
@@ -509,9 +540,9 @@ async def granian_server_gzip_only(
 # === HPKE Client Fixtures (Separate) ===
 
 # Default timeouts (httpx 5s, aiohttp 300s) are misaligned and can cause flaky
-# failures on slower x64 CI runners during large encrypted uploads. Use 120s for
-# both clients to ensure consistent behavior across architectures.
-_TEST_TIMEOUT_SECS = 120.0
+# failures on CI runners during large encrypted uploads. Use 180s for both
+# clients to handle 1GB+ payloads with virtualized I/O variance.
+_TEST_TIMEOUT_SECS = 180.0
 
 # --- aiohttp fixtures ---
 
