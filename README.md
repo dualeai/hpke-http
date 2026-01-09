@@ -20,7 +20,8 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE.
 
 ```bash
 uv add "hpke-http[fastapi]"       # Server
-uv add "hpke-http[aiohttp]"       # Client
+uv add "hpke-http[aiohttp]"       # Client (aiohttp)
+uv add "hpke-http[httpx]"         # Client (httpx)
 uv add "hpke-http[fastapi,zstd]"  # + compression
 ```
 
@@ -77,13 +78,34 @@ async with HPKEClientSession(
     psk_id=tenant_id,
 ) as session:
     # Standard JSON request - encryption is automatic
-    resp = await session.post("/users", json={"name": "Alice"})
-    user = await resp.json()  # Decrypted automatically
+    async with session.post("/users", json={"name": "Alice"}) as resp:
+        user = await resp.json()  # Decrypted automatically
+        print(user)  # {"id": 123, "name": "Alice"}
+
+    # SSE streaming request - encryption is automatic
+    async with session.post("/chat", json={"prompt": "Hello"}) as resp:
+        async for chunk in session.iter_sse(resp):
+            print(chunk)  # b"event: progress\ndata: {...}\n\n"
+```
+
+### Client (httpx)
+
+```python
+from hpke_http.middleware.httpx import HPKEAsyncClient
+
+async with HPKEAsyncClient(
+    base_url="https://api.example.com",
+    psk=api_key,        # >= 32 bytes
+    psk_id=tenant_id,
+) as client:
+    # Standard JSON request - encryption is automatic
+    resp = await client.post("/users", json={"name": "Alice"})
+    user = resp.json()  # Decrypted automatically
     print(user)  # {"id": 123, "name": "Alice"}
 
     # SSE streaming request - encryption is automatic
-    resp = await session.post("/chat", json={"prompt": "Hello"})
-    async for chunk in session.iter_sse(resp):
+    resp = await client.post("/chat", json={"prompt": "Hello"})
+    async for chunk in client.iter_sse(resp):
         print(chunk)  # b"event: progress\ndata: {...}\n\n"
 ```
 
