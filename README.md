@@ -199,18 +199,7 @@ Response type is detected via `Content-Type` header:
 
 ## Compression (Optional)
 
-Zstd compression reduces bandwidth by **40-95%** for JSON/text.
-
-```python
-HPKEMiddleware(..., compress=True)      # Server
-HPKEClientSession(..., compress=True)   # Client
-```
-
-| Choice | Rationale |
-| ------ | --------- |
-| Compress-then-encrypt | Encrypted data is incompressible |
-| Zstd (RFC 8878) | Best ratio/speed, Python 3.14 native |
-| 64B threshold | Smaller payloads skip compression |
+Zstd (RFC 8878) reduces bandwidth by **40-95%** for JSON/text. Both client and server must enable `compress=True`. Payloads < 64 bytes skip compression automatically.
 
 ## Pitfalls
 
