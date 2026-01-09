@@ -57,6 +57,20 @@ class DecryptedResponse:
     when accessed via read(), text(), or json() methods. The underlying
     response uses counter-based chunk encryption (RawFormat).
 
+    Connection lifecycle:
+        Unlike aiohttp.ClientResponse, this wrapper auto-releases the connection
+        when read()/text()/json() is called. This prevents connection leaks without
+        requiring explicit release() or context manager usage.
+
+        - read()/text()/json(): Reads body, decrypts, releases connection
+        - release(): Idempotent, safe to call after read()
+        - Context manager: Calls release() on exit, idempotent
+        - close(): Closes connection (doesn't return to pool)
+        - unwrap().read(): Returns cached raw body even after release
+
+        On decryption failure, the connection is still released to prevent leaks.
+        The raw encrypted body remains accessible via unwrap().read().
+
     Duck-types common aiohttp.ClientResponse attributes (status, headers, url,
     ok, reason, content_type, raise_for_status) for seamless usage. Use unwrap()
     to access the underlying ClientResponse directly.
@@ -98,10 +112,17 @@ class DecryptedResponse:
         self._release_encrypted = release_encrypted
 
     async def _ensure_decrypted(self) -> bytes:
-        """Decrypt response body using ResponseDecryptor.
+        """Decrypt response body and release connection.
 
-        Uses the centralized ResponseDecryptor class which handles
-        header parsing, chunk boundary detection, and decryption.
+        Uses ResponseDecryptor for header parsing, chunk boundary detection,
+        and decryption. Connection is always released after reading, even if
+        decryption fails - this prevents connection leaks while preserving
+        access to cached raw body via unwrap().read().
+
+        Connection lifecycle:
+        - read() consumes body, caches in aiohttp's _body
+        - release() returns connection to pool (idempotent)
+        - Raw body remains accessible via unwrap().read() after release
         """
         if self._decrypted is not None:
             return self._decrypted
@@ -109,22 +130,27 @@ class DecryptedResponse:
         # Read entire response body (cached by aiohttp, safe to call multiple times)
         raw_body = await self._response.read()
 
-        # Use centralized ResponseDecryptor - handles headers, chunking, decryption
-        decryptor = ResponseDecryptor(self._response.headers, self._sender_ctx)
-        self._decrypted = decryptor.decrypt_all(raw_body)
+        try:
+            # Use centralized ResponseDecryptor - handles headers, chunking, decryption
+            decryptor = ResponseDecryptor(self._response.headers, self._sender_ctx)
+            self._decrypted = decryptor.decrypt_all(raw_body)
 
-        # Release encrypted content to reduce held memory (2x → 1x)
-        if self._release_encrypted:
-            # Clear aiohttp's internal body cache
-            self._response._body = b""  # type: ignore[attr-defined]  # noqa: SLF001
+            # Release encrypted content to reduce held memory (2x → 1x)
+            if self._release_encrypted:
+                # Clear aiohttp's internal body cache
+                self._response._body = b""  # type: ignore[attr-defined]  # noqa: SLF001
 
-        _logger.debug(
-            "Response decrypted: url=%s size=%d release_encrypted=%s",
-            self._response.url,
-            len(self._decrypted),
-            self._release_encrypted,
-        )
-        return self._decrypted
+            _logger.debug(
+                "Response decrypted: url=%s size=%d release_encrypted=%s",
+                self._response.url,
+                len(self._decrypted),
+                self._release_encrypted,
+            )
+            return self._decrypted
+        finally:
+            # Always release connection to pool - prevents leaks even on failure.
+            # Safe: body cached in _body, release() is idempotent.
+            await self._response.release()
 
     async def read(self) -> bytes:
         """Read and decrypt the response body."""
@@ -225,6 +251,36 @@ class DecryptedResponse:
         for example when passing to iter_sse().
         """
         return self._response
+
+    def close(self) -> None:
+        """Close the underlying response and its connection.
+
+        After calling close(), the response body cannot be read.
+        The connection is closed and NOT returned to the pool.
+        Prefer release() or context manager for connection reuse.
+        """
+        self._response.close()
+
+    async def release(self) -> None:
+        """Release the connection back to the pool.
+
+        Discards any unread response body and returns the connection
+        to the pool for reuse. Preferred over close() for efficiency.
+        """
+        await self._response.release()
+
+    async def __aenter__(self) -> Self:
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: types.TracebackType | None,
+    ) -> None:
+        """Async context manager exit - releases connection to pool."""
+        await self.release()
 
     def __getattr__(self, name: str) -> Any:
         """Proxy unknown attributes to underlying response."""

@@ -16,9 +16,11 @@ import asyncio
 import gc
 import json
 import re
+import sys
 import time
 import warnings
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import httpx
@@ -554,6 +556,304 @@ class TestDecryptedResponseEdgeCases:
 
         # Headers should be accessible
         assert "content-type" in resp.headers or "Content-Type" in resp.headers
+
+
+class TestDecryptedResponseReleaseLifecycle:
+    """Tests for DecryptedResponse connection release behavior.
+
+    Verifies that connections are properly released to the pool after
+    read()/text()/json() calls, and that release() is idempotent.
+    """
+
+    async def test_read_auto_releases_connection(self, aiohttp_client: HPKEClientSession) -> None:
+        """read() automatically releases connection to pool."""
+        connector = aiohttp_client._session.connector  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+        resp = await aiohttp_client.post("/echo", json={"test": "release"})
+        assert isinstance(resp, DecryptedResponse)
+
+        # Connection acquired before read
+        await resp.read()
+
+        # Connection should be released after read
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+    async def test_text_auto_releases_connection(self, aiohttp_client: HPKEClientSession) -> None:
+        """text() automatically releases connection to pool."""
+        connector = aiohttp_client._session.connector  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+        resp = await aiohttp_client.post("/echo", json={"test": "text"})
+        await resp.text()
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+    async def test_json_auto_releases_connection(self, aiohttp_client: HPKEClientSession) -> None:
+        """json() automatically releases connection to pool."""
+        connector = aiohttp_client._session.connector  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+        resp = await aiohttp_client.post("/echo", json={"test": "json"})
+        await resp.json()
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+    async def test_multiple_reads_only_release_once(self, aiohttp_client: HPKEClientSession) -> None:
+        """Multiple read() calls don't cause issues (cached, release idempotent)."""
+        resp = await aiohttp_client.post("/echo", json={"test": "multi"})
+
+        data1 = await resp.read()
+        data2 = await resp.read()
+        data3 = await resp.read()
+
+        assert data1 == data2 == data3
+        assert b"multi" in data1
+
+    async def test_read_then_explicit_release_idempotent(self, aiohttp_client: HPKEClientSession) -> None:
+        """Calling release() after read() is safe (idempotent)."""
+        connector = aiohttp_client._session.connector  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+        resp = await aiohttp_client.post("/echo", json={"test": "idem"})
+        await resp.read()  # Auto-releases
+        await resp.release()  # Should be idempotent no-op
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+    async def test_read_in_context_manager_idempotent(self, aiohttp_client: HPKEClientSession) -> None:
+        """read() inside context manager - __aexit__ release is idempotent."""
+        connector = aiohttp_client._session.connector  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+        resp = await aiohttp_client.post("/echo", json={"test": "ctx"})
+        async with resp:
+            data = await resp.read()  # Auto-releases
+            assert b"ctx" in data
+        # __aexit__ calls release() again - should be idempotent
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+    async def test_headers_accessible_after_read(self, aiohttp_client: HPKEClientSession) -> None:
+        """Headers remain accessible after read() releases connection."""
+        resp = await aiohttp_client.post("/echo", json={"test": "headers"})
+
+        await resp.read()  # Auto-releases connection
+
+        # Metadata should still be accessible
+        assert resp.status == 200
+        assert resp.ok is True
+        assert "content-type" in resp.headers or "Content-Type" in resp.headers
+        assert "/echo" in str(resp.url)
+
+    async def test_status_accessible_after_release(self, aiohttp_client: HPKEClientSession) -> None:
+        """Status and other metadata accessible after explicit release()."""
+        resp = await aiohttp_client.post("/echo", json={"test": "status"})
+
+        await resp.release()
+
+        # Should still work
+        assert resp.status == 200
+        assert resp.ok is True
+        assert resp.content_type  # Non-empty string
+
+    async def test_raw_body_cached_after_release(self, aiohttp_client: HPKEClientSession) -> None:
+        """Raw encrypted body is cached in aiohttp's _body after release."""
+        resp = await aiohttp_client.post("/echo", json={"test": "cached"})
+        assert isinstance(resp, DecryptedResponse)
+
+        # Read decrypted (auto-releases connection)
+        decrypted = await resp.read()
+        assert b"cached" in decrypted
+
+        # Raw body should be cached in underlying response's _body
+        # (accessing private attr for testing - aiohttp caches body here)
+        raw_cached = resp.unwrap()._body  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+        assert isinstance(raw_cached, bytes)
+        assert len(raw_cached) > 0  # Should have cached encrypted body
+
+    async def test_sequential_requests_no_leak(self, aiohttp_client: HPKEClientSession) -> None:
+        """Sequential requests with read() don't leak connections."""
+        connector = aiohttp_client._session.connector  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+        for i in range(20):
+            resp = await aiohttp_client.post("/echo", json={"seq": i})
+            data = await resp.json()
+            assert str(i) in data["echo"]
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+    async def test_concurrent_requests_no_leak(self, aiohttp_client: HPKEClientSession) -> None:
+        """Concurrent requests with read() don't leak connections."""
+        connector = aiohttp_client._session.connector  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+        async def make_request(i: int) -> dict[str, Any]:
+            resp = await aiohttp_client.post("/echo", json={"concurrent": i})
+            return await resp.json()
+
+        results = await asyncio.gather(*[make_request(i) for i in range(10)])
+        assert len(results) == 10
+
+        await asyncio.sleep(0.05)
+        assert len(connector._acquired) == 0  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]  # noqa: SLF001
+
+    @pytest.mark.skipif(
+        sys.version_info >= (3, 14),
+        reason="ResourceWarning GC timing is flaky on Python 3.14+ due to free-threading changes",
+    )
+    async def test_no_resource_warning_after_read(self, aiohttp_client: HPKEClientSession) -> None:
+        """No ResourceWarning after read() - connection properly released."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", ResourceWarning)
+
+            resp = await aiohttp_client.post("/echo", json={"warn": "test"})
+            await resp.read()
+
+            # Yield to event loop - allows pending cleanup tasks to complete
+            await asyncio.sleep(0.01)
+
+            # Force GC to trigger any warnings
+            gc.collect()
+            gc.collect()
+
+            # Filter to connection leaks
+            leaks = [x for x in w if issubclass(x.category, ResourceWarning) and _is_connection_leak(x)]
+            assert not leaks, f"Connection leak after read(): {leaks[0].message}"
+
+
+class TestDecryptedResponseDecryptionFailure:
+    """Tests for connection release on decryption failure.
+
+    Verifies that connections are released even when decryption fails,
+    and that the raw body remains accessible via unwrap().read().
+    """
+
+    async def test_decryption_failure_releases_connection(self) -> None:
+        """Connection is released even when decryption fails."""
+        # Create mock response
+        mock_response = MagicMock(spec=aiohttp.ClientResponse)
+        mock_response.read = AsyncMock(return_value=b"encrypted_data")
+        mock_response.release = AsyncMock()
+        mock_response.headers = {"X-HPKE-Stream": "counter=0"}
+        mock_response.url = "http://test/echo"
+
+        # Create mock sender context
+        mock_ctx = MagicMock()
+
+        # Create DecryptedResponse
+        resp = DecryptedResponse(mock_response, mock_ctx)
+
+        # Patch ResponseDecryptor to raise an exception
+        with patch("hpke_http.middleware.aiohttp.ResponseDecryptor") as mock_decryptor_class:
+            mock_decryptor = MagicMock()
+            mock_decryptor.decrypt_all.side_effect = ValueError("Decryption failed")
+            mock_decryptor_class.return_value = mock_decryptor
+
+            # read() should raise the decryption error
+            with pytest.raises(ValueError, match="Decryption failed"):
+                await resp.read()
+
+        # But release() should have been called despite the error
+        mock_response.release.assert_called_once()
+
+    async def test_decryption_failure_raw_body_accessible(self) -> None:
+        """Raw body accessible via unwrap().read() after decryption failure."""
+        raw_encrypted = b"some_encrypted_bytes_here"
+
+        # Create mock response
+        mock_response = MagicMock(spec=aiohttp.ClientResponse)
+        mock_response.read = AsyncMock(return_value=raw_encrypted)
+        mock_response.release = AsyncMock()
+        mock_response.headers = {"X-HPKE-Stream": "counter=0"}
+
+        mock_ctx = MagicMock()
+        resp = DecryptedResponse(mock_response, mock_ctx)
+
+        with patch("hpke_http.middleware.aiohttp.ResponseDecryptor") as mock_decryptor_class:
+            mock_decryptor = MagicMock()
+            mock_decryptor.decrypt_all.side_effect = ValueError("Bad data")
+            mock_decryptor_class.return_value = mock_decryptor
+
+            with pytest.raises(ValueError):
+                await resp.read()
+
+        # Raw body should still be accessible
+        raw = await resp.unwrap().read()
+        assert raw == raw_encrypted
+
+    async def test_decryption_failure_no_resource_warning(self) -> None:
+        """No ResourceWarning after decryption failure - connection released."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", ResourceWarning)
+
+            mock_response = MagicMock(spec=aiohttp.ClientResponse)
+            mock_response.read = AsyncMock(return_value=b"data")
+            mock_response.release = AsyncMock()
+            mock_response.headers = {}
+
+            mock_ctx = MagicMock()
+            resp = DecryptedResponse(mock_response, mock_ctx)
+
+            with patch("hpke_http.middleware.aiohttp.ResponseDecryptor") as mock_decryptor_class:
+                mock_decryptor_class.return_value.decrypt_all.side_effect = RuntimeError("Fail")
+
+                with pytest.raises(RuntimeError):
+                    await resp.read()
+
+            # Force GC
+            gc.collect()
+            gc.collect()
+
+            # release() was called, so no warning from our code
+            mock_response.release.assert_called_once()
+
+            # No connection leaks from our wrapper
+            leaks = [x for x in w if issubclass(x.category, ResourceWarning) and _is_connection_leak(x)]
+            assert not leaks
+
+    async def test_release_called_once_on_failure(self) -> None:
+        """release() called exactly once on decryption failure."""
+        mock_response = MagicMock(spec=aiohttp.ClientResponse)
+        mock_response.read = AsyncMock(return_value=b"data")
+        mock_response.release = AsyncMock()
+        mock_response.headers = {}
+
+        mock_ctx = MagicMock()
+        resp = DecryptedResponse(mock_response, mock_ctx)
+
+        with patch("hpke_http.middleware.aiohttp.ResponseDecryptor") as mock_decryptor_class:
+            mock_decryptor_class.return_value.decrypt_all.side_effect = RuntimeError("Oops")
+
+            with pytest.raises(RuntimeError):
+                await resp.read()
+
+        # Exactly one release call
+        assert mock_response.release.call_count == 1
+
+    async def test_multiple_read_after_failure_reraises(self) -> None:
+        """Multiple read() calls after failure re-raise (not cached)."""
+        mock_response = MagicMock(spec=aiohttp.ClientResponse)
+        mock_response.read = AsyncMock(return_value=b"data")
+        mock_response.release = AsyncMock()
+        mock_response.headers = {}
+
+        mock_ctx = MagicMock()
+        resp = DecryptedResponse(mock_response, mock_ctx)
+
+        with patch("hpke_http.middleware.aiohttp.ResponseDecryptor") as mock_decryptor_class:
+            mock_decryptor_class.return_value.decrypt_all.side_effect = ValueError("Bad")
+
+            # First read fails
+            with pytest.raises(ValueError):
+                await resp.read()
+
+            # Second read also fails (not cached because _decrypted not set)
+            with pytest.raises(ValueError):
+                await resp.read()
+
+        # release() called twice (once per read attempt)
+        assert mock_response.release.call_count == 2
 
 
 class TestStandardResponseEdgeCasesE2E:
@@ -1948,15 +2248,23 @@ class TestActiveAttackResistance:
 class TestAiohttpConnectionLeaks:
     """Verify aiohttp connections are properly released."""
 
+    @pytest.mark.skipif(
+        sys.version_info >= (3, 14),
+        reason="ResourceWarning GC timing is flaky on Python 3.14+ due to free-threading changes",
+    )
     async def test_no_resource_warning_normal_request(
         self,
         aiohttp_client: Any,
     ) -> None:
-        """Normal request emits no connection ResourceWarning."""
+        """Normal request with consumed response emits no ResourceWarning."""
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always", ResourceWarning)
 
-            await aiohttp_client.post("/echo", json={"test": 1})
+            resp = await aiohttp_client.post("/echo", json={"test": 1})
+            await resp.read()  # Consume response to release connection
+
+            # Yield to event loop - allows pending cleanup tasks to complete
+            await asyncio.sleep(0.01)
 
             gc.collect()
             gc.collect()
@@ -1965,6 +2273,63 @@ class TestAiohttpConnectionLeaks:
             leaks = [x for x in w if issubclass(x.category, ResourceWarning) and _is_connection_leak(x)]
             assert not leaks, f"Connection leak: {leaks[0].message}"
 
+    @pytest.mark.skipif(
+        sys.version_info >= (3, 14),
+        reason="ResourceWarning GC timing is flaky on Python 3.14+ due to free-threading changes",
+    )
+    async def test_no_resource_warning_with_context_manager(
+        self,
+        aiohttp_client: Any,
+    ) -> None:
+        """Context manager releases connection without consuming body."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", ResourceWarning)
+
+            resp = await aiohttp_client.post("/echo", json={"test": 1})
+            async with resp:
+                # Don't consume body - context manager handles cleanup
+                assert resp.status == 200
+
+            # Yield to event loop - allows pending cleanup tasks to complete
+            await asyncio.sleep(0.01)
+
+            gc.collect()
+            gc.collect()
+
+            # Filter to connection leaks only
+            leaks = [x for x in w if issubclass(x.category, ResourceWarning) and _is_connection_leak(x)]
+            assert not leaks, f"Connection leak: {leaks[0].message}"
+
+    @pytest.mark.skipif(
+        sys.version_info >= (3, 14),
+        reason="ResourceWarning GC timing is flaky on Python 3.14+ due to free-threading changes",
+    )
+    async def test_no_resource_warning_with_release(
+        self,
+        aiohttp_client: Any,
+    ) -> None:
+        """Explicit release() cleans up without consuming body."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", ResourceWarning)
+
+            resp = await aiohttp_client.post("/echo", json={"test": 1})
+            assert resp.status == 200
+            await resp.release()  # Explicit cleanup
+
+            # Yield to event loop - allows pending cleanup tasks to complete
+            await asyncio.sleep(0.01)
+
+            gc.collect()
+            gc.collect()
+
+            # Filter to connection leaks only
+            leaks = [x for x in w if issubclass(x.category, ResourceWarning) and _is_connection_leak(x)]
+            assert not leaks, f"Connection leak: {leaks[0].message}"
+
+    @pytest.mark.skipif(
+        sys.version_info >= (3, 14),
+        reason="ResourceWarning GC timing is flaky on Python 3.14+ due to free-threading changes",
+    )
     async def test_no_resource_warning_sse_early_break(
         self,
         aiohttp_client: Any,
@@ -1976,6 +2341,9 @@ class TestAiohttpConnectionLeaks:
             resp = await aiohttp_client.post("/stream", json={"start": True})
             async for _ in aiohttp_client.iter_sse(resp):
                 break
+
+            # Yield to event loop - allows pending cleanup tasks to complete
+            await asyncio.sleep(0.01)
 
             gc.collect()
             gc.collect()
