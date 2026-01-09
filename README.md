@@ -15,6 +15,7 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE (Hybrid Public Key Encry
 - **PSK binding** - Each request cryptographically bound to pre-shared key (API key)
 - **Replay protection** - Counter-based nonces (numbers used once) prevent replay attacks
 - **RFC 9180 compliant** - Auditable, interoperable standard
+- **Memory-efficient** - Streams large file uploads with O(chunk_size) memory
 
 ## Installation
 
@@ -27,7 +28,7 @@ uv add "hpke-http[fastapi,zstd]"  # + zstd compression (gzip fallback included)
 
 ## Quick Start
 
-Both standard JSON requests and SSE (Server-Sent Events) streaming are transparently encrypted.
+Standard JSON requests, SSE (Server-Sent Events) streaming, and file uploads are transparently encrypted.
 
 ### Server (FastAPI)
 
@@ -70,6 +71,7 @@ async def chat(request: Request):
 ### Client (aiohttp)
 
 ```python
+import aiohttp
 from hpke_http.middleware.aiohttp import HPKEClientSession
 
 async with HPKEClientSession(
@@ -89,6 +91,12 @@ async with HPKEClientSession(
     async with session.post("/chat", json={"prompt": "Hello"}) as resp:
         async for chunk in session.iter_sse(resp):
             print(chunk)  # b"event: progress\ndata: {...}\n\n"
+
+    # File upload - encryption is automatic, streams with O(chunk_size) memory
+    form = aiohttp.FormData()
+    form.add_field("file", open("large.pdf", "rb"), filename="large.pdf")
+    async with session.post("/upload", data=form) as resp:
+        result = await resp.json()
 ```
 
 ### Client (httpx)
@@ -113,6 +121,10 @@ async with HPKEAsyncClient(
     resp = await client.post("/chat", json={"prompt": "Hello"})
     async for chunk in client.iter_sse(resp):
         print(chunk)  # b"event: progress\ndata: {...}\n\n"
+
+    # File upload - encryption is automatic, streams with O(chunk_size) memory
+    resp = await client.post("/upload", files={"file": open("large.pdf", "rb")})
+    result = resp.json()
 ```
 
 ## Documentation
@@ -283,6 +295,7 @@ Auto-negotiated via `Accept-Encoding` header on discovery endpoint (`/.well-know
 | `X-HPKE-Enc` | Added | - | Ephemeral public key |
 | `X-HPKE-Stream` | Added | Added | Session salt for nonces |
 | `X-HPKE-Encoding` | Added (if compressed) | - | Compression algorithm |
+| `X-HPKE-Content-Type` | Added (if body) | - | Original Content-Type for server parsing |
 
 ### Security Boundary
 
