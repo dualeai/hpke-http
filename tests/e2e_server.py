@@ -30,9 +30,9 @@ async def health(_request: Request) -> JSONResponse:
 
 async def echo(request: Request) -> JSONResponse:
     """Echo endpoint - returns the decrypted body."""
-    _logger.debug("POST /echo: reading body...")
+    _logger.debug("%s /echo: reading body...", request.method)
     body = await request.body()
-    _logger.debug("POST /echo: body read, %d bytes", len(body))
+    _logger.debug("%s /echo: body read, %d bytes", request.method, len(body))
     return JSONResponse(
         {
             "path": request.url.path,
@@ -160,7 +160,7 @@ def _create_app() -> HPKEMiddleware:
     # Create base Starlette app
     routes = [
         Route("/health", health, methods=["GET"]),
-        Route("/echo", echo, methods=["POST"]),
+        Route("/echo", echo, methods=["POST", "PUT", "PATCH", "DELETE"]),
         Route("/echo-chunks", echo_chunks, methods=["POST"]),
         Route("/stream", stream, methods=["POST"]),
         Route("/stream-delayed", stream_delayed, methods=["POST"]),

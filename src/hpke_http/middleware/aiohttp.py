@@ -16,15 +16,13 @@ Usage:
 Reference: RFC-065 §4.4, §5.2
 """
 
-import asyncio
 import json as json_module
-import time
 import types
 import weakref
 from collections.abc import AsyncIterator, Callable
 from http import HTTPStatus
-from typing import Any, ClassVar
-from urllib.parse import urljoin, urlparse
+from typing import Any
+from urllib.parse import urljoin
 
 import aiohttp
 from multidict import CIMultiDictProxy
@@ -32,20 +30,15 @@ from typing_extensions import Self
 from yarl import URL
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import (
-    DISCOVERY_CACHE_MAX_AGE,
-    DISCOVERY_PATH,
-    HEADER_HPKE_STREAM,
-    KemId,
-)
+from hpke_http.constants import HEADER_HPKE_STREAM
 from hpke_http.core import (
-    RequestEncryptor,
+    BaseHPKEClient,
     ResponseDecryptor,
     SSEDecryptor,
     SSELineParser,
+    extract_sse_data,
 )
 from hpke_http.exceptions import EncryptionRequiredError, KeyDiscoveryError
-from hpke_http.headers import b64url_decode
 from hpke_http.hpke import SenderContext
 
 __all__ = [
@@ -86,6 +79,8 @@ class DecryptedResponse:
         self,
         response: aiohttp.ClientResponse,
         sender_ctx: "SenderContext",
+        *,
+        release_encrypted: bool = False,
     ) -> None:
         """
         Initialize decrypted response wrapper.
@@ -93,10 +88,14 @@ class DecryptedResponse:
         Args:
             response: The underlying aiohttp response
             sender_ctx: HPKE sender context for key derivation
+            release_encrypted: If True, release encrypted content after decryption
+                to reduce held memory from 2x to 1x payload. Trade-off: unwrap().read()
+                will return empty bytes after decryption.
         """
         self._response = response
         self._sender_ctx = sender_ctx
         self._decrypted: bytes | None = None
+        self._release_encrypted = release_encrypted
 
     async def _ensure_decrypted(self) -> bytes:
         """Decrypt response body using ResponseDecryptor.
@@ -114,10 +113,16 @@ class DecryptedResponse:
         decryptor = ResponseDecryptor(self._response.headers, self._sender_ctx)
         self._decrypted = decryptor.decrypt_all(raw_body)
 
+        # Release encrypted content to reduce held memory (2x → 1x)
+        if self._release_encrypted:
+            # Clear aiohttp's internal body cache
+            self._response._body = b""  # type: ignore[attr-defined]
+
         _logger.debug(
-            "Response decrypted: url=%s size=%d",
+            "Response decrypted: url=%s size=%d release_encrypted=%s",
             self._response.url,
             len(self._decrypted),
+            self._release_encrypted,
         )
         return self._decrypted
 
@@ -226,20 +231,7 @@ class DecryptedResponse:
         return getattr(self._response, name)
 
 
-def _extract_sse_data(event_lines: list[bytes]) -> str | None:
-    """Extract data field value from SSE event lines.
-
-    Per WHATWG spec, the data field is prefixed with "data: ".
-    Returns stripped value if non-empty, None otherwise.
-    """
-    for line in event_lines:
-        if line.startswith(b"data: "):
-            value = line[6:].decode("ascii").strip()
-            return value if value else None
-    return None
-
-
-class HPKEClientSession:
+class HPKEClientSession(BaseHPKEClient):
     """
     aiohttp-compatible client session with transparent HPKE encryption.
 
@@ -250,10 +242,6 @@ class HPKEClientSession:
     - Class-level key caching with TTL
     """
 
-    # Class-level key cache: host -> (keys_dict, expires_at)
-    _key_cache: ClassVar[dict[str, tuple[dict[KemId, bytes], float]]] = {}
-    _cache_lock: ClassVar[asyncio.Lock | None] = None
-
     def __init__(
         self,
         base_url: str,
@@ -263,6 +251,7 @@ class HPKEClientSession:
         *,
         compress: bool = False,
         require_encryption: bool = False,
+        release_encrypted: bool = False,
         **aiohttp_kwargs: Any,
     ) -> None:
         """
@@ -278,30 +267,29 @@ class HPKEClientSession:
                 Server must have backports.zstd installed (Python < 3.14).
             require_encryption: If True, raise EncryptionRequiredError when
                 server responds with plaintext instead of encrypted response.
+            release_encrypted: If True, release encrypted response content after
+                decryption to reduce held memory from 2x to 1x payload. Trade-off:
+                response.unwrap().read() will return empty bytes after decryption.
             **aiohttp_kwargs: Additional arguments passed to aiohttp.ClientSession
         """
-        self.base_url = base_url.rstrip("/")
-        self.psk = psk
-        self.psk_id = psk_id or psk
-        self.discovery_url = discovery_url or urljoin(self.base_url, DISCOVERY_PATH)
-        self.compress = compress
-        self.require_encryption = require_encryption
+        super().__init__(
+            base_url=base_url,
+            psk=psk,
+            psk_id=psk_id,
+            discovery_url=discovery_url,
+            compress=compress,
+            require_encryption=require_encryption,
+            logger=_logger,
+        )
 
         self._session: aiohttp.ClientSession | None = None
         self._aiohttp_kwargs = aiohttp_kwargs
-        self._platform_keys: dict[KemId, bytes] | None = None
+        self._release_encrypted = release_encrypted
 
-        # Maps responses to their sender contexts for SSE decryption (thread-safe for concurrent requests)
+        # Maps responses to their sender contexts for SSE decryption
         self._response_contexts: weakref.WeakKeyDictionary[aiohttp.ClientResponse, SenderContext] = (
             weakref.WeakKeyDictionary()
         )
-
-    @classmethod
-    def _get_cache_lock(cls) -> asyncio.Lock:
-        """Get or create cache lock (lazy initialization for event loop safety)."""
-        if cls._cache_lock is None:
-            cls._cache_lock = asyncio.Lock()
-        return cls._cache_lock
 
     async def __aenter__(self) -> Self:
         """Async context manager entry."""
@@ -310,98 +298,43 @@ class HPKEClientSession:
 
     async def __aexit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: types.TracebackType | None,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: types.TracebackType | None,
     ) -> None:
         """Async context manager exit."""
         if self._session:
             await self._session.close()
             self._session = None
 
-    async def _ensure_keys(self) -> dict[KemId, bytes]:
-        """
-        Fetch and cache platform public keys.
+    async def _fetch_discovery(self) -> tuple[dict[str, Any], str]:
+        """Fetch discovery endpoint using aiohttp.
 
         Returns:
-            Dict mapping KemId to public key bytes
+            Tuple of (response JSON dict, Cache-Control header value)
         """
-        if self._platform_keys:
-            return self._platform_keys
+        if not self._session:
+            raise RuntimeError("Session not initialized. Use 'async with' context manager.")
 
-        host = urlparse(self.base_url).netloc
-        lock = self._get_cache_lock()
+        try:
+            async with self._session.get(self.discovery_url) as resp:
+                if resp.status != HTTPStatus.OK:
+                    raise KeyDiscoveryError(f"Discovery endpoint returned {resp.status}")
 
-        async with lock:
-            # Check cache
-            if host in self._key_cache:
-                keys, expires_at = self._key_cache[host]
-                if time.time() < expires_at:
-                    _logger.debug("Key cache hit: host=%s", host)
-                    self._platform_keys = keys
-                    return self._platform_keys
+                data = await resp.json()
+                cache_control = resp.headers.get("Cache-Control", "")
+                return (data, cache_control)
 
-            _logger.debug("Key cache miss: host=%s fetching from %s", host, self.discovery_url)
-            # Fetch from discovery endpoint
-            if not self._session:
-                raise RuntimeError("Session not initialized. Use 'async with' context manager.")
-
-            try:
-                async with self._session.get(self.discovery_url) as resp:
-                    if resp.status != HTTPStatus.OK:
-                        raise KeyDiscoveryError(f"Discovery endpoint returned {resp.status}")
-
-                    data = await resp.json()
-
-                    # Parse Cache-Control for TTL
-                    cache_control = resp.headers.get("Cache-Control", "")
-                    max_age = self._parse_max_age(cache_control)
-                    expires_at = time.time() + max_age
-
-                    # Parse keys
-                    keys = self._parse_keys(data)
-
-                    # Cache
-                    self._key_cache[host] = (keys, expires_at)
-                    self._platform_keys = keys
-                    _logger.debug(
-                        "Keys fetched: host=%s kem_ids=%s ttl=%ds",
-                        host,
-                        [f"0x{k:04x}" for k in keys],
-                        max_age,
-                    )
-                    return self._platform_keys
-
-            except aiohttp.ClientError as e:
-                _logger.debug("Key discovery failed: host=%s error=%s", host, e)
-                raise KeyDiscoveryError(f"Failed to fetch keys: {e}") from e
-
-    def _parse_max_age(self, cache_control: str) -> int:
-        """Parse max-age from Cache-Control header."""
-        for directive in cache_control.split(","):
-            directive_stripped = directive.strip()
-            if directive_stripped.startswith("max-age="):
-                try:
-                    return int(directive_stripped[8:])
-                except ValueError:
-                    pass
-        return DISCOVERY_CACHE_MAX_AGE
-
-    def _parse_keys(self, response: dict[str, Any]) -> dict[KemId, bytes]:
-        """Parse keys from discovery response."""
-        result: dict[KemId, bytes] = {}
-        for key_info in response.get("keys", []):
-            kem_id = KemId(int(key_info["kem_id"], 16))
-            public_key = bytes(b64url_decode(key_info["public_key"]))
-            result[kem_id] = public_key
-        return result
+        except aiohttp.ClientError as e:
+            _logger.debug("Key discovery failed: host=%s error=%s", self.base_url, e)
+            raise KeyDiscoveryError(f"Failed to fetch keys: {e}") from e
 
     async def _encrypt_request(
         self,
         body: bytes,
     ) -> tuple[AsyncIterator[bytes], dict[str, str], SenderContext]:
         """
-        Encrypt request body using RequestEncryptor with streaming.
+        Encrypt request body using base class encryption with async wrapper.
 
         Returns an async generator for memory-efficient chunked upload.
         Uses HTTP chunked transfer encoding (Transfer-Encoding: chunked).
@@ -411,33 +344,12 @@ class HPKEClientSession:
         """
         keys = await self._ensure_keys()
 
-        # Use X25519 (default suite)
-        pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
-        if not pk_r:
-            raise KeyDiscoveryError("No X25519 key available from platform")
+        # Use base class sync encryption
+        sync_iter, headers, ctx = self._encrypt_request_sync(body, keys)
 
-        # Use centralized RequestEncryptor - handles compression, chunking, encryption
-        encryptor = RequestEncryptor(
-            public_key=pk_r,
-            psk=self.psk,
-            psk_id=self.psk_id,
-            compress=self.compress,
-        )
-
-        # Prime the generator to trigger compression BEFORE get_headers()
-        # Generator code doesn't execute until iteration starts, so we must
-        # consume at least the first chunk to set _was_compressed flag
-        chunk_iter = encryptor.encrypt_iter(body)
-        first_chunk = next(chunk_iter)
-
-        # Now compression has happened and _was_compressed is set
-        headers = encryptor.get_headers()
-
-        # Create async generator for streaming upload
-        # Memory: O(chunk_size) instead of O(body_size)
-        async def stream_chunks() -> AsyncIterator[bytes]:
-            yield first_chunk  # Return the primed first chunk
-            for chunk in chunk_iter:  # Then yield remaining chunks
+        # Wrap sync iterator in async generator for aiohttp
+        async def async_stream() -> AsyncIterator[bytes]:
+            for chunk in sync_iter:
                 yield chunk
 
         _logger.debug(
@@ -445,7 +357,7 @@ class HPKEClientSession:
             len(body),
         )
 
-        return (stream_chunks(), headers, encryptor.context)
+        return (async_stream(), headers, ctx)
 
     async def request(
         self,
@@ -514,7 +426,11 @@ class HPKEClientSession:
                 content_type = response.headers.get("Content-Type", "")
                 if "text/event-stream" not in content_type:
                     _logger.debug("Encrypted response detected: url=%s", url)
-                    return DecryptedResponse(response, sender_ctx)
+                    return DecryptedResponse(
+                        response,
+                        sender_ctx,
+                        release_encrypted=self._release_encrypted,
+                    )
             elif self.require_encryption:
                 # We sent encrypted request but got plaintext response
                 raise EncryptionRequiredError("Response was not encrypted")
@@ -588,7 +504,7 @@ class HPKEClientSession:
             for line in line_parser.feed(chunk):
                 if not line:
                     # Empty line = event boundary (WHATWG spec)
-                    data_value = _extract_sse_data(current_event_lines)
+                    data_value = extract_sse_data(current_event_lines)
                     if data_value:
                         raw_chunk = decryptor.decrypt(data_value)
                         yield raw_chunk

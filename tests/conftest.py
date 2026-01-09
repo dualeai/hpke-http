@@ -13,7 +13,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import IO
+from typing import IO, Any
 
 import aiohttp
 import pytest
@@ -435,6 +435,90 @@ async def granian_server_compressed(
             sys.stdout.write(logs)
             sys.stdout.write(f"\n{'=' * 60}\n\n")
             sys.stdout.flush()
+
+
+# === HPKE Client Fixtures (Separate) ===
+
+
+# --- aiohttp fixtures ---
+
+
+@pytest_asyncio.fixture
+async def aiohttp_client(
+    granian_server: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """aiohttp HPKEClientSession connected to test server."""
+    from hpke_http.middleware.aiohttp import HPKEClientSession
+
+    base_url = f"http://{granian_server.host}:{granian_server.port}"
+    async with HPKEClientSession(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def aiohttp_client_compressed(
+    granian_server_compressed: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """aiohttp HPKEClientSession with compression enabled."""
+    from hpke_http.middleware.aiohttp import HPKEClientSession
+
+    base_url = f"http://{granian_server_compressed.host}:{granian_server_compressed.port}"
+    async with HPKEClientSession(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        compress=True,
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def aiohttp_client_no_compress_server_compress(
+    granian_server_compressed: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """aiohttp client without compression, server with compression."""
+    from hpke_http.middleware.aiohttp import HPKEClientSession
+
+    base_url = f"http://{granian_server_compressed.host}:{granian_server_compressed.port}"
+    async with HPKEClientSession(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        compress=False,
+    ) as client:
+        yield client
+
+
+# --- release_encrypted fixtures ---
+
+
+@pytest_asyncio.fixture
+async def aiohttp_client_release_encrypted(
+    granian_server: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """aiohttp HPKEClientSession with release_encrypted=True."""
+    from hpke_http.middleware.aiohttp import HPKEClientSession
+
+    base_url = f"http://{granian_server.host}:{granian_server.port}"
+    async with HPKEClientSession(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        release_encrypted=True,
+    ) as client:
+        yield client
 
 
 # === Network Traffic Capture ===
