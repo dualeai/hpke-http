@@ -55,6 +55,16 @@ def chi_square_byte_uniformity(data: bytes) -> tuple[float, float]:
     return float(chi2_result.statistic), float(chi2_result.pvalue)  # type: ignore[reportUnknownMemberType]
 
 
+# Chi-square test parameters for uniformity tests
+# Even truly random data fails chi-square at rate = threshold (by definition).
+# With p > 0.01, expect ~1% false positives per trial. Running multiple trials
+# and allowing few failures reduces flakiness.
+# This catches real bugs (which fail most/all trials) while tolerating rare statistical outliers.
+CHI_SQUARE_TRIALS: int = 10
+CHI_SQUARE_MIN_PASS: int = 8
+CHI_SQUARE_P_THRESHOLD: float = 0.01
+
+
 # === Key Fixtures ===
 
 

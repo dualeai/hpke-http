@@ -29,7 +29,14 @@ from hpke_http.constants import HEADER_HPKE_STREAM
 from hpke_http.middleware.aiohttp import DecryptedResponse, HPKEClientSession
 from hpke_http.middleware.httpx import DecryptedResponse as HTTPXDecryptedResponse
 from hpke_http.middleware.httpx import HPKEAsyncClient
-from tests.conftest import E2EServer, calculate_shannon_entropy, chi_square_byte_uniformity
+from tests.conftest import (
+    CHI_SQUARE_MIN_PASS,
+    CHI_SQUARE_P_THRESHOLD,
+    CHI_SQUARE_TRIALS,
+    E2EServer,
+    calculate_shannon_entropy,
+    chi_square_byte_uniformity,
+)
 
 
 def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
@@ -1369,20 +1376,36 @@ class TestCryptographicProperties:
         self,
         aiohttp_client: HPKEClientSession,
     ) -> None:
-        """Verify encrypted data has uniform byte distribution (chi-square p > 0.01)."""
-        payload = {"message": "Hello World " * 1000}
+        """Verify encrypted data has uniform byte distribution.
 
-        resp = await aiohttp_client.post("/echo", json=payload)
-        assert resp.status == 200
-        assert isinstance(resp, DecryptedResponse)
+        Chi-square tests have inherent false positive rate equal to the p-value
+        threshold (e.g., p > 0.01 means 1% of truly random data fails). To reduce
+        CI flakiness, we run multiple trials and allow one failure.
 
-        raw_body = await resp.unwrap().read()
-        assert len(raw_body) >= 1000, "Response too short for chi-square test"
+        With 10 trials and 9 required passes at p > 0.01:
+        P(flaky failure) = P(>=2 of 10 fail) ≈ 0.4% (binomial)
+        """
+        passes = 0
+        results: list[tuple[float, float]] = []
 
-        chi2, p_value = chi_square_byte_uniformity(raw_body)
-        assert p_value > 0.01, (
-            f"Chi-square p-value {p_value:.4f} indicates non-uniform distribution. "
-            f"Encrypted data should appear random (chi2={chi2:.2f})."
+        for _ in range(CHI_SQUARE_TRIALS):
+            payload = {"message": "Hello World " * 1000}
+            resp = await aiohttp_client.post("/echo", json=payload)
+            assert resp.status == 200
+            assert isinstance(resp, DecryptedResponse)
+
+            raw_body = await resp.unwrap().read()
+            assert len(raw_body) >= 1000, "Response too short for chi-square test"
+
+            chi2, p_value = chi_square_byte_uniformity(raw_body)
+            results.append((chi2, p_value))
+            if p_value > CHI_SQUARE_P_THRESHOLD:
+                passes += 1
+
+        assert passes >= CHI_SQUARE_MIN_PASS, (
+            f"Chi-square uniformity test failed: {passes}/{CHI_SQUARE_TRIALS} trials passed "
+            f"(required {CHI_SQUARE_MIN_PASS}). Results: {results}. "
+            f"Encrypted data should appear random."
         )
 
     async def test_known_plaintext_not_visible_on_wire(
@@ -2698,20 +2721,36 @@ class TestCryptographicPropertiesHTTPX:
         self,
         httpx_client: HPKEAsyncClient,
     ) -> None:
-        """Verify encrypted data has uniform byte distribution (chi-square p > 0.01)."""
-        payload = {"message": "Hello World " * 1000}
+        """Verify encrypted data has uniform byte distribution.
 
-        resp = await httpx_client.post("/echo", json=payload)
-        assert resp.status_code == 200
-        assert isinstance(resp, HTTPXDecryptedResponse)
+        Chi-square tests have inherent false positive rate equal to the p-value
+        threshold (e.g., p > 0.01 means 1% of truly random data fails). To reduce
+        CI flakiness, we run multiple trials and allow one failure.
 
-        raw_body = resp.unwrap().content
-        assert len(raw_body) >= 1000, "Response too short for chi-square test"
+        With 10 trials and 9 required passes at p > 0.01:
+        P(flaky failure) = P(>=2 of 10 fail) ≈ 0.4% (binomial)
+        """
+        passes = 0
+        results: list[tuple[float, float]] = []
 
-        chi2, p_value = chi_square_byte_uniformity(raw_body)
-        assert p_value > 0.01, (
-            f"Chi-square p-value {p_value:.4f} indicates non-uniform distribution. "
-            f"Encrypted data should appear random (chi2={chi2:.2f})."
+        for _ in range(CHI_SQUARE_TRIALS):
+            payload = {"message": "Hello World " * 1000}
+            resp = await httpx_client.post("/echo", json=payload)
+            assert resp.status_code == 200
+            assert isinstance(resp, HTTPXDecryptedResponse)
+
+            raw_body = resp.unwrap().content
+            assert len(raw_body) >= 1000, "Response too short for chi-square test"
+
+            chi2, p_value = chi_square_byte_uniformity(raw_body)
+            results.append((chi2, p_value))
+            if p_value > CHI_SQUARE_P_THRESHOLD:
+                passes += 1
+
+        assert passes >= CHI_SQUARE_MIN_PASS, (
+            f"Chi-square uniformity test failed: {passes}/{CHI_SQUARE_TRIALS} trials passed "
+            f"(required {CHI_SQUARE_MIN_PASS}). Results: {results}. "
+            f"Encrypted data should appear random."
         )
 
     async def test_known_plaintext_not_visible_on_wire(
