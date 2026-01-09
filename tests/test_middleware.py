@@ -12,12 +12,16 @@ Uses granian (Rust ASGI server) started as subprocess.
 Fixtures are shared via conftest.py.
 """
 
+import asyncio
+import gc
 import json
 import re
 import time
+import warnings
 from typing import Any
 
 import aiohttp
+import httpx
 import pytest
 from typing_extensions import assert_type
 
@@ -56,6 +60,13 @@ def parse_sse_chunk(chunk: bytes) -> tuple[str | None, dict[str, Any] | None]:
                     data = {"raw": value}
 
     return (event_type, data)
+
+
+def _is_connection_leak(warning: warnings.WarningMessage) -> bool:
+    """Check if warning is a connection/socket leak (not file IO from test infra)."""
+    msg = str(warning.message).lower()
+    # Connection-related keywords
+    return any(kw in msg for kw in ("socket", "transport", "connection", "ssl", "tcp"))
 
 
 # === Tests ===
@@ -1907,6 +1918,225 @@ class TestActiveAttackResistance:
 
 
 # =============================================================================
+# AIOHTTP CONNECTION LEAK TESTS
+# =============================================================================
+
+
+class TestAiohttpConnectionLeaks:
+    """Verify aiohttp connections are properly released."""
+
+    async def test_no_resource_warning_normal_request(
+        self,
+        aiohttp_client: Any,
+    ) -> None:
+        """Normal request emits no connection ResourceWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", ResourceWarning)
+
+            await aiohttp_client.post("/echo", json={"test": 1})
+
+            gc.collect()
+            gc.collect()
+
+            # Filter to connection leaks only
+            leaks = [x for x in w if issubclass(x.category, ResourceWarning) and _is_connection_leak(x)]
+            assert not leaks, f"Connection leak: {leaks[0].message}"
+
+    async def test_no_resource_warning_sse_early_break(
+        self,
+        aiohttp_client: Any,
+    ) -> None:
+        """SSE with early break emits no connection ResourceWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", ResourceWarning)
+
+            resp = await aiohttp_client.post("/stream", json={"start": True})
+            async for _ in aiohttp_client.iter_sse(resp):
+                break
+
+            gc.collect()
+            gc.collect()
+
+            # Filter to connection leaks only
+            leaks = [x for x in w if issubclass(x.category, ResourceWarning) and _is_connection_leak(x)]
+            assert not leaks, f"Connection leak: {leaks[0].message}"
+
+    async def test_multiple_sse_streams_sequential(
+        self,
+        aiohttp_client: Any,
+    ) -> None:
+        """Multiple SSE streams don't leak."""
+        for i in range(5):
+            resp = await aiohttp_client.post("/stream", json={"i": i})
+            count = 0
+            async for _ in aiohttp_client.iter_sse(resp):
+                count += 1
+                if count >= 2:
+                    break
+
+        # If leaking, pool would be exhausted
+        resp = await aiohttp_client.post("/echo", json={"final": True})
+        assert resp.status == 200
+
+    async def test_post_releases_connection(self, aiohttp_client: Any) -> None:
+        """POST /echo releases connection."""
+        connector = aiohttp_client._session.connector
+
+        resp = await aiohttp_client.post("/echo", json={"test": "leak"})
+        assert resp.status == 200
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0
+
+    async def test_sequential_requests(self, aiohttp_client: Any) -> None:
+        """10 sequential requests don't leak."""
+        connector = aiohttp_client._session.connector
+
+        for i in range(10):
+            resp = await aiohttp_client.post("/echo", json={"seq": i})
+            assert resp.status == 200
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0
+
+    async def test_concurrent_requests(self, aiohttp_client: Any) -> None:
+        """5 concurrent requests don't leak."""
+        connector = aiohttp_client._session.connector
+
+        async def req(n: int) -> None:
+            resp = await aiohttp_client.post("/echo", json={"n": n})
+            assert resp.status == 200
+
+        await asyncio.gather(*[req(i) for i in range(5)])
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0
+
+    async def test_sse_stream_releases(self, aiohttp_client: Any) -> None:
+        """SSE stream releases connection after consumption."""
+        connector = aiohttp_client._session.connector
+
+        resp = await aiohttp_client.post("/stream", json={"start": True})
+        assert resp.status == 200
+
+        event_count = 0
+        async for _chunk in aiohttp_client.iter_sse(resp):
+            event_count += 1
+
+        assert event_count >= 1
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0
+
+    async def test_sse_many_events(self, aiohttp_client: Any) -> None:
+        """50-event SSE doesn't leak."""
+        connector = aiohttp_client._session.connector
+
+        resp = await aiohttp_client.post("/stream-many", json={"start": True})
+        assert resp.status == 200
+
+        count = 0
+        async for _chunk in aiohttp_client.iter_sse(resp):
+            count += 1
+
+        assert count >= 50
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0
+
+    async def test_sse_cancelled_early(self, aiohttp_client: Any) -> None:
+        """Early SSE cancellation releases connection."""
+        connector = aiohttp_client._session.connector
+
+        resp = await aiohttp_client.post("/stream-many", json={"start": True})
+        assert resp.status == 200
+
+        count = 0
+        async for _chunk in aiohttp_client.iter_sse(resp):
+            count += 1
+            if count >= 5:
+                break
+
+        await asyncio.sleep(0.05)
+        assert len(connector._acquired) == 0
+
+
+class TestAiohttpConnectionLeaksCompressed:
+    """Connection leak tests with compression enabled."""
+
+    async def test_compressed_post(self, aiohttp_client_compressed: Any) -> None:
+        """Compressed POST releases connection."""
+        connector = aiohttp_client_compressed._session.connector
+
+        resp = await aiohttp_client_compressed.post("/echo", json={"compressed": True})
+        assert resp.status == 200
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0
+
+    async def test_compressed_sse(self, aiohttp_client_compressed: Any) -> None:
+        """Compressed SSE releases connection."""
+        connector = aiohttp_client_compressed._session.connector
+
+        resp = await aiohttp_client_compressed.post("/stream", json={"start": True})
+        assert resp.status == 200
+
+        async for _chunk in aiohttp_client_compressed.iter_sse(resp):
+            pass
+
+        await asyncio.sleep(0.01)
+        assert len(connector._acquired) == 0
+
+
+class TestAiohttpPoolExhaustion:
+    """Tests requiring small connection pool to detect leaks."""
+
+    async def test_sequential_requests_no_exhaustion(
+        self,
+        aiohttp_client_small_pool: Any,
+    ) -> None:
+        """Sequential requests don't exhaust pool of 2."""
+        for i in range(10):
+            resp = await aiohttp_client_small_pool.post("/echo", json={"i": i})
+            assert resp.status == 200
+
+    async def test_concurrent_requests_no_exhaustion(
+        self,
+        aiohttp_client_small_pool: Any,
+    ) -> None:
+        """Concurrent requests complete without pool timeout."""
+
+        async def make_request(i: int) -> int:
+            resp = await aiohttp_client_small_pool.post("/echo", json={"i": i})
+            return resp.status
+
+        # 3 batches, pool of 2 - must release connections
+        for _ in range(3):
+            results = await asyncio.gather(*[make_request(i) for i in range(2)])
+            assert all(r == 200 for r in results)
+
+    async def test_sse_cancellation_releases_connection(
+        self,
+        aiohttp_client_small_pool: Any,
+    ) -> None:
+        """Cancelled SSE releases connection to pool."""
+
+        async def consume_sse() -> None:
+            resp = await aiohttp_client_small_pool.post("/stream", json={"start": True})
+            async for _ in aiohttp_client_small_pool.iter_sse(resp):
+                await asyncio.sleep(1)
+
+        task = asyncio.create_task(consume_sse())
+        await asyncio.sleep(0.1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Pool of 2 - if leaked, this times out
+        resp = await aiohttp_client_small_pool.post("/echo", json={"after": True})
+        assert resp.status == 200
+
+
+# =============================================================================
 # HTTPX Client Tests
 # =============================================================================
 # Fixtures are defined in conftest.py: httpx_client, httpx_client_compressed
@@ -2112,8 +2342,6 @@ class TestDecryptedResponseHTTPXCompat:
 
     async def test_unwrap_returns_httpx_response(self, httpx_client: HPKEAsyncClient) -> None:
         """unwrap() returns the underlying httpx.Response."""
-        import httpx
-
         resp = await httpx_client.post("/echo", json={"test": 1})
         assert isinstance(resp, HTTPXDecryptedResponse)
         unwrapped = resp.unwrap()
@@ -2344,8 +2572,6 @@ class TestEncryptionStateValidationHTTPX:
         granian_server: E2EServer,
     ) -> None:
         """Verify X-HPKE-Stream header presence matches actual encryption."""
-        import httpx
-
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         # Case 1: Encrypted request → should get encrypted response with header
@@ -2828,3 +3054,138 @@ class TestNetworkLevelVerificationHTTPX:
 
         # Note: Server's static public key IS visible in /.well-known/hpke-keys response
         # (that's expected - it's public). We only check private key doesn't leak.
+
+
+class TestHttpxConnectionLeaks:
+    """Verify httpx connections are properly released.
+
+    Mirrors TestAiohttpConnectionLeaks for consistency.
+    Uses pool exhaustion detection since httpx doesn't expose internal pool state.
+    """
+
+    async def test_post_releases_connection(
+        self,
+        httpx_client_small_pool: HPKEAsyncClient,
+    ) -> None:
+        """POST /echo releases connection."""
+        resp = await httpx_client_small_pool.post("/echo", json={"test": "leak"})
+        assert resp.status_code == 200
+
+        # If connection leaked, this would timeout (pool of 2)
+        resp = await httpx_client_small_pool.post("/echo", json={"verify": True})
+        assert resp.status_code == 200
+
+    async def test_sequential_requests(
+        self,
+        httpx_client_small_pool: HPKEAsyncClient,
+    ) -> None:
+        """10 sequential requests don't leak."""
+        for i in range(10):
+            resp = await httpx_client_small_pool.post("/echo", json={"seq": i})
+            assert resp.status_code == 200
+
+    async def test_concurrent_requests(
+        self,
+        httpx_client_small_pool: HPKEAsyncClient,
+    ) -> None:
+        """5 concurrent requests don't leak."""
+
+        async def req(n: int) -> int:
+            resp = await httpx_client_small_pool.post("/echo", json={"n": n})
+            return resp.status_code
+
+        results = await asyncio.gather(*[req(i) for i in range(5)])
+        assert all(r == 200 for r in results)
+
+        # Verify pool still works
+        resp = await httpx_client_small_pool.post("/echo", json={"after": True})
+        assert resp.status_code == 200
+
+    async def test_sse_stream_releases(
+        self,
+        httpx_client_small_pool: HPKEAsyncClient,
+    ) -> None:
+        """SSE stream releases connection after full consumption."""
+        resp = await httpx_client_small_pool.post("/stream", json={"start": True})
+        assert resp.status_code == 200
+
+        event_count = 0
+        async for _chunk in httpx_client_small_pool.iter_sse(resp):
+            event_count += 1
+
+        assert event_count >= 1
+
+        # If connection leaked, this would timeout
+        resp = await httpx_client_small_pool.post("/echo", json={"after_sse": True})
+        assert resp.status_code == 200
+
+    async def test_sse_many_events(
+        self,
+        httpx_client_small_pool: HPKEAsyncClient,
+    ) -> None:
+        """50-event SSE doesn't leak."""
+        resp = await httpx_client_small_pool.post("/stream-many", json={"start": True})
+        assert resp.status_code == 200
+
+        count = 0
+        async for _chunk in httpx_client_small_pool.iter_sse(resp):
+            count += 1
+
+        assert count >= 50
+
+        # If connection leaked, this would timeout
+        resp = await httpx_client_small_pool.post("/echo", json={"after_many": True})
+        assert resp.status_code == 200
+
+    async def test_sse_cancelled_early(
+        self,
+        httpx_client_small_pool: HPKEAsyncClient,
+    ) -> None:
+        """Early SSE cancellation releases connection."""
+        resp = await httpx_client_small_pool.post("/stream-many", json={"start": True})
+        assert resp.status_code == 200
+
+        count = 0
+        async for _chunk in httpx_client_small_pool.iter_sse(resp):
+            count += 1
+            if count >= 5:
+                break
+
+        # If connection leaked, this would timeout
+        await asyncio.sleep(0.05)
+        resp = await httpx_client_small_pool.post("/echo", json={"after_cancel": True})
+        assert resp.status_code == 200
+
+
+class TestHttpxConnectionLeaksCompressed:
+    """Connection leak tests with compression enabled.
+
+    Mirrors TestAiohttpConnectionLeaksCompressed for consistency.
+    """
+
+    async def test_compressed_post(
+        self,
+        httpx_client_compressed: HPKEAsyncClient,
+    ) -> None:
+        """Compressed POST releases connection."""
+        resp = await httpx_client_compressed.post("/echo", json={"compressed": True})
+        assert resp.status_code == 200
+
+        # Verify connection released
+        resp = await httpx_client_compressed.post("/echo", json={"verify": True})
+        assert resp.status_code == 200
+
+    async def test_compressed_sse(
+        self,
+        httpx_client_compressed: HPKEAsyncClient,
+    ) -> None:
+        """Compressed SSE releases connection."""
+        resp = await httpx_client_compressed.post("/stream", json={"start": True})
+        assert resp.status_code == 200
+
+        async for _chunk in httpx_client_compressed.iter_sse(resp):
+            pass
+
+        # Verify connection released
+        resp = await httpx_client_compressed.post("/echo", json={"after_sse": True})
+        assert resp.status_code == 200

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import IO, Any
 
 import aiohttp
+import httpx
 import pytest
 import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -481,6 +482,27 @@ async def aiohttp_client_compressed(
 
 
 @pytest_asyncio.fixture
+async def aiohttp_client_small_pool(
+    granian_server: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """aiohttp HPKEClientSession with small pool to detect leaks."""
+    from hpke_http.middleware.aiohttp import HPKEClientSession
+
+    base_url = f"http://{granian_server.host}:{granian_server.port}"
+    connector = aiohttp.TCPConnector(limit=2)
+    async with HPKEClientSession(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=5.0),
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
 async def aiohttp_client_no_compress_server_compress(
     granian_server_compressed: E2EServer,
     test_psk: bytes,
@@ -595,6 +617,29 @@ async def httpx_client_release_encrypted(
         psk=test_psk,
         psk_id=test_psk_id,
         release_encrypted=True,
+    ) as client:
+        yield client
+
+
+# --- connection leak testing fixtures ---
+
+
+@pytest_asyncio.fixture
+async def httpx_client_small_pool(
+    granian_server: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """httpx HPKEAsyncClient with small pool to detect leaks."""
+    from hpke_http.middleware.httpx import HPKEAsyncClient
+
+    base_url = f"http://{granian_server.host}:{granian_server.port}"
+    async with HPKEAsyncClient(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        limits=httpx.Limits(max_connections=2),
+        timeout=httpx.Timeout(5.0),
     ) as client:
         yield client
 
