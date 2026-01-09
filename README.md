@@ -76,6 +76,9 @@ async with HPKEClientSession(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
+    # compress=True,           # Zstd compression, reduces bandwidth 40-95%
+    # require_encryption=True, # Raise if server responds unencrypted
+    # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
 ) as session:
     # Standard JSON request - encryption is automatic
     async with session.post("/users", json={"name": "Alice"}) as resp:
@@ -97,6 +100,9 @@ async with HPKEAsyncClient(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
+    # compress=True,           # Zstd compression, reduces bandwidth 40-95%
+    # require_encryption=True, # Raise if server responds unencrypted
+    # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
 ) as client:
     # Standard JSON request - encryption is automatic
     resp = await client.post("/users", json={"name": "Alice"})
