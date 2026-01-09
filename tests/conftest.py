@@ -452,7 +452,7 @@ async def granian_server_no_zstd(
     """Start granian server with HPKE middleware and zstd disabled.
 
     Function-scoped: each test gets its own server with isolated logs.
-    Used for testing 415 rejection when client sends compressed requests.
+    Used for testing 415 rejection when client sends zstd-compressed requests.
     """
     async for server in _start_granian_server(platform_keypair, test_psk, test_psk_id, disable_zstd=True):
         yield server
@@ -462,6 +462,34 @@ async def granian_server_no_zstd(
             test_name: str = request.node.name  # type: ignore[attr-defined]
             sys.stdout.write(f"\n{'=' * 60}\n")
             sys.stdout.write(f"Server logs for: {test_name} (no-zstd)\n")
+            sys.stdout.write(f"{'=' * 60}\n")
+            sys.stdout.write(logs)
+            sys.stdout.write(f"\n{'=' * 60}\n\n")
+            sys.stdout.flush()
+
+
+@pytest_asyncio.fixture
+async def granian_server_gzip_only(
+    platform_keypair: tuple[bytes, bytes],
+    test_psk: bytes,
+    test_psk_id: bytes,
+    request: pytest.FixtureRequest,
+) -> AsyncIterator[E2EServer]:
+    """Start granian server with compression enabled but zstd unavailable (gzip fallback).
+
+    Function-scoped: each test gets its own server with isolated logs.
+    Used for testing compression negotiation with gzip-only server.
+    """
+    async for server in _start_granian_server(
+        platform_keypair, test_psk, test_psk_id, compress=True, disable_zstd=True
+    ):
+        yield server
+        # Print server logs after test completes
+        logs = server.get_logs()
+        if logs.strip():
+            test_name: str = request.node.name  # type: ignore[attr-defined]
+            sys.stdout.write(f"\n{'=' * 60}\n")
+            sys.stdout.write(f"Server logs for: {test_name} (gzip-only)\n")
             sys.stdout.write(f"{'=' * 60}\n")
             sys.stdout.write(logs)
             sys.stdout.write(f"\n{'=' * 60}\n\n")
@@ -551,6 +579,25 @@ async def aiohttp_client_no_compress_server_compress(
         yield client
 
 
+@pytest_asyncio.fixture
+async def aiohttp_client_gzip_only(
+    granian_server_gzip_only: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """aiohttp client with compression to gzip-only server (no zstd)."""
+    from hpke_http.middleware.aiohttp import HPKEClientSession
+
+    base_url = f"http://{granian_server_gzip_only.host}:{granian_server_gzip_only.port}"
+    async with HPKEClientSession(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        compress=True,
+    ) as client:
+        yield client
+
+
 # --- httpx fixtures ---
 
 
@@ -606,6 +653,25 @@ async def httpx_client_no_compress_server_compress(
         psk=test_psk,
         psk_id=test_psk_id,
         compress=False,
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def httpx_client_gzip_only(
+    granian_server_gzip_only: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """httpx client with compression to gzip-only server (no zstd)."""
+    from hpke_http.middleware.httpx import HPKEAsyncClient
+
+    base_url = f"http://{granian_server_gzip_only.host}:{granian_server_gzip_only.port}"
+    async with HPKEAsyncClient(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        compress=True,
     ) as client:
         yield client
 

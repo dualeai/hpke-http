@@ -74,13 +74,14 @@ class TestDiscoveryAcceptEncoding:
         self,
         granian_server_no_zstd: E2EServer,
     ) -> None:
-        """Server without zstd advertises 'identity' only."""
+        """Server without zstd advertises 'identity, gzip' (gzip is stdlib fallback)."""
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"http://{granian_server_no_zstd.host}:{granian_server_no_zstd.port}/.well-known/hpke-keys"
             ) as resp:
                 assert resp.status == 200
-                assert resp.headers.get("Accept-Encoding") == "identity"
+                accept_encoding = resp.headers.get("Accept-Encoding")
+                assert accept_encoding == "identity, gzip"
 
 
 # =============================================================================
@@ -116,7 +117,8 @@ class TestUnsupportedEncodingRejection:
                 data=encrypted_body,
             ) as resp:
                 assert resp.status == 415
-                assert resp.headers.get("Accept-Encoding") == "identity"
+                # Server advertises gzip as fallback (stdlib, always available)
+                assert resp.headers.get("Accept-Encoding") == "identity, gzip"
                 body = await resp.json()
                 assert "error" in body
                 assert "zstd" in body["error"].lower()
@@ -192,9 +194,10 @@ class TestEncodingEdgeCases:
     @pytest.mark.parametrize(
         ("encoding", "expected_status"),
         [
-            ("zstd", 415),  # Only this one rejected
+            ("zstd", 415),  # Rejected - server lacks zstd
             ("ZSTD", 200),  # Case-sensitive, ignored
-            ("gzip", 200),  # Unknown, ignored
+            ("gzip", 400),  # Valid encoding, but body not compressed → decompression fails
+            ("GZIP", 200),  # Case-sensitive, ignored
             ("br", 200),  # Unknown, ignored
             ("deflate", 200),  # Unknown, ignored
         ],
@@ -336,10 +339,10 @@ class TestCompressionCompatibilityAiohttp:
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
-        """Server lacks zstd, client configured with compress=True auto-negotiates.
+        """Server lacks zstd, client configured with compress=True uses gzip fallback.
 
-        Client reads Accept-Encoding from discovery and auto-disables compression
-        when server lacks zstd support. Request succeeds with 200.
+        Client reads Accept-Encoding from discovery ('identity, gzip') and uses
+        gzip compression since zstd is unavailable. Server decompresses gzip request.
         """
         from hpke_http.middleware.aiohttp import HPKEClientSession
 
@@ -348,12 +351,12 @@ class TestCompressionCompatibilityAiohttp:
             base_url=base_url,
             psk=test_psk,
             psk_id=test_psk_id,
-            compress=True,  # Client wants compression, but will auto-negotiate
+            compress=True,  # Client uses gzip since server lacks zstd
         ) as client:
-            # Body would trigger compression if server supported zstd
+            # Body triggers gzip compression (server advertises 'identity, gzip')
             large_payload = {"data": "x" * 100}
             resp = await client.post("/echo", json=large_payload)
-            # Auto-negotiation: client detected server lacks zstd, sent uncompressed
+            # Auto-negotiation: client uses gzip, server decompresses
             assert resp.status == 200
             data = await resp.json()
             assert data["method"] == "POST"
@@ -431,10 +434,10 @@ class TestCompressionCompatibilityHttpx:
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
-        """Server lacks zstd, client configured with compress=True auto-negotiates.
+        """Server lacks zstd, client configured with compress=True uses gzip fallback.
 
-        Client reads Accept-Encoding from discovery and auto-disables compression
-        when server lacks zstd support. Request succeeds with 200.
+        Client reads Accept-Encoding from discovery ('identity, gzip') and uses
+        gzip compression since zstd is unavailable. Server decompresses gzip request.
         """
         from hpke_http.middleware.httpx import HPKEAsyncClient
 
@@ -443,12 +446,12 @@ class TestCompressionCompatibilityHttpx:
             base_url=base_url,
             psk=test_psk,
             psk_id=test_psk_id,
-            compress=True,  # Client wants compression, but will auto-negotiate
+            compress=True,  # Client uses gzip since server lacks zstd
         ) as client:
-            # Body would trigger compression if server supported zstd
+            # Body triggers gzip compression (server advertises 'identity, gzip')
             large_payload = {"data": "x" * 100}
             resp = await client.post("/echo", json=large_payload)
-            # Auto-negotiation: client detected server lacks zstd, sent uncompressed
+            # Auto-negotiation: client uses gzip, server decompresses
             assert resp.status_code == 200
             data = resp.json()
             assert data["method"] == "POST"
@@ -481,30 +484,40 @@ class TestCompressionCompatibilityHttpx:
 
 
 class TestServerConfigValidation:
-    """Server rejects invalid compression configuration at startup."""
+    """Server compression configuration validation."""
 
-    async def test_compress_true_without_zstd_raises(self) -> None:
-        """HPKEMiddleware(compress=True) raises ImportError if zstd unavailable."""
+    async def test_compress_true_without_zstd_uses_gzip_fallback(self) -> None:
+        """HPKEMiddleware(compress=True) uses gzip fallback when zstd unavailable."""
         from typing import Any
         from unittest.mock import patch
 
+        from cryptography.hazmat.primitives.asymmetric import x25519
+
+        from hpke_http.constants import KemId
         from hpke_http.middleware.fastapi import HPKEMiddleware
 
         async def mock_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
             pass
 
         async def mock_psk_resolver(scope: dict[str, Any]) -> tuple[bytes, bytes]:
-            return (b"", b"")
+            return (b"psk", b"psk_id")
+
+        # Generate a valid test keypair
+        private_key = x25519.X25519PrivateKey.generate()
+        sk = private_key.private_bytes_raw()
 
         # Mock _check_zstd_available to return False
         with patch.object(HPKEMiddleware, "_check_zstd_available", return_value=False):
-            with pytest.raises(ImportError, match="compress=True requires zstd"):
-                HPKEMiddleware(
-                    app=mock_app,
-                    private_keys={},
-                    psk_resolver=mock_psk_resolver,
-                    compress=True,
-                )
+            # Should NOT raise - gzip is used as fallback
+            middleware = HPKEMiddleware(
+                app=mock_app,
+                private_keys={KemId.DHKEM_X25519_HKDF_SHA256: sk},
+                psk_resolver=mock_psk_resolver,
+                compress=True,
+            )
+            # Verify middleware was created with compress enabled
+            assert middleware.compress is True
+            assert middleware._zstd_available is False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
     async def test_compress_false_without_zstd_works(self) -> None:
         """HPKEMiddleware(compress=False) works even if zstd unavailable."""

@@ -59,6 +59,7 @@ from hpke_http.constants import (
     RESPONSE_KEY_LABEL,
     SSE_SESSION_KEY_LABEL,
     ZSTD_MIN_SIZE,
+    EncodingName,
     KemId,
 )
 from hpke_http.exceptions import DecryptionError, EncryptionRequiredError, KeyDiscoveryError
@@ -75,6 +76,9 @@ from hpke_http.streaming import (
     SSEFormat,
     StreamingSession,
     create_session_from_context,
+    gzip_compress,
+    gzip_decompress,
+    import_zstd,
     zstd_compress,
     zstd_decompress,
 )
@@ -94,6 +98,15 @@ __all__ = [
     "parse_cache_max_age",
     "parse_discovery_keys",
 ]
+
+
+def _check_zstd_available() -> bool:
+    """Check if zstd is available."""
+    try:
+        import_zstd()
+        return True
+    except ImportError:
+        return False
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -546,7 +559,31 @@ class BaseHPKEClient(ABC):
         Returns True if 'zstd' is in the Accept-Encoding header from discovery.
         Must call _ensure_keys() first to populate _server_encodings.
         """
-        return "zstd" in self._server_encodings
+        return EncodingName.ZSTD in self._server_encodings
+
+    @property
+    def server_supports_gzip(self) -> bool:
+        """Check if server supports gzip encoding (from discovery).
+
+        Returns True if 'gzip' is in the Accept-Encoding header from discovery.
+        Must call _ensure_keys() first to populate _server_encodings.
+        """
+        return EncodingName.GZIP in self._server_encodings
+
+    def _get_best_encoding(self) -> EncodingName:
+        """Select best compression encoding based on server and client capabilities.
+
+        Priority: zstd > gzip > identity
+
+        Returns:
+            Encoding name enum value
+        """
+        if self.server_supports_zstd and _check_zstd_available():
+            return EncodingName.ZSTD
+        if self.server_supports_gzip:
+            # Gzip always available (stdlib)
+            return EncodingName.GZIP
+        return EncodingName.IDENTITY
 
     def _encrypt_request_sync(
         self,
@@ -572,9 +609,11 @@ class BaseHPKEClient(ABC):
         if not pk_r:
             raise KeyDiscoveryError("No X25519 key available from platform")
 
-        # Auto-negotiate compression: only compress if client wants it AND server supports it
+        # Auto-negotiate compression: use best available encoding
+        # Priority: zstd > gzip > identity
         # This prevents 415 errors when server lacks zstd support
-        effective_compress = self.compress and self.server_supports_zstd
+        best_encoding = self._get_best_encoding() if self.compress else EncodingName.IDENTITY
+        effective_compress = best_encoding != EncodingName.IDENTITY
 
         # Use centralized RequestEncryptor - handles compression, chunking, encryption
         encryptor = RequestEncryptor(
@@ -582,6 +621,7 @@ class BaseHPKEClient(ABC):
             psk=self.psk,
             psk_id=self.psk_id,
             compress=effective_compress,
+            zstd=(best_encoding == EncodingName.ZSTD),  # Use zstd only if negotiated
         )
 
         # Prime the generator to trigger compression BEFORE get_headers()
@@ -666,6 +706,7 @@ class RequestEncryptor:
         psk_id: bytes,
         *,
         compress: bool = False,
+        zstd: bool = True,
     ) -> None:
         """
         Initialize request encryptor.
@@ -674,10 +715,15 @@ class RequestEncryptor:
             public_key: Server's X25519 public key (32 bytes)
             psk: Pre-shared key / API key (>= 32 bytes)
             psk_id: PSK identifier (e.g., tenant ID)
-            compress: Enable Zstd compression for request body
+            compress: Enable compression for request body.
+            zstd: Allow zstd compression. If False, uses gzip.
+                Priority: zstd (if allowed and available) > gzip.
         """
         self._compress = compress
         self._was_compressed = False
+        self._encoding: EncodingName | None = None  # Actual encoding used
+        # Check zstd availability only if compression enabled and zstd allowed
+        self._zstd_available = _check_zstd_available() if (compress and zstd) else False
 
         # Set up HPKE context
         self._ctx = setup_sender_psk(pk_r=public_key, info=psk_id, psk=psk, psk_id=psk_id)
@@ -705,8 +751,8 @@ class RequestEncryptor:
             HEADER_HPKE_STREAM: _b64url_encode(self._session.session_salt),
         }
         # Signal whole-body compression via header (chunks have 0x00 encoding ID)
-        if self._was_compressed:
-            headers[HEADER_HPKE_ENCODING] = "zstd"
+        if self._was_compressed and self._encoding:
+            headers[HEADER_HPKE_ENCODING] = self._encoding
         return headers
 
     def encrypt(self, chunk: bytes) -> bytes:
@@ -750,8 +796,14 @@ class RequestEncryptor:
         """
         # Whole-body compression before chunking (better ratio than per-chunk).
         # Header X-HPKE-Encoding signals this since chunk encoding IDs are 0x00.
+        # Priority: zstd > gzip (automatic selection)
         if self._compress and len(body) >= ZSTD_MIN_SIZE:
-            body = zstd_compress(body)
+            if self._zstd_available:
+                body = zstd_compress(body)
+                self._encoding = EncodingName.ZSTD
+            else:
+                body = gzip_compress(body)
+                self._encoding = EncodingName.GZIP
             self._was_compressed = True
 
         # Handle empty body
@@ -1024,7 +1076,8 @@ class RequestDecryptor:
         # Header X-HPKE-Encoding signals compression, unlike responses/SSE where per-chunk
         # compression makes encoding ID self-describing.
         encoding_header = _get_header(headers, HEADER_HPKE_ENCODING)
-        self._is_compressed = encoding_header == "zstd"
+        self._is_compressed = encoding_header in (EncodingName.ZSTD, EncodingName.GZIP)
+        self._encoding = encoding_header if self._is_compressed else None
 
         # Set up HPKE context
         self._ctx = setup_recipient_psk(enc=enc, sk_r=private_key, info=psk_id, psk=psk, psk_id=psk_id)
@@ -1039,8 +1092,13 @@ class RequestDecryptor:
 
     @property
     def is_compressed(self) -> bool:
-        """Whether request body is compressed (X-HPKE-Encoding: zstd)."""
+        """Whether request body is compressed (X-HPKE-Encoding: zstd or gzip)."""
         return self._is_compressed
+
+    @property
+    def encoding(self) -> str | None:
+        """Get the compression encoding used ("zstd", "gzip", or None)."""
+        return self._encoding
 
     def decrypt(self, chunk: bytes) -> bytes:
         """
@@ -1127,10 +1185,16 @@ class RequestDecryptor:
         """
         plaintext = b"".join(self.decrypt_iter(body))
 
-        # Decompress whole body if X-HPKE-Encoding: zstd was set.
+        # Decompress whole body if X-HPKE-Encoding was set.
         # Chunks were compressed as a unit before chunking, not per-chunk.
         if self._is_compressed:
-            plaintext = zstd_decompress(plaintext)
+            match self._encoding:
+                case EncodingName.ZSTD:
+                    plaintext = zstd_decompress(plaintext)
+                case EncodingName.GZIP:
+                    plaintext = gzip_decompress(plaintext)
+                case _:
+                    pass  # Unknown encoding - skip decompression
 
         return plaintext
 

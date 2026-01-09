@@ -17,6 +17,7 @@ Reference: RFC-065 §6
 from __future__ import annotations
 
 import base64
+import gzip
 import io
 import secrets
 import struct
@@ -30,6 +31,10 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     CHACHA20_POLY1305_TAG_SIZE,
+    GZIP_COMPRESSION_LEVEL,
+    GZIP_MIN_SIZE,
+    GZIP_STREAMING_CHUNK_SIZE,
+    GZIP_STREAMING_THRESHOLD,
     RAW_LENGTH_PREFIX_SIZE,
     SSE_COUNTER_SIZE,
     SSE_MAX_COUNTER,
@@ -61,6 +66,7 @@ _SSE_COUNTER_STRUCT = struct.Struct(">I")
 # Pre-defined encoding prefixes for zero-allocation concat (5x faster than bytearray)
 _IDENTITY_PREFIX = bytes([SSEEncodingId.IDENTITY])  # b"\x00"
 _ZSTD_PREFIX = bytes([SSEEncodingId.ZSTD])  # b"\x01"
+_GZIP_PREFIX = bytes([SSEEncodingId.GZIP])  # b"\x02"
 
 
 def import_zstd() -> Any:
@@ -212,6 +218,149 @@ def zstd_decompress(
     return zstd.decompress(data)
 
 
+# =============================================================================
+# Gzip Compression (RFC 1952) - Stdlib fallback when zstd unavailable
+# =============================================================================
+#
+# Why gzip compressor cannot be reused like zstd:
+#
+# Zstd's FLUSH_BLOCK mode produces independently decompressible blocks while
+# maintaining the compression dictionary across blocks. This allows a single
+# ZstdCompressor instance to be reused for multiple chunks with good compression.
+#
+# Gzip/deflate has no equivalent:
+# - Z_SYNC_FLUSH: Flushes output but maintains dictionary (not independently
+#   decompressible - requires prior blocks for context)
+# - Z_FULL_FLUSH: Resets dictionary entirely (independently decompressible but
+#   loses all compression benefit from reuse)
+#
+# For SSE per-chunk compression, each chunk MUST be independently decompressible
+# so clients can decrypt and decompress chunks as they arrive. This requires
+# Z_FULL_FLUSH semantics, which resets the dictionary - meaning no benefit from
+# compressor reuse.
+#
+# Additionally, gzip format requires header (10B) + trailer (8B) per independent
+# block for CRC validation. There's no way to produce valid independent gzip
+# blocks without this 18-byte overhead per chunk.
+#
+# Performance impact is minimal:
+# - gzip.compress(): ~25µs per 10KB chunk
+# - Compressor creation overhead: ~5µs (negligible)
+# - Zstd with reuse: ~15µs per 10KB chunk (only ~10µs faster)
+#
+# Given gzip is a fallback for when zstd is unavailable (increasingly rare with
+# Python 3.14's native compression.zstd), the complexity of raw deflate with
+# custom framing isn't justified.
+#
+# References:
+# - https://www.bolet.org/~pornin/deflate-flush.html (Zlib flush modes)
+# - https://docs.python.org/3/library/compression.zstd.html (Python 3.14 zstd)
+# - RFC 1952 (gzip format specification)
+# =============================================================================
+
+
+def _gzip_compress_streaming(
+    data: bytes,
+    level: int,
+    chunk_size: int,
+) -> bytes:
+    """Internal: streaming compression with GzipFile."""
+    output = io.BytesIO()
+
+    with gzip.GzipFile(fileobj=output, mode="wb", compresslevel=level, mtime=0) as f:
+        for offset in range(0, len(data), chunk_size):
+            f.write(data[offset : offset + chunk_size])
+
+    return output.getvalue()
+
+
+def _gzip_decompress_streaming(
+    data: bytes,
+    chunk_size: int,
+) -> bytes:
+    """Internal: streaming decompression with GzipFile.
+
+    Uses BytesIO for output instead of list+join. Same RAM/CPU tradeoff
+    as zstd streaming: reduces peak memory from ~2x to ~1.3x decompressed size.
+    """
+    input_buffer = io.BytesIO(data)
+    output_buffer = io.BytesIO()
+
+    with gzip.GzipFile(fileobj=input_buffer, mode="rb") as f:
+        while chunk := f.read(chunk_size):
+            output_buffer.write(chunk)
+
+    return output_buffer.getvalue()
+
+
+def gzip_compress(
+    data: bytes,
+    level: int = GZIP_COMPRESSION_LEVEL,
+    streaming_threshold: int = GZIP_STREAMING_THRESHOLD,
+) -> bytes:
+    """
+    Compress data with gzip, auto-selecting streaming for large payloads.
+
+    For payloads >= streaming_threshold (default 1MB), uses streaming
+    compression with bounded memory. Smaller payloads use faster in-memory.
+
+    Uses gzip module (not zlib) for proper gzip format with headers.
+    mtime=0 for reproducible output across Python versions.
+
+    Args:
+        data: Raw bytes to compress
+        level: Compression level (0-9, default 6 = balanced)
+        streaming_threshold: Size threshold for streaming mode (default 1MB)
+
+    Returns:
+        Compressed bytes in gzip format (RFC 1952)
+
+    Example:
+        >>> compressed = gzip_compress(large_json_bytes)
+        >>> # Auto-selects streaming for payloads >= 1MB
+    """
+    if not data:
+        return b""
+
+    if len(data) >= streaming_threshold:
+        return _gzip_compress_streaming(data, level, GZIP_STREAMING_CHUNK_SIZE)
+
+    return gzip.compress(data, compresslevel=level, mtime=0)
+
+
+def gzip_decompress(
+    data: bytes,
+    streaming_threshold: int = GZIP_STREAMING_THRESHOLD,
+) -> bytes:
+    """
+    Decompress gzip data, auto-selecting streaming for large payloads.
+
+    For compressed payloads >= streaming_threshold (default 1MB), uses
+    streaming decompression with bounded memory.
+
+    Args:
+        data: Gzip-compressed bytes
+        streaming_threshold: Size threshold for streaming mode (default 1MB)
+
+    Returns:
+        Decompressed bytes
+
+    Raises:
+        OSError: If data is invalid or corrupted
+
+    Example:
+        >>> original = gzip_decompress(compressed_data)
+        >>> # Auto-selects streaming for large compressed payloads
+    """
+    if not data:
+        return b""
+
+    if len(data) >= streaming_threshold:
+        return _gzip_decompress_streaming(data, GZIP_STREAMING_CHUNK_SIZE)
+
+    return gzip.decompress(data)
+
+
 __all__ = [
     "ChunkDecryptor",
     "ChunkEncryptor",
@@ -220,6 +369,8 @@ __all__ = [
     "SSEFormat",
     "StreamingSession",
     "create_session_from_context",
+    "gzip_compress",
+    "gzip_decompress",
     "import_zstd",
     "zstd_compress",
     "zstd_decompress",
@@ -430,7 +581,8 @@ class ChunkEncryptor:
     - SSEFormat (default): SSE events with base64url payload
     - RawFormat: Binary length || counter || ciphertext
 
-    Optional compression (RFC 8878 Zstd) can be enabled via compress=True.
+    Optional compression can be enabled via compress=True.
+    Uses zstd if available, falls back to gzip (stdlib).
     Compressed chunks are prefixed with encoding ID for client detection.
     """
 
@@ -440,7 +592,7 @@ class ChunkEncryptor:
     counter: int = field(default=1)  # Start at 1 (0 reserved)
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
     _lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)
-    _compressor: Any = field(init=False, repr=False, default=None)  # Reused per session
+    _compressor: Any = field(init=False, repr=False, default=None)  # Reused zstd compressor
     _nonce_buf: bytearray = field(init=False, repr=False)  # Pre-allocated 12-byte nonce buffer
 
     def __post_init__(self) -> None:
@@ -450,8 +602,12 @@ class ChunkEncryptor:
         self._nonce_buf[:4] = self.session.session_salt
         # Bytes 4-7 remain zeros (default bytearray value)
         if self.compress:
-            zstd = import_zstd()
-            self._compressor = zstd.ZstdCompressor(level=ZSTD_COMPRESSION_LEVEL)
+            try:
+                zstd = import_zstd()
+                self._compressor = zstd.ZstdCompressor(level=ZSTD_COMPRESSION_LEVEL)
+            except ImportError:
+                # Zstd not available - gzip fallback used in encrypt()
+                pass
 
     def _compute_nonce(self, counter: int) -> memoryview:
         """
@@ -486,10 +642,17 @@ class ChunkEncryptor:
         # Could eliminate by using AAD: encrypt(chunk, aad=encoding_id), then transmit
         # encoding_id || ciphertext. This authenticates encoding_id without encrypting it.
         # However, this requires wire format change (breaking). See RFC 9180 §5.2.
+        #
+        # Compression priority: zstd > gzip > identity
         if self._compressor is not None and len(chunk) >= ZSTD_MIN_SIZE:
+            # Zstd available and chunk large enough
             zstd = import_zstd()
             compressed = self._compressor.compress(chunk, mode=zstd.ZstdCompressor.FLUSH_BLOCK)
             data = _ZSTD_PREFIX + compressed
+        elif self.compress and len(chunk) >= GZIP_MIN_SIZE:
+            # Gzip fallback (compress=True but zstd unavailable)
+            compressed = gzip_compress(bytes(chunk) if isinstance(chunk, memoryview) else chunk)
+            data = _GZIP_PREFIX + compressed
         else:
             data = _IDENTITY_PREFIX + chunk
 
@@ -601,15 +764,21 @@ class ChunkDecryptor:
         encoding_id = payload[0]
         encoded_payload = payload[1:]
 
-        if encoding_id == SSEEncodingId.ZSTD:
-            try:
-                plaintext = self._get_decompressor().decompress(encoded_payload)
-            except Exception as e:
-                raise DecryptionError("Zstd decompression failed") from e
-        elif encoding_id == SSEEncodingId.IDENTITY:
-            plaintext = encoded_payload
-        else:
-            raise DecryptionError(f"Unknown encoding: 0x{encoding_id:02x}")
+        match encoding_id:
+            case SSEEncodingId.ZSTD:
+                try:
+                    plaintext = self._get_decompressor().decompress(encoded_payload)
+                except Exception as e:
+                    raise DecryptionError("Zstd decompression failed") from e
+            case SSEEncodingId.GZIP:
+                try:
+                    plaintext = gzip_decompress(encoded_payload)
+                except Exception as e:
+                    raise DecryptionError("Gzip decompression failed") from e
+            case SSEEncodingId.IDENTITY:
+                plaintext = encoded_payload
+            case _:
+                raise DecryptionError(f"Unknown encoding: 0x{encoding_id:02x}")
 
         # Increment expected counter
         self.expected_counter += 1

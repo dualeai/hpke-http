@@ -44,6 +44,7 @@ from hpke_http.constants import (
     CHUNK_SIZE,
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
+    GZIP_STREAMING_THRESHOLD,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
@@ -51,7 +52,9 @@ from hpke_http.constants import (
     SCOPE_HPKE_CONTEXT,
     SSE_MAX_EVENT_SIZE,
     ZSTD_DECOMPRESS_STREAMING_THRESHOLD,
+    EncodingName,
     KemId,
+    build_accept_encoding,
 )
 from hpke_http.core import (
     RequestDecryptor,
@@ -62,7 +65,7 @@ from hpke_http.core import (
 )
 from hpke_http.exceptions import CryptoError, DecryptionError
 from hpke_http.headers import b64url_encode
-from hpke_http.streaming import zstd_decompress
+from hpke_http.streaming import gzip_decompress, zstd_decompress
 
 __all__ = [
     "HPKEMiddleware",
@@ -182,11 +185,8 @@ class HPKEMiddleware:
         self.require_encryption = require_encryption
 
         # Check zstd availability for compression support
+        # If zstd unavailable, gzip (stdlib) is used as fallback
         self._zstd_available = self._check_zstd_available()
-
-        # Validate compress config - fail fast if zstd unavailable
-        if compress and not self._zstd_available:
-            raise ImportError("HPKEMiddleware compress=True requires zstd. Install with: pip install hpke-http[zstd]")
 
         # Derive public keys for discovery endpoint
         self._public_keys: dict[KemId, bytes] = {}
@@ -255,7 +255,7 @@ class HPKEMiddleware:
                 send,
                 415,
                 "Unsupported encoding: zstd",
-                extra_headers=[(b"accept-encoding", b"identity")],
+                extra_headers=[(b"accept-encoding", build_accept_encoding(zstd_available=False).encode())],
             )
             return
 
@@ -496,7 +496,7 @@ class HPKEMiddleware:
         body = json.dumps(response).encode()
 
         # Advertise supported request encodings (RFC 9110 §12.5.3)
-        accept_encoding = b"identity, zstd" if self._zstd_available else b"identity"
+        accept_encoding = build_accept_encoding(zstd_available=self._zstd_available).encode()
 
         await send(
             {
@@ -629,19 +629,32 @@ class HPKEMiddleware:
 
         # Decompress full body using streaming for memory efficiency
         compressed_body = b"".join(parts)
+        encoding = state.decryptor.encoding
         try:
-            decompressed = zstd_decompress(
-                compressed_body,
-                streaming_threshold=ZSTD_DECOMPRESS_STREAMING_THRESHOLD,
-            )
+            match encoding:
+                case EncodingName.ZSTD:
+                    decompressed = zstd_decompress(
+                        compressed_body,
+                        streaming_threshold=ZSTD_DECOMPRESS_STREAMING_THRESHOLD,
+                    )
+                case EncodingName.GZIP:
+                    decompressed = gzip_decompress(
+                        compressed_body,
+                        streaming_threshold=GZIP_STREAMING_THRESHOLD,
+                    )
+                case _:
+                    raise DecryptionError(f"Unknown encoding: {encoding}")
             _logger.debug(
-                "Request decompressed: compressed=%d decompressed=%d",
+                "Request decompressed: encoding=%s compressed=%d decompressed=%d",
+                encoding,
                 len(compressed_body),
                 len(decompressed),
             )
             return decompressed
+        except DecryptionError:
+            raise
         except Exception as e:
-            raise DecryptionError(f"Zstd decompression failed: {e}") from e
+            raise DecryptionError(f"{encoding} decompression failed: {e}") from e
 
     async def _create_decrypted_receive(
         self,
