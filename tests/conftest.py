@@ -509,9 +509,9 @@ async def granian_server_gzip_only(
 # === HPKE Client Fixtures (Separate) ===
 
 # Default timeouts (httpx 5s, aiohttp 300s) are misaligned and can cause flaky
-# failures on slower x64 CI runners during large encrypted uploads. Use 60s for
+# failures on slower x64 CI runners during large encrypted uploads. Use 120s for
 # both clients to ensure consistent behavior across architectures.
-_TEST_TIMEOUT_SECS = 60.0
+_TEST_TIMEOUT_SECS = 120.0
 
 # --- aiohttp fixtures ---
 
