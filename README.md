@@ -242,14 +242,21 @@ All methods supported. **Encryption requires a request body** to establish the H
 >
 > For read-only endpoints requiring E2E encryption, use POST with a body (common pattern for sensitive queries).
 
-### Response Types
+### Response Encryption (Server)
 
-| Content-Type | Format | Streaming | Notes |
-| ------------ | ------ | --------- | ----- |
-| `application/json` | Binary chunks | No | Buffered, then chunked |
-| `text/html` | Binary chunks | No | Any non-SSE content type |
-| `text/event-stream` | SSE events | Yes | Real-time streaming |
-| `application/octet-stream` | Binary chunks | No | Binary data |
+| Content-Type | Wire Format | Memory |
+| ------------ | ----------- | ------ |
+| Any non-SSE | Length-prefixed 64KB chunks | O(64KB) buffer |
+| `text/event-stream` | Base64 SSE events | O(event size) |
+
+### Response Decryption (Client)
+
+| Content-Type | API | Memory | Delivery |
+| ------------ | --- | ------ | -------- |
+| Any non-SSE | `resp.json()`, `resp.content` | O(response size) | After full download |
+| `text/event-stream` | `async for chunk in iter_sse(resp)` | O(event size) | As events arrive |
+
+> **Tip:** For large non-SSE responses, use `release_encrypted=True` to free the encrypted buffer after decryption, reducing peak memory from 2× to 1× response size.
 
 ### Compression
 
