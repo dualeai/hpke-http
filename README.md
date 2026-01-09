@@ -122,6 +122,7 @@ async with HPKEAsyncClient(
 - [RFC 5869 - HKDF](https://datatracker.ietf.org/doc/rfc5869/)
 - [RFC 8439 - ChaCha20-Poly1305](https://datatracker.ietf.org/doc/rfc8439/)
 - [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (optional compression)
+- [RFC 9110 - HTTP Semantics](https://datatracker.ietf.org/doc/rfc9110/) (Accept-Encoding negotiation)
 
 ## Security
 
@@ -199,7 +200,22 @@ Response type is detected via `Content-Type` header:
 
 ## Compression (Optional)
 
-Zstd (RFC 8878) reduces bandwidth by **40-95%** for JSON/text. Both client and server must enable `compress=True`. Payloads < 64 bytes skip compression automatically.
+Zstd (RFC 8878) reduces bandwidth by **40-95%** for JSON/text.
+
+**Auto-negotiation:** Clients with `compress=True` automatically detect server capabilities via the `Accept-Encoding` header in discovery response. If server lacks zstd, client sends uncompressed - no 415 errors.
+
+```python
+# Client auto-negotiates - safe even if server lacks zstd
+async with HPKEClientSession(base_url=url, psk=key, compress=True) as client:
+    # Check server capability (after first request triggers discovery)
+    print(client.server_supports_zstd)  # True or False
+```
+
+**Server config:** Enable with `compress=True`. Middleware validates zstd availability at startup - raises `ImportError` if zstd package missing.
+
+**Request compression:** Client compresses body before encryption when `compress=True` and server supports zstd. Payloads < 64 bytes skip compression.
+
+**Response compression:** Server compresses response chunks (both SSE and standard) when `compress=True`. Payloads < 64 bytes skip compression.
 
 ## Pitfalls
 
