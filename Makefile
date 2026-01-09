@@ -21,6 +21,14 @@ WYCHEPROOF_CHACHA := $(VECTORS_DIR)/wycheproof_chacha20_poly1305.json
 WYCHEPROOF_HKDF := $(VECTORS_DIR)/wycheproof_hkdf_sha256.json
 WYCHEPROOF_HMAC := $(VECTORS_DIR)/wycheproof_hmac_sha256.json
 
+# Flamegraph profiling for e2e tests
+# Requires: sudo (py-spy needs elevated privileges on macOS)
+# Output: profiles/flamegraph_<timestamp>.json
+PROFILES_DIR := profiles
+PYSPY_RATE := 80
+PYSPY_BASETEMP := /tmp/pytest-flamegraph
+PYSPY_OUTPUT = $(PROFILES_DIR)/flamegraph_$(shell date +%Y%m%d_%H%M%S).json
+
 version:
 	@bash ./cicd/version.sh -g . -c
 
@@ -109,6 +117,35 @@ test-fuzz:
 lint:
 	uv run ruff format .
 	uv run ruff check --fix .
+
+# Profile e2e tests (client + server subprocesses)
+# Outputs speedscope JSON (open at https://speedscope.app for filtering)
+# Usage: sudo make test-flamegraph
+test-flamegraph:
+	@mkdir -p $(PROFILES_DIR)
+	@echo "Profiling e2e tests (requires sudo for py-spy)..."
+	uv run py-spy record \
+		--subprocesses \
+		--rate $(PYSPY_RATE) \
+		--format speedscope \
+		--output $(PYSPY_OUTPUT) \
+		-- uv run pytest tests/test_middleware.py -v -n auto --no-cov --basetemp=$(PYSPY_BASETEMP)
+	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
+	@echo "Open at https://speedscope.app for interactive filtering (search 'hpke_http')"
+
+# Profile specific test file or pattern
+# Usage: sudo make test-flamegraph-pattern PATTERN=test_middleware.py::TestStandardResponseEncryption PYSPY_RATE=250
+test-flamegraph-pattern:
+	@mkdir -p $(PROFILES_DIR)
+	@echo "Profiling: $(PATTERN)"
+	uv run py-spy record \
+		--subprocesses \
+		--rate $(PYSPY_RATE) \
+		--format speedscope \
+		--output $(PYSPY_OUTPUT) \
+		-- uv run pytest tests/$(PATTERN) -v -n 0 --no-cov --basetemp=$(PYSPY_BASETEMP)
+	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
+	@echo "Open at https://speedscope.app for interactive filtering"
 
 # Build and publish
 build:

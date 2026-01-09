@@ -46,6 +46,7 @@ dependencies = [
 dev = [
     "granian~=2.0",              # Rust ASGI server for E2E tests
     "hypothesis~=6.148",         # Property-based fuzz testing
+    "py-spy~=0.4",               # Sampling profiler for flamegraph generation
     "pyright~=1.1",
     "pytest-asyncio~=0.24",
     "pytest-cov~=7.0",
