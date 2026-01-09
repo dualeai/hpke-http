@@ -3636,6 +3636,7 @@ def _validate_parts(data: dict[str, Any], expected_hashes: dict[str, str]) -> No
         assert part["size"] == 10 * 1024 * 1024
 
 
+@skip_on_314t_gc_bug
 class TestMultipartUploadHttpx:
     """Test encrypted multipart uploads via httpx client."""
 
@@ -3691,6 +3692,7 @@ class TestMultipartUploadHttpx:
         _validate_parts(resp.json(), expected_hashes)
 
 
+@skip_on_314t_gc_bug
 class TestMultipartUploadAiohttp:
     """Test encrypted multipart uploads via aiohttp client."""
 
