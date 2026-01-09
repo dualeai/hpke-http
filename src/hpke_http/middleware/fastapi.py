@@ -45,6 +45,7 @@ from hpke_http.constants import (
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
     GZIP_STREAMING_THRESHOLD,
+    HEADER_HPKE_CONTENT_TYPE,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
@@ -493,6 +494,10 @@ class HPKEMiddleware:
             },
         }
 
+        # NOTE: json.dumps().encode() creates 2 allocations (str → bytes).
+        # For higher throughput, consider orjson.dumps() which returns bytes
+        # directly (1 allocation, ~10x faster). Not included as dependency
+        # to keep the library lightweight.
         body = json.dumps(response).encode()
 
         # Advertise supported request encodings (RFC 9110 §12.5.3)
@@ -682,6 +687,19 @@ class HPKEMiddleware:
 
         # Set up decryption context (resolves PSK, creates RequestDecryptor)
         decryptor = await self._setup_decryption(scope, enc_header, stream_header, encoding_header)
+
+        # Restore original Content-Type for multipart parsing
+        # Client sends original Content-Type (with boundary) via X-HPKE-Content-Type header
+        original_ct = headers.get(HEADER_HPKE_CONTENT_TYPE.lower().encode())
+        if original_ct:
+            # Rebuild scope headers with restored Content-Type
+            # ASGI headers are list of (name, value) byte tuples, lowercase names
+            new_headers = [
+                (b"content-type", original_ct) if name == b"content-type" else (name, value)
+                for name, value in scope.get("headers", [])
+            ]
+            scope["headers"] = new_headers
+            _logger.debug("Content-Type restored: %s", original_ct.decode())
 
         # Initialize shared state for streaming decryption
         state = _DecryptionState(decryptor=decryptor)

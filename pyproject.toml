@@ -53,6 +53,7 @@ dev = [
     "pytest-mock~=3.14",
     "pytest-xdist[psutil]~=3.8",
     "pytest~=8.3",
+    "python-multipart~=0.0",     # Multipart form parsing for upload tests
     "ruff~=0.7",
     "scipy~=1.14",               # Statistical tests for encryption verification
     "twine~=6.1",                # Package verification before PyPI upload
@@ -117,6 +118,7 @@ markers = [
     "vectors: RFC 9180 test vector validation (slow, 74MB JSON)",
     "fuzz: Property-based fuzz tests using Hypothesis",
     "requires_root: Tests requiring root/sudo for tcpdump network capture",
+    "slow: Resource-intensive tests requiring large CI runners (1GB+ payloads)",
 ]
 
 # Subprocess coverage for granian E2E tests (pytest-cov 7.x)

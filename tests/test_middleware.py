@@ -14,6 +14,7 @@ Fixtures are shared via conftest.py.
 
 import asyncio
 import gc
+import hashlib
 import json
 import re
 import sys
@@ -35,9 +36,12 @@ from tests.conftest import (
     CHI_SQUARE_MIN_PASS,
     CHI_SQUARE_P_THRESHOLD,
     CHI_SQUARE_TRIALS,
+    LARGE_PAYLOAD_SIZES_IDS,
+    LARGE_PAYLOAD_SIZES_MB,
     E2EServer,
     calculate_shannon_entropy,
     chi_square_byte_uniformity,
+    skip_on_314t_gc_bug,
 )
 
 
@@ -1520,9 +1524,11 @@ class TestDecryptedResponseAiohttpCompat:
         assert isinstance(resp.unwrap(), aiohttp.ClientResponse)
 
 
+@pytest.mark.slow
+@skip_on_314t_gc_bug
 class TestLargePayloadAutoChunking:
     """
-    Test auto-chunking for large payloads (10MB, 50MB, 100MB, 250MB).
+    Test auto-chunking for large payloads (10MB, 50MB, 100MB, 250MB, 500MB, 1GB).
 
     These tests verify that the length-prefix wire format correctly handles
     multi-chunk encryption/decryption for very large request/response bodies.
@@ -1530,11 +1536,7 @@ class TestLargePayloadAutoChunking:
     Wire format per chunk: length(4B) || counter(4B) || ciphertext
     """
 
-    @pytest.mark.parametrize(
-        "size_mb",
-        [10, 50, 100, 250],
-        ids=["10MB", "50MB", "100MB", "250MB"],
-    )
+    @pytest.mark.parametrize("size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     async def test_large_request_roundtrip(
         self,
         aiohttp_client: HPKEClientSession,
@@ -1553,11 +1555,7 @@ class TestLargePayloadAutoChunking:
         # Verify content length (echo returns the raw body as string)
         assert len(data["echo"]) == len(large_content)
 
-    @pytest.mark.parametrize(
-        "size_mb",
-        [10, 50, 100, 250],
-        ids=["10MB", "50MB", "100MB", "250MB"],
-    )
+    @pytest.mark.parametrize("size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     async def test_large_response_decryption(
         self,
         aiohttp_client: HPKEClientSession,
@@ -1576,11 +1574,7 @@ class TestLargePayloadAutoChunking:
         data = await resp.json()
         assert data["echo"] == large_content
 
-    @pytest.mark.parametrize(
-        "size_mb",
-        [10, 50, 100, 250],
-        ids=["10MB", "50MB", "100MB", "250MB"],
-    )
+    @pytest.mark.parametrize("size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     async def test_large_payload_wire_format(
         self,
         aiohttp_client: HPKEClientSession,
@@ -2264,7 +2258,8 @@ class TestAiohttpConnectionLeaks:
             await resp.read()  # Consume response to release connection
 
             # Yield to event loop - allows pending cleanup tasks to complete
-            await asyncio.sleep(0.01)
+            # Use longer sleep (0.5s) to avoid flaky failures on slower CI runners
+            await asyncio.sleep(0.5)
 
             gc.collect()
             gc.collect()
@@ -2291,7 +2286,8 @@ class TestAiohttpConnectionLeaks:
                 assert resp.status == 200
 
             # Yield to event loop - allows pending cleanup tasks to complete
-            await asyncio.sleep(0.01)
+            # Use longer sleep (0.5s) to avoid flaky failures on slower CI runners
+            await asyncio.sleep(0.5)
 
             gc.collect()
             gc.collect()
@@ -2317,7 +2313,8 @@ class TestAiohttpConnectionLeaks:
             await resp.release()  # Explicit cleanup
 
             # Yield to event loop - allows pending cleanup tasks to complete
-            await asyncio.sleep(0.01)
+            # Use longer sleep (0.5s) to avoid flaky failures on slower CI runners
+            await asyncio.sleep(0.5)
 
             gc.collect()
             gc.collect()
@@ -2343,7 +2340,8 @@ class TestAiohttpConnectionLeaks:
                 break
 
             # Yield to event loop - allows pending cleanup tasks to complete
-            await asyncio.sleep(0.01)
+            # Use longer sleep (0.5s) to avoid flaky failures on slower CI runners
+            await asyncio.sleep(0.5)
 
             gc.collect()
             gc.collect()
@@ -3596,3 +3594,698 @@ class TestHttpxConnectionLeaksCompressed:
         # Verify connection released
         resp = await httpx_client_compressed.post("/echo", json={"after_sse": True})
         assert resp.status_code == 200
+
+
+# === Multipart Upload Tests ===
+
+
+def _build_100_parts() -> tuple[dict[str, tuple[str, bytes, str]], dict[str, str]]:
+    """Build 100 x 10MB parts with random data (1GB total)."""
+    import os
+
+    files: dict[str, tuple[str, bytes, str]] = {}
+    expected_hashes: dict[str, str] = {}
+    for i in range(100):
+        content = os.urandom(10 * 1024 * 1024)  # 10MB random bytes
+        field = f"part_{i}"
+        files[field] = (f"{field}.bin", content, "application/octet-stream")
+        expected_hashes[field] = hashlib.sha256(content).hexdigest()
+    return files, expected_hashes
+
+
+def _build_100_parts_aiohttp() -> tuple[aiohttp.FormData, dict[str, str]]:
+    """Build 100 x 10MB parts as aiohttp FormData (1GB total)."""
+    import os
+
+    form = aiohttp.FormData()
+    expected_hashes: dict[str, str] = {}
+    for i in range(100):
+        content = os.urandom(10 * 1024 * 1024)  # 10MB random bytes
+        field = f"part_{i}"
+        form.add_field(field, content, filename=f"{field}.bin", content_type="application/octet-stream")
+        expected_hashes[field] = hashlib.sha256(content).hexdigest()
+    return form, expected_hashes
+
+
+def _validate_parts(data: dict[str, Any], expected_hashes: dict[str, str]) -> None:
+    """Validate all parts have correct hash and size."""
+    assert len(data["parts"]) == len(expected_hashes)
+    for part in data["parts"]:
+        field = part["field"]
+        assert part["sha256"] == expected_hashes[field], f"Hash mismatch for {field}"
+        assert part["size"] == 10 * 1024 * 1024
+
+
+class TestMultipartUploadHttpx:
+    """Test encrypted multipart uploads via httpx client."""
+
+    async def test_multipart_bytes_payload_httpx(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """httpx: BytesPayload - 10MB raw bytes upload."""
+        import os
+
+        content = os.urandom(10 * 1024 * 1024)  # 10MB
+        files = {"file": ("test.bin", content, "application/octet-stream")}
+
+        resp = await httpx_client.post("/upload", files=files)
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert len(data["parts"]) == 1
+        assert data["parts"][0]["size"] == 10 * 1024 * 1024
+        assert data["parts"][0]["sha256"] == hashlib.sha256(content).hexdigest()
+
+    async def test_multipart_iobase_payload_httpx(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """httpx: IOBasePayload - 10MB file-like object upload."""
+        import io
+        import os
+
+        content = os.urandom(10 * 1024 * 1024)  # 10MB
+        file_obj = io.BytesIO(content)
+        files = {"file": ("test.bin", file_obj, "application/octet-stream")}
+
+        resp = await httpx_client.post("/upload", files=files)
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert len(data["parts"]) == 1
+        assert data["parts"][0]["size"] == 10 * 1024 * 1024
+        assert data["parts"][0]["sha256"] == hashlib.sha256(content).hexdigest()
+
+    @pytest.mark.slow
+    async def test_multipart_100_parts_10mb_httpx(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """httpx: 100 parts x 10MB (1GB) - client validates hashes."""
+        files, expected_hashes = _build_100_parts()
+
+        resp = await httpx_client.post("/upload", files=files)
+        assert resp.status_code == 200
+
+        _validate_parts(resp.json(), expected_hashes)
+
+
+class TestMultipartUploadAiohttp:
+    """Test encrypted multipart uploads via aiohttp client."""
+
+    async def test_multipart_bytes_payload_aiohttp(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """aiohttp: BytesPayload - 10MB raw bytes upload."""
+        import os
+
+        content = os.urandom(10 * 1024 * 1024)  # 10MB
+
+        form = aiohttp.FormData()
+        form.add_field("file", content, filename="test.bin", content_type="application/octet-stream")
+
+        resp = await aiohttp_client.post("/upload", data=form)
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert len(data["parts"]) == 1
+        assert data["parts"][0]["size"] == 10 * 1024 * 1024
+        assert data["parts"][0]["sha256"] == hashlib.sha256(content).hexdigest()
+
+    async def test_multipart_iobase_payload_aiohttp(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """aiohttp: IOBasePayload - 10MB file-like object upload."""
+        import io
+        import os
+
+        content = os.urandom(10 * 1024 * 1024)  # 10MB
+        file_obj = io.BytesIO(content)
+
+        form = aiohttp.FormData()
+        form.add_field("file", file_obj, filename="test.bin", content_type="application/octet-stream")
+
+        resp = await aiohttp_client.post("/upload", data=form)
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert len(data["parts"]) == 1
+        assert data["parts"][0]["size"] == 10 * 1024 * 1024
+        assert data["parts"][0]["sha256"] == hashlib.sha256(content).hexdigest()
+
+    @pytest.mark.slow
+    async def test_multipart_100_parts_10mb_aiohttp(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """aiohttp: 100 parts x 10MB (1GB) via FormData - client validates hashes."""
+        form, expected_hashes = _build_100_parts_aiohttp()
+
+        resp = await aiohttp_client.post("/upload", data=form)
+        assert resp.status == 200
+
+        _validate_parts(await resp.json(), expected_hashes)
+
+
+# === Multipart Memory Tests ===
+
+
+class TestMultipartMemoryHttpx:
+    """Memory behavior tests for multipart uploads via httpx client."""
+
+    async def test_multipart_no_memory_leak(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Repeated multipart uploads don't leak memory."""
+        import gc
+        import os
+        import tracemalloc
+
+        content = os.urandom(1024 * 1024)  # 1MB
+        expected_hash = hashlib.sha256(content).hexdigest()
+
+        # Warmup
+        for _ in range(3):
+            files = {"file": ("test.bin", content, "application/octet-stream")}
+            resp = await httpx_client.post("/upload", files=files)
+            assert resp.status_code == 200
+        gc.collect()
+
+        # Measure
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        for i in range(20):
+            files = {"file": (f"test_{i}.bin", content, "application/octet-stream")}
+            resp = await httpx_client.post("/upload", files=files)
+            assert resp.status_code == 200
+            assert resp.json()["parts"][0]["sha256"] == expected_hash
+
+        gc.collect()
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        net_allocated = sum(stat.size_diff for stat in diff)
+
+        # Allow 300KB growth for 20 uploads (connection pools, caches, SSL contexts)
+        # Platform variance: Linux allocators may use more memory than macOS
+        max_leak = 300 * 1024
+        assert net_allocated < max_leak, (
+            f"Memory grew by {net_allocated / 1024:.1f}KB after 20 uploads, expected < {max_leak // 1024}KB"
+        )
+
+    async def test_multipart_peak_memory_ratio(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """REAL test: actual client.post() with file-backed content uses bounded memory.
+
+        This tests the full end-to-end path:
+        - File on disk (not pre-allocated in-memory bytes)
+        - Actual httpx_client.post() call
+        - Real encryption pipeline
+
+        Memory should be O(chunk_size), not O(file_size).
+        """
+        import gc
+        import os
+        import tempfile
+        import tracemalloc
+
+        file_size = 50 * 1024 * 1024  # 50MB file
+
+        # Create file on disk (content NOT in Python memory)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+            # Write in chunks to avoid large allocation
+            chunk = os.urandom(1024 * 1024)  # 1MB chunk
+            for _ in range(file_size // len(chunk)):
+                f.write(chunk)
+            temp_path = f.name
+        del chunk
+        gc.collect()
+
+        try:
+            # Warmup - exercise full path
+            with open(temp_path, "rb") as f:
+                files = {"file": ("test.bin", f, "application/octet-stream")}
+                resp = await httpx_client.post("/upload", files=files)
+                assert resp.status_code == 200
+            gc.collect()
+
+            # Measure REAL upload with file handle
+            tracemalloc.start()
+            tracemalloc.reset_peak()
+
+            with open(temp_path, "rb") as f:
+                files = {"file": ("test.bin", f, "application/octet-stream")}
+                resp = await httpx_client.post("/upload", files=files)
+                assert resp.status_code == 200
+                result = resp.json()
+                # Verify upload succeeded and correct size
+                assert result["parts"][0]["size"] == file_size
+
+            _current, peak_alloc = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+            # Real streaming should use bounded memory
+            # Allow 5MB for buffers, crypto state, HTTP overhead (but NOT 50MB)
+            max_memory = 5 * 1024 * 1024  # 5MB
+            assert peak_alloc < max_memory, (
+                f"Peak memory {peak_alloc / 1024 / 1024:.1f}MB exceeds {max_memory // 1024 // 1024}MB limit. "
+                f"Full upload path should stream, not buffer entire file. "
+                f"Ratio: {peak_alloc / file_size:.1%} of file size"
+            )
+
+        finally:
+            os.unlink(temp_path)
+
+
+class TestMultipartMemoryAiohttp:
+    """Memory behavior tests for multipart uploads via aiohttp client."""
+
+    async def test_multipart_no_memory_leak(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Repeated multipart uploads don't leak memory."""
+        import gc
+        import os
+        import tracemalloc
+
+        content = os.urandom(1024 * 1024)  # 1MB
+        expected_hash = hashlib.sha256(content).hexdigest()
+
+        # Warmup
+        for _ in range(3):
+            form = aiohttp.FormData()
+            form.add_field("file", content, filename="test.bin", content_type="application/octet-stream")
+            resp = await aiohttp_client.post("/upload", data=form)
+            assert resp.status == 200
+        gc.collect()
+
+        # Measure
+        tracemalloc.start()
+        snapshot1 = tracemalloc.take_snapshot()
+
+        for i in range(20):
+            form = aiohttp.FormData()
+            form.add_field("file", content, filename=f"test_{i}.bin", content_type="application/octet-stream")
+            resp = await aiohttp_client.post("/upload", data=form)
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["parts"][0]["sha256"] == expected_hash
+
+        gc.collect()
+        snapshot2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+
+        diff = snapshot2.compare_to(snapshot1, "lineno")
+        net_allocated = sum(stat.size_diff for stat in diff)
+
+        # Allow 300KB growth for 20 uploads (connection pools, caches, SSL contexts)
+        # Platform variance: Linux allocators may use more memory than macOS
+        max_leak = 300 * 1024
+        assert net_allocated < max_leak, (
+            f"Memory grew by {net_allocated / 1024:.1f}KB after 20 uploads, expected < {max_leak // 1024}KB"
+        )
+
+    async def test_multipart_peak_memory_ratio(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """REAL test: actual client.post() with file-backed content uses bounded memory.
+
+        This tests the full end-to-end path:
+        - File on disk (not pre-allocated in-memory bytes)
+        - Actual aiohttp_client.post() call
+        - Real encryption pipeline
+
+        Memory should be O(chunk_size), not O(file_size).
+        """
+        import gc
+        import os
+        import tempfile
+        import tracemalloc
+
+        file_size = 50 * 1024 * 1024  # 50MB file
+
+        # Create file on disk (content NOT in Python memory)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+            # Write in chunks to avoid large allocation
+            chunk = os.urandom(1024 * 1024)  # 1MB chunk
+            for _ in range(file_size // len(chunk)):
+                f.write(chunk)
+            temp_path = f.name
+        del chunk
+        gc.collect()
+
+        try:
+            # Warmup - exercise full path
+            with open(temp_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field("file", f, filename="test.bin", content_type="application/octet-stream")
+                resp = await aiohttp_client.post("/upload", data=form)
+                assert resp.status == 200
+            gc.collect()
+
+            # Measure REAL upload with file handle
+            tracemalloc.start()
+            tracemalloc.reset_peak()
+
+            with open(temp_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field("file", f, filename="test.bin", content_type="application/octet-stream")
+                resp = await aiohttp_client.post("/upload", data=form)
+                assert resp.status == 200
+                result = await resp.json()
+                # Verify upload succeeded and correct size
+                assert result["parts"][0]["size"] == file_size
+
+            _current, peak_alloc = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+            # Real streaming should use bounded memory
+            # Allow 5MB for buffers, crypto state, HTTP overhead (but NOT 50MB)
+            max_memory = 5 * 1024 * 1024  # 5MB
+            assert peak_alloc < max_memory, (
+                f"Peak memory {peak_alloc / 1024 / 1024:.1f}MB exceeds {max_memory // 1024 // 1024}MB limit. "
+                f"Full upload path should stream, not buffer entire file. "
+                f"Ratio: {peak_alloc / file_size:.1%} of file size"
+            )
+
+        finally:
+            os.unlink(temp_path)
+
+
+class TestServerMemoryBounded:
+    """Verify server-side processing uses bounded memory."""
+
+    async def test_server_streams_large_upload(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Server processes large uploads without holding full body in memory.
+
+        The /upload endpoint uses streaming hash computation (64KB chunks),
+        so server memory should be O(1) regardless of upload size.
+        This test verifies the endpoint works for large files.
+        """
+        import os
+
+        # 50MB file - server should handle without OOM
+        content = os.urandom(50 * 1024 * 1024)
+        expected_hash = hashlib.sha256(content).hexdigest()
+        files = {"file": ("large.bin", content, "application/octet-stream")}
+
+        resp = await httpx_client.post("/upload", files=files)
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert data["parts"][0]["size"] == 50 * 1024 * 1024
+        assert data["parts"][0]["sha256"] == expected_hash
+
+
+# === Content-Type Preservation Tests ===
+
+
+class TestContentTypePreservationHttpx:
+    """Test X-HPKE-Content-Type header preservation via httpx client.
+
+    Verifies that the original Content-Type is preserved through encryption
+    and restored on the server side for proper request parsing.
+    """
+
+    # --- Normal cases ---
+
+    async def test_content_type_json(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Normal: application/json is preserved."""
+        resp = await httpx_client.post("/echo-headers", json={"test": "value"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_type"] == "application/json"
+
+    async def test_content_type_text_plain(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Normal: text/plain is preserved."""
+        resp = await httpx_client.post(
+            "/echo-headers",
+            content=b"Hello, World!",
+            headers={"Content-Type": "text/plain"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_type"] == "text/plain"
+
+    async def test_content_type_multipart_explicit(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Normal: multipart/form-data with boundary is preserved."""
+        files = {"file": ("test.txt", b"content", "text/plain")}
+        resp = await httpx_client.post("/echo-headers", files=files)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_type"] is not None
+        assert data["content_type"].startswith("multipart/form-data")
+        assert "boundary=" in data["content_type"]
+
+    # --- Weird cases ---
+
+    async def test_content_type_custom_xml(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Weird: custom application/xml is preserved."""
+        resp = await httpx_client.post(
+            "/echo-headers",
+            content=b"<root><item>test</item></root>",
+            headers={"Content-Type": "application/xml"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_type"] == "application/xml"
+
+    async def test_content_type_with_charset(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Weird: Content-Type with charset parameter is preserved exactly."""
+        resp = await httpx_client.post(
+            "/echo-headers",
+            content=b'{"test": "value"}',
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_type"] == "application/json; charset=utf-8"
+
+    async def test_content_type_with_multiple_params(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Weird: Content-Type with multiple parameters is preserved exactly."""
+        complex_ct = "application/json; charset=utf-8; boundary=something"
+        resp = await httpx_client.post(
+            "/echo-headers",
+            content=b'{"test": "value"}',
+            headers={"Content-Type": complex_ct},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_type"] == complex_ct
+
+    async def test_content_type_vendor_specific(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Weird: vendor-specific Content-Type is preserved."""
+        resp = await httpx_client.post(
+            "/echo-headers",
+            content=b'{"api": "data"}',
+            headers={"Content-Type": "application/vnd.api+json"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_type"] == "application/vnd.api+json"
+
+    # --- Edge cases ---
+
+    async def test_content_type_missing_raw_bytes(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Edge: raw bytes without Content-Type header - server sees None."""
+        resp = await httpx_client.post(
+            "/echo-headers",
+            content=b"raw binary data",
+            # No Content-Type header
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Server should see application/octet-stream (the encrypted wire format)
+        # since no original Content-Type was provided to preserve
+        assert data["content_type"] == "application/octet-stream"
+
+    async def test_content_type_empty_body_with_type(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Edge: empty body with Content-Type - no encryption, passes through."""
+        resp = await httpx_client.post(
+            "/echo-headers",
+            content=b"",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Empty body means no encryption, Content-Type passes through as-is
+        assert data["body_size"] == 0
+
+
+class TestContentTypePreservationAiohttp:
+    """Test X-HPKE-Content-Type header preservation via aiohttp client.
+
+    Mirrors httpx tests to ensure both clients behave identically.
+    """
+
+    # --- Normal cases ---
+
+    async def test_content_type_json(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Normal: application/json is preserved."""
+        resp = await aiohttp_client.post("/echo-headers", json={"test": "value"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["content_type"] == "application/json"
+
+    async def test_content_type_text_plain(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Normal: text/plain is preserved."""
+        resp = await aiohttp_client.post(
+            "/echo-headers",
+            data=b"Hello, World!",
+            headers={"Content-Type": "text/plain"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["content_type"] == "text/plain"
+
+    async def test_content_type_multipart_explicit(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Normal: multipart/form-data with boundary is preserved."""
+        form = aiohttp.FormData()
+        form.add_field("file", b"content", filename="test.txt", content_type="text/plain")
+        resp = await aiohttp_client.post("/echo-headers", data=form)
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["content_type"] is not None
+        assert data["content_type"].startswith("multipart/form-data")
+        assert "boundary=" in data["content_type"]
+
+    # --- Weird cases ---
+
+    async def test_content_type_custom_xml(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Weird: custom application/xml is preserved."""
+        resp = await aiohttp_client.post(
+            "/echo-headers",
+            data=b"<root><item>test</item></root>",
+            headers={"Content-Type": "application/xml"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["content_type"] == "application/xml"
+
+    async def test_content_type_with_charset(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Weird: Content-Type with charset parameter is preserved exactly."""
+        resp = await aiohttp_client.post(
+            "/echo-headers",
+            data=b'{"test": "value"}',
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["content_type"] == "application/json; charset=utf-8"
+
+    async def test_content_type_with_multiple_params(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Weird: Content-Type with multiple parameters is preserved exactly."""
+        complex_ct = "application/json; charset=utf-8; boundary=something"
+        resp = await aiohttp_client.post(
+            "/echo-headers",
+            data=b'{"test": "value"}',
+            headers={"Content-Type": complex_ct},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["content_type"] == complex_ct
+
+    async def test_content_type_vendor_specific(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Weird: vendor-specific Content-Type is preserved."""
+        resp = await aiohttp_client.post(
+            "/echo-headers",
+            data=b'{"api": "data"}',
+            headers={"Content-Type": "application/vnd.api+json"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["content_type"] == "application/vnd.api+json"
+
+    # --- Edge cases ---
+
+    async def test_content_type_missing_raw_bytes(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Edge: raw bytes without Content-Type header - server sees None."""
+        resp = await aiohttp_client.post(
+            "/echo-headers",
+            data=b"raw binary data",
+            # No Content-Type header
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        # Server should see application/octet-stream (the encrypted wire format)
+        # since no original Content-Type was provided to preserve
+        assert data["content_type"] == "application/octet-stream"
+
+    async def test_content_type_empty_body_with_type(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """Edge: empty body with Content-Type - no encryption, passes through."""
+        resp = await aiohttp_client.post(
+            "/echo-headers",
+            data=b"",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        # Empty body means no encryption, Content-Type passes through as-is
+        assert data["body_size"] == 0

@@ -152,6 +152,15 @@ HEADER_HPKE_STREAM: Final[str] = "X-HPKE-Stream"
 HEADER_HPKE_ENCODING: Final[str] = "X-HPKE-Encoding"
 """Header specifying compression algorithm for request body (RFC 8878)."""
 
+HEADER_HPKE_CONTENT_TYPE: Final[str] = "X-HPKE-Content-Type"
+"""Header preserving original Content-Type before encryption.
+
+Used to restore Content-Type after decryption so frameworks can properly
+parse multipart/form-data and other content types. The encrypted body is
+sent as application/octet-stream, and this header allows the server to
+restore the original Content-Type for the application layer.
+"""
+
 RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"
 """Export label for deriving response encryption key from HPKE context."""
 
@@ -278,7 +287,7 @@ ZSTD_COMPRESSION_LEVEL: Final[int] = 3
 """Zstd compression level (1-22). Level 3 = fast compression."""
 
 ZSTD_MIN_SIZE: Final[int] = 64
-"""Minimum payload size for compression. Smaller payloads skip compression."""
+"""Minimum payload size for compression (zstd or gzip). Smaller payloads skip compression."""
 
 ZSTD_STREAMING_THRESHOLD: Final[int] = 1024 * 1024  # 1MB
 """Threshold for using streaming compression vs in-memory.
@@ -318,9 +327,6 @@ GZIP_COMPRESSION_LEVEL: Final[int] = 6
 
 Level 9 is ~3x slower than level 6 for only ~1% better compression.
 """
-
-GZIP_MIN_SIZE: Final[int] = 64
-"""Minimum payload size for gzip compression. Same threshold as zstd."""
 
 GZIP_STREAMING_THRESHOLD: Final[int] = 1024 * 1024  # 1MB
 """Threshold for using streaming gzip compression vs in-memory.

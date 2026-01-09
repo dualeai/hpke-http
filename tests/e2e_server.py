@@ -4,6 +4,7 @@ This module is loaded by granian via `tests.e2e_server:app`.
 Reads configuration from environment variables set by the test fixtures.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ if os.environ.get("HPKE_DISABLE_ZSTD") == "true":
     hpke_http.streaming._zstd_module = None  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 from starlette.applications import Starlette
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -50,6 +52,23 @@ async def echo(request: Request) -> JSONResponse:
             "path": request.url.path,
             "method": request.method,
             "echo": body.decode("utf-8", errors="replace"),
+        }
+    )
+
+
+async def echo_headers(request: Request) -> JSONResponse:
+    """Echo headers endpoint - returns Content-Type and other headers as seen by the app.
+
+    Used to verify X-HPKE-Content-Type restoration after decryption.
+    """
+    _logger.debug("%s /echo-headers", request.method)
+    body = await request.body()
+    return JSONResponse(
+        {
+            "content_type": request.headers.get("content-type"),
+            "content_length": request.headers.get("content-length"),
+            "body_size": len(body),
+            "all_headers": dict(request.headers),
         }
     )
 
@@ -147,6 +166,42 @@ async def echo_chunks(request: Request) -> JSONResponse:
     )
 
 
+async def upload(request: Request) -> JSONResponse:
+    """Handle multipart upload, return SHA256 hash + metadata for each part.
+
+    Streams each part to compute hash without storing full content in memory.
+    Client validates by comparing expected vs actual hashes.
+    """
+    _logger.debug("POST /upload: parsing multipart form...")
+    form = await request.form()
+    parts: list[dict[str, Any]] = []
+
+    for key in form:
+        value = form[key]
+        # Check if it's an UploadFile (not a plain string field)
+        if isinstance(value, UploadFile):
+            # Stream hash computation - O(1) memory per part
+            hasher = hashlib.sha256()
+            size = 0
+            while chunk := await value.read(64 * 1024):  # 64KB chunks
+                hasher.update(chunk)
+                size += len(chunk)
+
+            parts.append(
+                {
+                    "field": key,
+                    "filename": value.filename,
+                    "content_type": value.content_type,
+                    "size": size,
+                    "sha256": hasher.hexdigest(),
+                }
+            )
+            _logger.debug("POST /upload: processed part %s, size=%d", key, size)
+
+    _logger.debug("POST /upload: completed, %d parts", len(parts))
+    return JSONResponse({"parts": parts})
+
+
 def _create_app() -> HPKEMiddleware:
     """Create ASGI app wrapped with HPKEMiddleware.
 
@@ -173,11 +228,13 @@ def _create_app() -> HPKEMiddleware:
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/echo", echo, methods=["POST", "PUT", "PATCH", "DELETE"]),
+        Route("/echo-headers", echo_headers, methods=["POST"]),
         Route("/echo-chunks", echo_chunks, methods=["POST"]),
         Route("/stream", stream, methods=["POST"]),
         Route("/stream-delayed", stream_delayed, methods=["POST"]),
         Route("/stream-large", stream_large, methods=["POST"]),
         Route("/stream-many", stream_many, methods=["POST"]),
+        Route("/upload", upload, methods=["POST"]),
     ]
     starlette_app = Starlette(routes=routes)
 

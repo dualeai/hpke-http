@@ -101,9 +101,13 @@ test-static:
 test-func:
 	uv run pytest tests/ -v -n auto
 
-# CI-friendly tests (no root required, parallel execution)
+# CI-friendly tests (no root required, no slow tests, parallel execution)
 test-func-ci:
-	uv run pytest tests/ -v -n auto -m "not requires_root"
+	uv run pytest tests/ -v -n auto -m "not requires_root and not slow"
+
+# Slow tests only (large payloads 1GB+, requires large CI runners)
+test-func-slow:
+	uv run pytest tests/ -v -n auto -m "slow" --no-cov
 
 # Root-required tests only (tcpdump network capture, must run serial)
 # Usage: sudo make test-func-root

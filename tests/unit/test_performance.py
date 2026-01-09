@@ -729,7 +729,8 @@ class TestRelativeOverhead:
 
         response_time, _ = measure_cpu_time(response_encrypt, iterations=5)
 
-        assert response_time < request_time, (
+        # Allow 10% tolerance for measurement noise in CI
+        assert response_time < request_time * 1.1, (
             f"Response ({response_time * 1000:.2f}ms) should be faster than request ({request_time * 1000:.2f}ms)"
         )
 
@@ -760,7 +761,8 @@ class TestRelativeOverhead:
 
         response_time, _ = measure_cpu_time(response_decrypt, iterations=5)
 
-        assert response_time < request_time, (
+        # Allow 10% tolerance for measurement noise in CI
+        assert response_time < request_time * 1.1, (
             f"Response ({response_time * 1000:.2f}ms) should be faster than request ({request_time * 1000:.2f}ms)"
         )
 

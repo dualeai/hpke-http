@@ -23,6 +23,8 @@ import secrets
 import struct
 import sys
 import threading
+import zlib
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -32,7 +34,6 @@ from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     CHACHA20_POLY1305_TAG_SIZE,
     GZIP_COMPRESSION_LEVEL,
-    GZIP_MIN_SIZE,
     GZIP_STREAMING_CHUNK_SIZE,
     GZIP_STREAMING_THRESHOLD,
     RAW_LENGTH_PREFIX_SIZE,
@@ -361,13 +362,174 @@ def gzip_decompress(
     return gzip.decompress(data)
 
 
+# =============================================================================
+# Streaming Compressor Abstraction
+# =============================================================================
+#
+# Abstract interface for streaming compression with dictionary context preservation.
+#
+# Unlike per-chunk compression (used for SSE where each chunk must be independently
+# decompressible), streaming compression maintains dictionary context across chunks.
+# This enables better compression ratios for whole-body compression where the server
+# decrypts all chunks first, then decompresses as one stream.
+#
+# Implementations:
+# - ZstdStreamingCompressor: Uses FLUSH_BLOCK mode (maintains dictionary)
+# - GzipStreamingCompressor: Uses Z_SYNC_FLUSH mode (~32% overhead vs one-shot)
+# - IdentityCompressor: No compression (passthrough)
+# =============================================================================
+
+
+class StreamingCompressor(ABC):
+    """Abstract streaming compressor with dictionary context preservation.
+
+    Maintains compression dictionary across chunks for better compression ratio.
+    Each call to compress() produces output that must be concatenated and
+    decompressed as a single stream.
+
+    Use finalize() after all data is compressed to flush any remaining output.
+    """
+
+    @abstractmethod
+    def compress(self, chunk: bytes) -> bytes:
+        """Compress chunk, maintaining dictionary context across calls.
+
+        Args:
+            chunk: Raw bytes to compress
+
+        Returns:
+            Compressed bytes (may be empty if buffered internally)
+        """
+        ...
+
+    @abstractmethod
+    def finalize(self) -> bytes:
+        """Finalize the compression stream.
+
+        Must be called after all data is compressed to flush any remaining
+        buffered output and write stream terminator.
+
+        Returns:
+            Final compressed bytes (may be empty)
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def encoding_id(self) -> bytes:
+        """1-byte encoding ID prefix for wire format.
+
+        Returns:
+            Single byte identifying the compression format
+        """
+        ...
+
+
+class ZstdStreamingCompressor(StreamingCompressor):
+    """Zstd streaming compressor with FLUSH_BLOCK mode.
+
+    Maintains dictionary context across chunks for good compression ratio.
+    Output can be decompressed as a single zstd stream.
+
+    Uses FLUSH_BLOCK to produce output after each compress() call while
+    maintaining the compression dictionary. Final FLUSH_FRAME closes the stream.
+    """
+
+    def __init__(self, level: int = ZSTD_COMPRESSION_LEVEL):
+        """Initialize zstd streaming compressor.
+
+        Args:
+            level: Compression level (1-22, default 3 = fast)
+
+        Raises:
+            ImportError: If backports.zstd not installed (Python < 3.14)
+        """
+        zstd = import_zstd()
+        self._compressor = zstd.ZstdCompressor(level=level)
+        self._zstd = zstd
+
+    def compress(self, chunk: bytes) -> bytes:
+        """Compress chunk with FLUSH_BLOCK to maintain dictionary context."""
+        return self._compressor.compress(chunk, mode=self._zstd.ZstdCompressor.FLUSH_BLOCK)
+
+    def finalize(self) -> bytes:
+        """Finalize with FLUSH_FRAME to close the zstd stream."""
+        return self._compressor.compress(b"", mode=self._zstd.ZstdCompressor.FLUSH_FRAME)
+
+    @property
+    def encoding_id(self) -> bytes:
+        return _ZSTD_PREFIX  # 0x01
+
+
+class GzipStreamingCompressor(StreamingCompressor):
+    """Gzip streaming compressor with Z_SYNC_FLUSH mode.
+
+    Maintains dictionary context across chunks. Output can be decompressed
+    as a single gzip stream.
+
+    Uses Z_SYNC_FLUSH to produce output after each compress() call while
+    maintaining the compression dictionary. Has ~32% overhead vs one-shot
+    gzip.compress() due to flush overhead, but enables streaming.
+
+    Note: For SSE per-chunk compression (where each chunk must decompress
+    independently), use gzip_compress() directly instead. This class is for
+    whole-body streaming where all chunks are concatenated before decompression.
+    """
+
+    def __init__(self, level: int = GZIP_COMPRESSION_LEVEL):
+        """Initialize gzip streaming compressor.
+
+        Args:
+            level: Compression level (0-9, default 6 = balanced)
+        """
+        # wbits=31 = gzip format (16 + MAX_WBITS where MAX_WBITS=15)
+        self._compressor = zlib.compressobj(level=level, wbits=31)
+
+    def compress(self, chunk: bytes) -> bytes:
+        """Compress chunk with Z_SYNC_FLUSH to maintain dictionary context."""
+        out = self._compressor.compress(chunk)
+        out += self._compressor.flush(zlib.Z_SYNC_FLUSH)
+        return out
+
+    def finalize(self) -> bytes:
+        """Finalize with Z_FINISH to close the gzip stream."""
+        return self._compressor.flush(zlib.Z_FINISH)
+
+    @property
+    def encoding_id(self) -> bytes:
+        return _GZIP_PREFIX  # 0x02
+
+
+class IdentityCompressor(StreamingCompressor):
+    """Identity compressor (passthrough, no compression).
+
+    Used when compression is disabled or chunk is too small to benefit.
+    """
+
+    def compress(self, chunk: bytes) -> bytes:
+        """Return chunk unchanged."""
+        return chunk
+
+    def finalize(self) -> bytes:
+        """No finalization needed for identity."""
+        return b""
+
+    @property
+    def encoding_id(self) -> bytes:
+        return _IDENTITY_PREFIX  # 0x00
+
+
 __all__ = [
     "ChunkDecryptor",
     "ChunkEncryptor",
     "ChunkFormat",
+    "GzipStreamingCompressor",
+    "IdentityCompressor",
     "RawFormat",
     "SSEFormat",
+    "StreamingCompressor",
     "StreamingSession",
+    "ZstdStreamingCompressor",
     "create_session_from_context",
     "gzip_compress",
     "gzip_decompress",
@@ -581,8 +743,7 @@ class ChunkEncryptor:
     - SSEFormat (default): SSE events with base64url payload
     - RawFormat: Binary length || counter || ciphertext
 
-    Optional compression can be enabled via compress=True.
-    Uses zstd if available, falls back to gzip (stdlib).
+    Compression: Set compress=True to enable (zstd preferred, gzip fallback).
     Compressed chunks are prefixed with encoding ID for client detection.
     """
 
@@ -592,8 +753,8 @@ class ChunkEncryptor:
     counter: int = field(default=1)  # Start at 1 (0 reserved)
     _cipher: ChaCha20Poly1305 = field(init=False, repr=False)
     _lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)
-    _compressor: Any = field(init=False, repr=False, default=None)  # Reused zstd compressor
     _nonce_buf: bytearray = field(init=False, repr=False)  # Pre-allocated 12-byte nonce buffer
+    _compressor: StreamingCompressor | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         self._cipher = ChaCha20Poly1305(self.session.session_key)
@@ -601,13 +762,13 @@ class ChunkEncryptor:
         self._nonce_buf = bytearray(12)
         self._nonce_buf[:4] = self.session.session_salt
         # Bytes 4-7 remain zeros (default bytearray value)
+
+        # Auto-create compressor when compress=True (zstd preferred, gzip fallback)
         if self.compress:
             try:
-                zstd = import_zstd()
-                self._compressor = zstd.ZstdCompressor(level=ZSTD_COMPRESSION_LEVEL)
+                self._compressor = ZstdStreamingCompressor()
             except ImportError:
-                # Zstd not available - gzip fallback used in encrypt()
-                pass
+                self._compressor = GzipStreamingCompressor()
 
     def _compute_nonce(self, counter: int) -> memoryview:
         """
@@ -642,19 +803,14 @@ class ChunkEncryptor:
         # Could eliminate by using AAD: encrypt(chunk, aad=encoding_id), then transmit
         # encoding_id || ciphertext. This authenticates encoding_id without encrypting it.
         # However, this requires wire format change (breaking). See RFC 9180 §5.2.
-        #
-        # Compression priority: zstd > gzip > identity
+        chunk_bytes = bytes(chunk) if isinstance(chunk, memoryview) else chunk
+
+        # Compress if enabled and chunk large enough to benefit
         if self._compressor is not None and len(chunk) >= ZSTD_MIN_SIZE:
-            # Zstd available and chunk large enough
-            zstd = import_zstd()
-            compressed = self._compressor.compress(chunk, mode=zstd.ZstdCompressor.FLUSH_BLOCK)
-            data = _ZSTD_PREFIX + compressed
-        elif self.compress and len(chunk) >= GZIP_MIN_SIZE:
-            # Gzip fallback (compress=True but zstd unavailable)
-            compressed = gzip_compress(bytes(chunk) if isinstance(chunk, memoryview) else chunk)
-            data = _GZIP_PREFIX + compressed
+            compressed = self._compressor.compress(chunk_bytes)
+            data = self._compressor.encoding_id + compressed
         else:
-            data = _IDENTITY_PREFIX + chunk
+            data = _IDENTITY_PREFIX + chunk_bytes
 
         # Lock only for counter operations and nonce computation
         # (nonce buffer is shared, so must be protected)

@@ -23,7 +23,12 @@ from hpke_http.streaming import (
     ChunkEncryptor,
     import_zstd,
 )
-from tests.conftest import extract_sse_data_field, make_sse_session
+from tests.conftest import (
+    LARGE_PAYLOAD_SIZES_IDS,
+    LARGE_PAYLOAD_SIZES_MB,
+    extract_sse_data_field,
+    make_sse_session,
+)
 
 
 def _zstd_available() -> bool:
@@ -868,6 +873,7 @@ class TestUnifiedCompression:
         assert decompressed == original
 
 
+@pytest.mark.slow
 class TestUnifiedCompressionMemory:
     """Memory usage tests for unified compression.
 
@@ -879,11 +885,7 @@ class TestUnifiedCompressionMemory:
     # Maximum allowed overhead for streaming operations (4MB)
     MAX_OVERHEAD_BYTES = 4 * 1024 * 1024
 
-    @pytest.mark.parametrize(
-        "payload_size_mb",
-        [5, 10, 50],
-        ids=["5MB", "10MB", "50MB"],
-    )
+    @pytest.mark.parametrize("payload_size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     def test_compress_memory_overhead_bounded(self, payload_size_mb: int) -> None:
         """Compression overhead stays under 4MB regardless of payload size."""
         from hpke_http.streaming import zstd_compress
@@ -914,11 +916,7 @@ class TestUnifiedCompressionMemory:
             f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
         )
 
-    @pytest.mark.parametrize(
-        "payload_size_mb",
-        [5, 10, 50],
-        ids=["5MB", "10MB", "50MB"],
-    )
+    @pytest.mark.parametrize("payload_size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     def test_decompress_memory_overhead_bounded(self, payload_size_mb: int) -> None:
         """Decompression overhead stays under 4MB regardless of payload size.
 
@@ -955,11 +953,7 @@ class TestUnifiedCompressionMemory:
             f"(payload={payload_size_mb}MB, peak={peak_allocated / 1024 / 1024:.1f}MB)"
         )
 
-    @pytest.mark.parametrize(
-        "payload_size_mb",
-        [5, 10, 50],
-        ids=["5MB", "10MB", "50MB"],
-    )
+    @pytest.mark.parametrize("payload_size_mb", LARGE_PAYLOAD_SIZES_MB, ids=LARGE_PAYLOAD_SIZES_IDS)
     def test_roundtrip_memory_overhead_bounded(self, payload_size_mb: int) -> None:
         """Full compress+decompress roundtrip overhead stays under 4MB.
 
