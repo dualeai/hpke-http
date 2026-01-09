@@ -6,6 +6,21 @@ python_version ?= 3.10  # Lowest compatible version (see pyproject.toml requires
 version_full ?= $(shell $(MAKE) --silent version-full)
 version_small ?= $(shell $(MAKE) --silent version)
 
+# Test vectors
+VECTORS_DIR := tests/vectors
+
+# RFC 9180 HPKE vectors from CFRG
+CFRG_URL := https://raw.githubusercontent.com/cfrg/draft-irtf-cfrg-hpke/master/test-vectors.json
+CFRG_RAW := $(VECTORS_DIR)/rfc9180_all.json
+CFRG_PSK := $(VECTORS_DIR)/rfc9180_psk_x25519_chacha.json
+
+# Wycheproof vectors for primitives
+WYCHEPROOF_BASE := https://raw.githubusercontent.com/C2SP/wycheproof/master/testvectors_v1
+WYCHEPROOF_X25519 := $(VECTORS_DIR)/wycheproof_x25519.json
+WYCHEPROOF_CHACHA := $(VECTORS_DIR)/wycheproof_chacha20_poly1305.json
+WYCHEPROOF_HKDF := $(VECTORS_DIR)/wycheproof_hkdf_sha256.json
+WYCHEPROOF_HMAC := $(VECTORS_DIR)/wycheproof_hmac_sha256.json
+
 version:
 	@bash ./cicd/version.sh -g . -c
 
@@ -21,21 +36,6 @@ install:
 
 install-deps:
 	uv sync --extra dev --extra fastapi --extra aiohttp --extra httpx --extra zstd
-
-# Test vectors
-VECTORS_DIR := tests/vectors
-
-# RFC 9180 HPKE vectors from CFRG
-CFRG_URL := https://raw.githubusercontent.com/cfrg/draft-irtf-cfrg-hpke/master/test-vectors.json
-CFRG_RAW := $(VECTORS_DIR)/rfc9180_all.json
-CFRG_PSK := $(VECTORS_DIR)/rfc9180_psk_x25519_chacha.json
-
-# Wycheproof vectors for primitives
-WYCHEPROOF_BASE := https://raw.githubusercontent.com/C2SP/wycheproof/master/testvectors_v1
-WYCHEPROOF_X25519 := $(VECTORS_DIR)/wycheproof_x25519.json
-WYCHEPROOF_CHACHA := $(VECTORS_DIR)/wycheproof_chacha20_poly1305.json
-WYCHEPROOF_HKDF := $(VECTORS_DIR)/wycheproof_hkdf_sha256.json
-WYCHEPROOF_HMAC := $(VECTORS_DIR)/wycheproof_hmac_sha256.json
 
 upgrade:
 	uv lock --upgrade --refresh
