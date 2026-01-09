@@ -456,7 +456,18 @@ class BaseHPKEClient(ABC):
 
     @classmethod
     def _get_cache_lock(cls) -> asyncio.Lock:
-        """Get or create cache lock (lazy initialization for event loop safety)."""
+        """Get or create cache lock (lazy initialization for event loop safety).
+
+        Handles event loop changes (e.g., pytest-xdist parallel workers) by
+        detecting when a Lock is bound to a different loop and creating a new one.
+        """
+        current_loop = asyncio.get_running_loop()
+        if cls._cache_lock is not None:
+            # Check if lock is bound to a different event loop
+            # In Python 3.10+, Lock stores _loop internally
+            lock_loop = getattr(cls._cache_lock, "_loop", None)
+            if lock_loop is not None and lock_loop is not current_loop:
+                cls._cache_lock = None  # Reset, will create new one below
         if cls._cache_lock is None:
             cls._cache_lock = asyncio.Lock()
         return cls._cache_lock
