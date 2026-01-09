@@ -10,6 +10,18 @@ import os
 from collections.abc import AsyncGenerator
 from typing import Any
 
+# HPKE_DISABLE_ZSTD=true simulates zstd being unavailable for testing
+# Must be patched before importing middleware (which caches availability)
+if os.environ.get("HPKE_DISABLE_ZSTD") == "true":
+    import hpke_http.streaming
+
+    def _mock_import_zstd() -> Any:
+        raise ImportError("zstd disabled for testing (HPKE_DISABLE_ZSTD=true)")
+
+    hpke_http.streaming.import_zstd = _mock_import_zstd
+    # Also clear any cached module
+    hpke_http.streaming._zstd_module = None
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse

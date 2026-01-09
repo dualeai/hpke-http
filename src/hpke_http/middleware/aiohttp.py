@@ -307,11 +307,11 @@ class HPKEClientSession(BaseHPKEClient):
             await self._session.close()
             self._session = None
 
-    async def _fetch_discovery(self) -> tuple[dict[str, Any], str]:
+    async def _fetch_discovery(self) -> tuple[dict[str, Any], str, str]:
         """Fetch discovery endpoint using aiohttp.
 
         Returns:
-            Tuple of (response JSON dict, Cache-Control header value)
+            Tuple of (response JSON dict, Cache-Control header, Accept-Encoding header)
         """
         if not self._session:
             raise RuntimeError("Session not initialized. Use 'async with' context manager.")
@@ -323,7 +323,8 @@ class HPKEClientSession(BaseHPKEClient):
 
                 data = await resp.json()
                 cache_control = resp.headers.get("Cache-Control", "")
-                return (data, cache_control)
+                accept_encoding = resp.headers.get("Accept-Encoding", "identity")
+                return (data, cache_control, accept_encoding)
 
         except aiohttp.ClientError as e:
             _logger.debug("Key discovery failed: host=%s error=%s", self.base_url, e)

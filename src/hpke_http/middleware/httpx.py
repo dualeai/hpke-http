@@ -331,11 +331,11 @@ class HPKEAsyncClient(BaseHPKEClient):
             await self._client.aclose()
             self._client = None
 
-    async def _fetch_discovery(self) -> tuple[dict[str, Any], str]:
+    async def _fetch_discovery(self) -> tuple[dict[str, Any], str, str]:
         """Fetch discovery endpoint using httpx.
 
         Returns:
-            Tuple of (response JSON dict, Cache-Control header value)
+            Tuple of (response JSON dict, Cache-Control header, Accept-Encoding header)
         """
         if not self._client:
             raise RuntimeError("Client not initialized. Use 'async with' context manager.")
@@ -347,7 +347,8 @@ class HPKEAsyncClient(BaseHPKEClient):
 
             data = resp.json()
             cache_control = resp.headers.get("Cache-Control", "")
-            return (data, cache_control)
+            accept_encoding = resp.headers.get("Accept-Encoding", "identity")
+            return (data, cache_control, accept_encoding)
 
         except httpx.HTTPError as e:
             _logger.debug("Key discovery failed: host=%s error=%s", self.base_url, e)

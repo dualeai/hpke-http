@@ -181,12 +181,33 @@ class HPKEMiddleware:
         self.compress = compress
         self.require_encryption = require_encryption
 
+        # Check zstd availability for compression support
+        self._zstd_available = self._check_zstd_available()
+
+        # Validate compress config - fail fast if zstd unavailable
+        if compress and not self._zstd_available:
+            raise ImportError(
+                "HPKEMiddleware compress=True requires zstd. "
+                "Install with: pip install hpke-http[zstd]"
+            )
+
         # Derive public keys for discovery endpoint
         self._public_keys: dict[KemId, bytes] = {}
         for kem_id, sk in private_keys.items():
             if kem_id == KemId.DHKEM_X25519_HKDF_SHA256:
                 private_key = x25519.X25519PrivateKey.from_private_bytes(sk)
                 self._public_keys[kem_id] = private_key.public_key().public_bytes_raw()
+
+    @staticmethod
+    def _check_zstd_available() -> bool:
+        """Check if zstd decompression is available."""
+        try:
+            from hpke_http.streaming import import_zstd
+
+            import_zstd()
+            return True
+        except ImportError:
+            return False
 
     async def __call__(
         self,
@@ -222,6 +243,24 @@ class HPKEMiddleware:
             return
 
         _logger.debug("Encrypted request received: method=%s path=%s", method, path)
+
+        # Early rejection for unsupported encoding (RFC 9110 §12.5.3)
+        # Check before attempting decryption to fail fast with clear error
+        encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
+        if encoding_header == b"zstd" and not self._zstd_available:
+            _logger.debug(
+                "Rejected unsupported encoding: method=%s path=%s encoding=%s",
+                method,
+                path,
+                encoding_header,
+            )
+            await self._send_error(
+                send,
+                415,
+                "Unsupported encoding: zstd",
+                extra_headers=[(b"accept-encoding", b"identity")],
+            )
+            return
 
         # Decrypt request AND wrap send for response encryption
         # Track if response has started so we know if we can send error responses
@@ -459,6 +498,9 @@ class HPKEMiddleware:
 
         body = json.dumps(response).encode()
 
+        # Advertise supported request encodings (RFC 9110 §12.5.3)
+        accept_encoding = b"identity, zstd" if self._zstd_available else b"identity"
+
         await send(
             {
                 "type": "http.response.start",
@@ -467,6 +509,7 @@ class HPKEMiddleware:
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(body)).encode()),
                     (b"cache-control", f"public, max-age={DISCOVERY_CACHE_MAX_AGE}".encode()),
+                    (b"accept-encoding", accept_encoding),
                 ],
             }
         )
@@ -718,17 +761,28 @@ class HPKEMiddleware:
         send: Callable[[dict[str, Any]], Awaitable[None]],
         status: int,
         message: str,
+        extra_headers: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
-        """Send an error response."""
+        """Send an error response.
+
+        Args:
+            send: ASGI send callable
+            status: HTTP status code
+            message: Error message for JSON body
+            extra_headers: Additional headers to include (e.g., Accept-Encoding for 415)
+        """
         body = json.dumps({"error": message}).encode()
+        headers: list[tuple[bytes, bytes]] = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ]
+        if extra_headers:
+            headers.extend(extra_headers)
         await send(
             {
                 "type": "http.response.start",
                 "status": status,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                ],
+                "headers": headers,
             }
         )
         await send(

@@ -380,6 +380,20 @@ def parse_discovery_keys(response: dict[str, Any]) -> dict[KemId, bytes]:
     return result
 
 
+def parse_accept_encoding(header: str) -> set[str]:
+    """Parse Accept-Encoding header into set of encoding names.
+
+    Handles quality values per RFC 9110: 'zstd;q=1.0, gzip;q=0.8' → {'zstd', 'gzip'}
+
+    Args:
+        header: Accept-Encoding header value
+
+    Returns:
+        Set of encoding names (lowercase, quality values stripped)
+    """
+    return {e.strip().split(";")[0].lower() for e in header.split(",")}
+
+
 # =============================================================================
 # CLIENT MIDDLEWARE BASE CLASS
 # =============================================================================
@@ -399,8 +413,8 @@ class BaseHPKEClient(ABC):
     - SSE response stream decryption
     """
 
-    # Class-level key cache: host -> (keys_dict, expires_at)
-    _key_cache: ClassVar[dict[str, tuple[dict[KemId, bytes], float]]] = {}
+    # Class-level key cache: host -> (keys_dict, encodings_set, expires_at)
+    _key_cache: ClassVar[dict[str, tuple[dict[KemId, bytes], set[str], float]]] = {}
     _cache_lock: ClassVar[asyncio.Lock | None] = None
 
     def __init__(
@@ -436,6 +450,7 @@ class BaseHPKEClient(ABC):
         self._logger = logger
 
         self._platform_keys: dict[KemId, bytes] | None = None
+        self._server_encodings: set[str] = set()  # Populated by _ensure_keys from discovery
         # Subclasses must initialize _response_contexts with appropriate response type
         self._response_contexts: weakref.WeakKeyDictionary[Any, SenderContext]
 
@@ -447,13 +462,13 @@ class BaseHPKEClient(ABC):
         return cls._cache_lock
 
     @abstractmethod
-    async def _fetch_discovery(self) -> tuple[dict[str, Any], str]:
-        """Fetch discovery endpoint and return (json_data, cache_control_header).
+    async def _fetch_discovery(self) -> tuple[dict[str, Any], str, str]:
+        """Fetch discovery endpoint and return (json_data, cache_control, accept_encoding).
 
         Subclasses implement library-specific HTTP fetch.
 
         Returns:
-            Tuple of (response JSON dict, Cache-Control header value)
+            Tuple of (response JSON dict, Cache-Control header, Accept-Encoding header)
 
         Raises:
             KeyDiscoveryError: If fetch fails or returns non-200 status
@@ -461,7 +476,7 @@ class BaseHPKEClient(ABC):
         ...
 
     async def _ensure_keys(self) -> dict[KemId, bytes]:
-        """Fetch and cache platform public keys.
+        """Fetch and cache platform public keys and server encodings.
 
         Returns:
             Dict mapping KemId to public key bytes
@@ -475,39 +490,52 @@ class BaseHPKEClient(ABC):
         async with lock:
             # Check cache
             if host in self._key_cache:
-                keys, expires_at = self._key_cache[host]
+                keys, encodings, expires_at = self._key_cache[host]
                 if time.time() < expires_at:
                     if self._logger:
                         self._logger.debug("Key cache hit: host=%s", host)
                     self._platform_keys = keys
+                    self._server_encodings = encodings
                     return self._platform_keys
 
             if self._logger:
                 self._logger.debug("Key cache miss: host=%s fetching from %s", host, self.discovery_url)
 
             # Fetch from discovery endpoint (implemented by subclass)
-            data, cache_control = await self._fetch_discovery()
+            data, cache_control, accept_encoding = await self._fetch_discovery()
 
             # Parse Cache-Control for TTL
             max_age = parse_cache_max_age(cache_control)
             expires_at = time.time() + max_age
 
-            # Parse keys
+            # Parse keys and encodings
             keys = parse_discovery_keys(data)
+            encodings = parse_accept_encoding(accept_encoding)
 
-            # Cache
-            self._key_cache[host] = (keys, expires_at)
+            # Cache keys and encodings together
+            self._key_cache[host] = (keys, encodings, expires_at)
             self._platform_keys = keys
+            self._server_encodings = encodings
 
             if self._logger:
                 self._logger.debug(
-                    "Keys fetched: host=%s kem_ids=%s ttl=%ds",
+                    "Keys fetched: host=%s kem_ids=%s encodings=%s ttl=%ds",
                     host,
                     [f"0x{k:04x}" for k in keys],
+                    encodings,
                     max_age,
                 )
 
             return self._platform_keys
+
+    @property
+    def server_supports_zstd(self) -> bool:
+        """Check if server supports zstd encoding (from discovery).
+
+        Returns True if 'zstd' is in the Accept-Encoding header from discovery.
+        Must call _ensure_keys() first to populate _server_encodings.
+        """
+        return "zstd" in self._server_encodings
 
     def _encrypt_request_sync(
         self,
@@ -533,12 +561,16 @@ class BaseHPKEClient(ABC):
         if not pk_r:
             raise KeyDiscoveryError("No X25519 key available from platform")
 
+        # Auto-negotiate compression: only compress if client wants it AND server supports it
+        # This prevents 415 errors when server lacks zstd support
+        effective_compress = self.compress and self.server_supports_zstd
+
         # Use centralized RequestEncryptor - handles compression, chunking, encryption
         encryptor = RequestEncryptor(
             public_key=pk_r,
             psk=self.psk,
             psk_id=self.psk_id,
-            compress=self.compress,
+            compress=effective_compress,
         )
 
         # Prime the generator to trigger compression BEFORE get_headers()
