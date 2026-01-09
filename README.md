@@ -1,6 +1,6 @@
 # hpke-http
 
-End-to-end encryption for HTTP APIs using RFC 9180 HPKE. Drop-in middleware for FastAPI, aiohttp, and httpx.
+End-to-end encryption for HTTP APIs using RFC 9180 HPKE (Hybrid Public Key Encryption). Drop-in middleware for FastAPI, aiohttp, and httpx.
 
 [![CI](https://github.com/dualeai/hpke-http/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/hpke-http/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/hpke-http)](https://pypi.org/project/hpke-http/)
@@ -11,9 +11,9 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE. Drop-in middleware for 
 ## Highlights
 
 - **Transparent** - Drop-in middleware, no application code changes
-- **E2E encryption** - Protects data even with TLS termination at CDN/LB
-- **PSK binding** - Each request cryptographically bound to API key
-- **Replay protection** - Counter-based nonces prevent replay attacks
+- **End-to-end encryption** - Protects data even when TLS terminates at CDN or load balancer
+- **PSK binding** - Each request cryptographically bound to pre-shared key (API key)
+- **Replay protection** - Counter-based nonces (numbers used once) prevent replay attacks
 - **RFC 9180 compliant** - Auditable, interoperable standard
 
 ## Installation
@@ -22,12 +22,12 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE. Drop-in middleware for 
 uv add "hpke-http[fastapi]"       # Server
 uv add "hpke-http[aiohttp]"       # Client (aiohttp)
 uv add "hpke-http[httpx]"         # Client (httpx)
-uv add "hpke-http[fastapi,zstd]"  # + zstd compression (gzip fallback is stdlib)
+uv add "hpke-http[fastapi,zstd]"  # + zstd compression (gzip fallback included)
 ```
 
 ## Quick Start
 
-Both standard JSON requests and SSE streaming are transparently encrypted.
+Both standard JSON requests and SSE (Server-Sent Events) streaming are transparently encrypted.
 
 ### Server (FastAPI)
 
@@ -122,47 +122,23 @@ async with HPKEAsyncClient(
 - [RFC 5869 - HKDF](https://datatracker.ietf.org/doc/rfc5869/)
 - [RFC 8439 - ChaCha20-Poly1305](https://datatracker.ietf.org/doc/rfc8439/)
 - [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (preferred compression)
-- [RFC 1952 - Gzip](https://datatracker.ietf.org/doc/rfc1952/) (fallback compression, stdlib)
+- [RFC 1952 - Gzip](https://datatracker.ietf.org/doc/rfc1952/) (fallback compression, always available)
 - [RFC 9110 - HTTP Semantics](https://datatracker.ietf.org/doc/rfc9110/) (Accept-Encoding negotiation)
-
-## Security
-
-Uses OpenSSL constant-time implementations via `cryptography` library.
-
-- [Security Policy](./SECURITY.md) - Vulnerability reporting
-- [SBOM](https://github.com/dualeai/hpke-http/releases) - CycloneDX attached to releases
-
-## Contributing
-
-Contributions welcome! Please open an issue first to discuss changes.
-
-```bash
-make install      # Setup venv
-make test         # Run tests
-make lint         # Format and lint
-```
-
-## License
-
-[Apache-2.0](https://opensource.org/licenses/Apache-2.0)
-
----
-
-<details>
-<summary>Technical Details</summary>
 
 ## Cipher Suite
 
 | Component | Algorithm | ID |
 | --------- | --------- | ------ |
-| KEM | DHKEM(X25519, HKDF-SHA256) | 0x0020 |
-| KDF | HKDF-SHA256 | 0x0001 |
-| AEAD | ChaCha20-Poly1305 | 0x0003 |
-| Mode | PSK | 0x01 |
+| KEM (Key Encapsulation) | DHKEM(X25519, HKDF-SHA256) | 0x0020 |
+| KDF (Key Derivation) | HKDF-SHA256 | 0x0001 |
+| AEAD (Authenticated Encryption) | ChaCha20-Poly1305 | 0x0003 |
+| Mode | PSK (Pre-Shared Key) | 0x01 |
 
 ## Wire Format
 
 ### Request/Response (Chunked Binary)
+
+See [Header Modifications](#header-modifications) for when headers are added.
 
 ```text
 Headers:
@@ -172,7 +148,7 @@ Headers:
 Body (repeating chunks):
 ┌───────────┬────────────┬─────────────────────────────────┐
 │ Length(4B)│ Counter(4B)│ Ciphertext (N + 16B tag)        │
-│ big-end   │ big-end    │ encrypted: encoding_id || data  │
+│ big-endian│ big-endian │ encrypted: encoding_id || data  │
 └───────────┴────────────┴─────────────────────────────────┘
 Overhead: 24B/chunk (4B length + 4B counter + 16B tag)
 ```
@@ -189,40 +165,16 @@ Uses standard base64 (not base64url) - SSE data fields allow +/= characters.
 
 ## Auto-Encryption
 
-The middleware automatically encrypts **all responses** when the request was encrypted:
-
-- **Standard responses** (JSON, HTML, etc.) - Uses chunked binary format (RawFormat)
-- **SSE responses** - Uses base64-encoded SSE events (SSEFormat)
-
-Response type is detected via `Content-Type` header:
-
-- `text/event-stream` → SSE format (requires `media_type="text/event-stream"`)
-- Everything else → Binary chunked format
+The middleware automatically encrypts **all responses** when the request was encrypted. See [Response Types](#response-types) for format selection and [HTTP Methods](#http-methods) for when encryption activates.
 
 ## Compression (Optional)
 
-Zstd (RFC 8878) reduces bandwidth by **40-95%** for JSON/text. Gzip (RFC 1952) is used as fallback when zstd is unavailable.
-
-**Auto-negotiation:** Clients with `compress=True` automatically detect server capabilities via the `Accept-Encoding` header in discovery response. Priority: zstd > gzip > identity.
-
-```python
-# Client auto-negotiates best available encoding
-async with HPKEClientSession(base_url=url, psk=key, compress=True) as client:
-    # Check server capabilities (after first request triggers discovery)
-    print(client.server_supports_zstd)  # True or False
-    print(client.server_supports_gzip)  # True (always, stdlib)
-```
-
-**Server config:** Enable with `compress=True`. Server advertises supported encodings (`identity, gzip, zstd` or `identity, gzip` if zstd unavailable).
-
-**Request compression:** Client compresses body before encryption when `compress=True`, using best mutually-supported encoding. Payloads < 64 bytes skip compression.
-
-**Response compression:** Server compresses response chunks (both SSE and standard) when `compress=True`. Payloads < 64 bytes skip compression.
+Zstd reduces bandwidth by **40-95%** for JSON/text. Enable with `compress=True` on both client and server. Payloads < 64 bytes skip compression. See [Compression table](#compression) for algorithm priority.
 
 ## Pitfalls
 
 ```python
-# PSK too short
+# PSK too short (applies to both aiohttp and httpx clients)
 HPKEClientSession(psk=b"short")                 # InvalidPSKError
 HPKEClientSession(psk=secrets.token_bytes(32))  # >= 32 bytes
 
@@ -247,13 +199,141 @@ return {"data": "value"}  # Auto-encrypted as binary chunks
 
 > **Note:** SSE is text-only (UTF-8). Binary data must be base64-encoded (+33% overhead).
 
+## HTTP Compatibility
+
+### Protocol Support
+
+| Feature | Supported | Notes |
+| ------- | --------- | ----- |
+| HTTP/1.1 | Yes | Chunked transfer encoding for streaming |
+| HTTP/2 | Yes | Native framing (chunked encoding forbidden by spec) |
+| HTTP/3 | Yes | QUIC streams, same semantics as HTTP/2 |
+| WebSockets | No | Different protocol, not applicable |
+
+### HTTP Methods
+
+All methods supported. **Encryption requires a request body** to establish the HPKE context.
+
+| Method | Typical Use | With Body | Without Body |
+| ------ | ----------- | --------- | ------------ |
+| POST | Create | Encrypted (both directions) | Plaintext* |
+| PUT | Replace | Encrypted (both directions) | Plaintext* |
+| PATCH | Update | Encrypted (both directions) | Plaintext* |
+| DELETE | Remove | Encrypted (both directions) | Plaintext |
+| GET | Read | Encrypted (both directions) | Plaintext |
+| HEAD | Metadata | N/A | Plaintext (no response body) |
+| OPTIONS | Preflight | Encrypted (both directions) | Plaintext |
+
+*Unusual - these methods typically have a body.
+
+> **Design note:** The HPKE encryption context is established during request encryption (key exchange + PSK). Without a request body, no encryption context exists for the response.
+>
+> For read-only endpoints requiring E2E encryption, use POST with a body (common pattern for sensitive queries).
+
+### Response Types
+
+| Content-Type | Format | Streaming | Notes |
+| ------------ | ------ | --------- | ----- |
+| `application/json` | Binary chunks | No | Buffered, then chunked |
+| `text/html` | Binary chunks | No | Any non-SSE content type |
+| `text/event-stream` | SSE events | Yes | Real-time streaming |
+| `application/octet-stream` | Binary chunks | No | Binary data |
+
+### Compression
+
+| Algorithm | Request | Response | Priority |
+| --------- | ------- | -------- | -------- |
+| Zstd (RFC 8878) | Yes | Yes | 1 (preferred) |
+| Gzip (RFC 1952) | Yes | Yes | 2 (fallback) |
+| Identity | Yes | Yes | 3 (no compression) |
+
+Auto-negotiated via `Accept-Encoding` header on discovery endpoint (`/.well-known/hpke-keys`).
+
+## Encryption Scope
+
+> Applies when request has a body (see [HTTP Methods](#http-methods) above).
+
+### What IS Encrypted
+
+| Component | Encrypted | Format |
+| --------- | --------- | ------ |
+| Request body | Yes | Binary chunks |
+| Response body | Yes | Binary chunks or SSE events |
+| JSON payloads | Yes | Inside encrypted body |
+| Binary data | Yes | Inside encrypted body |
+| SSE event content | Yes | Base64 in `data:` field |
+
+### What is NOT Encrypted
+
+| Component | Visible to | Reason |
+| --------- | ---------- | ------ |
+| URL path | Network | Routing requires plaintext |
+| Query parameters | Network | Part of URL |
+| HTTP method | Network | Protocol requirement |
+| HTTP headers | Network | Routing, caching, auth |
+| Status code | Network | Protocol requirement |
+| TLS metadata | Network | Transport layer |
+
+### Header Modifications
+
+| Header | Request | Response | Reason |
+| ------ | ------- | -------- | ------ |
+| `Content-Type` | Set to `application/octet-stream` | Preserved | Encrypted body is binary |
+| `Content-Length` | Auto (chunked) | Removed | Size changes after encryption |
+| `X-HPKE-Enc` | Added | - | Ephemeral public key |
+| `X-HPKE-Stream` | Added | Added | Session salt for nonces |
+| `X-HPKE-Encoding` | Added (if compressed) | - | Compression algorithm |
+
+### Security Boundary
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ TLS Encrypted (transport)                                   │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │ HTTP Layer (visible to CDN/LB/proxies)                │  │
+│  │  • Method: POST                                       │  │
+│  │  • URL: /api/chat                                     │  │
+│  │  • Headers: Authorization, X-HPKE-*, Content-Type     │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │ HPKE Encrypted (end-to-end)                     │  │  │
+│  │  │  • Request body: {"prompt": "Hello"}            │  │  │
+│  │  │  • Response body: {"response": "Hi!"}           │  │  │
+│  │  │  • SSE events: event: done\ndata: {...}\n\n     │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ## Low-Level API
+
+Direct access to HPKE seal/open operations:
 
 ```python
 from hpke_http.hpke import seal_psk, open_psk
 
+# pk_r: recipient public key, sk_r: recipient secret key
+# psk/psk_id: pre-shared key and identifier, aad: additional authenticated data
 enc, ct = seal_psk(pk_r, b"info", psk, psk_id, b"aad", b"plaintext")
 pt = open_psk(enc, sk_r, b"info", psk, psk_id, b"aad", ct)
 ```
 
-</details>
+## Security
+
+Uses OpenSSL constant-time implementations via `cryptography` library.
+
+- [Security Policy](./SECURITY.md) - Vulnerability reporting
+- [SBOM](https://github.com/dualeai/hpke-http/releases) - Software Bill of Materials (CycloneDX format) attached to releases
+
+## Contributing
+
+Contributions welcome! Please open an issue first to discuss changes.
+
+```bash
+make install      # Setup venv
+make test         # Run tests
+make lint         # Format and lint
+```
+
+## License
+
+[Apache-2.0](https://opensource.org/licenses/Apache-2.0)
