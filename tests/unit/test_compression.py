@@ -415,12 +415,13 @@ class TestCompressionErrors:
             decryptor.decrypt(encoded)
 
     def test_reserved_encoding_ids_raise_error(self) -> None:
-        """Reserved encoding IDs (0x02-0xFF except valid) raise DecryptionError."""
+        """Reserved encoding IDs (0x03-0xFF) raise DecryptionError."""
         import base64
 
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-        for encoding_id in [0x02, 0x03, 0x10, 0x80, 0xFE, 0xFF]:
+        # 0x00=IDENTITY, 0x01=ZSTD, 0x02=GZIP are valid; 0x03+ are reserved
+        for encoding_id in [0x03, 0x10, 0x80, 0xFE, 0xFF]:
             # Fresh session for each test (counter resets)
             test_session = make_sse_session()
             test_cipher = ChaCha20Poly1305(test_session.session_key)

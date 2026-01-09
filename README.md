@@ -1,6 +1,6 @@
 # hpke-http
 
-End-to-end encryption for HTTP APIs using RFC 9180 HPKE.
+End-to-end encryption for HTTP APIs using RFC 9180 HPKE. Drop-in middleware for FastAPI, aiohttp, and httpx.
 
 [![CI](https://github.com/dualeai/hpke-http/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/hpke-http/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/hpke-http)](https://pypi.org/project/hpke-http/)
@@ -20,8 +20,9 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE.
 
 ```bash
 uv add "hpke-http[fastapi]"       # Server
-uv add "hpke-http[aiohttp]"       # Client
-uv add "hpke-http[fastapi,zstd]"  # + compression
+uv add "hpke-http[aiohttp]"       # Client (aiohttp)
+uv add "hpke-http[httpx]"         # Client (httpx)
+uv add "hpke-http[fastapi,zstd]"  # + zstd compression (gzip fallback is stdlib)
 ```
 
 ## Quick Start
@@ -75,15 +76,42 @@ async with HPKEClientSession(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
+    # compress=True,           # Compression (zstd preferred, gzip fallback)
+    # require_encryption=True, # Raise if server responds unencrypted
+    # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
 ) as session:
     # Standard JSON request - encryption is automatic
-    resp = await session.post("/users", json={"name": "Alice"})
-    user = await resp.json()  # Decrypted automatically
+    async with session.post("/users", json={"name": "Alice"}) as resp:
+        user = await resp.json()  # Decrypted automatically
+        print(user)  # {"id": 123, "name": "Alice"}
+
+    # SSE streaming request - encryption is automatic
+    async with session.post("/chat", json={"prompt": "Hello"}) as resp:
+        async for chunk in session.iter_sse(resp):
+            print(chunk)  # b"event: progress\ndata: {...}\n\n"
+```
+
+### Client (httpx)
+
+```python
+from hpke_http.middleware.httpx import HPKEAsyncClient
+
+async with HPKEAsyncClient(
+    base_url="https://api.example.com",
+    psk=api_key,        # >= 32 bytes
+    psk_id=tenant_id,
+    # compress=True,           # Compression (zstd preferred, gzip fallback)
+    # require_encryption=True, # Raise if server responds unencrypted
+    # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
+) as client:
+    # Standard JSON request - encryption is automatic
+    resp = await client.post("/users", json={"name": "Alice"})
+    user = resp.json()  # Decrypted automatically
     print(user)  # {"id": 123, "name": "Alice"}
 
     # SSE streaming request - encryption is automatic
-    resp = await session.post("/chat", json={"prompt": "Hello"})
-    async for chunk in session.iter_sse(resp):
+    resp = await client.post("/chat", json={"prompt": "Hello"})
+    async for chunk in client.iter_sse(resp):
         print(chunk)  # b"event: progress\ndata: {...}\n\n"
 ```
 
@@ -93,7 +121,9 @@ async with HPKEClientSession(
 - [RFC 7748 - X25519](https://datatracker.ietf.org/doc/rfc7748/)
 - [RFC 5869 - HKDF](https://datatracker.ietf.org/doc/rfc5869/)
 - [RFC 8439 - ChaCha20-Poly1305](https://datatracker.ietf.org/doc/rfc8439/)
-- [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (optional compression)
+- [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (preferred compression)
+- [RFC 1952 - Gzip](https://datatracker.ietf.org/doc/rfc1952/) (fallback compression, stdlib)
+- [RFC 9110 - HTTP Semantics](https://datatracker.ietf.org/doc/rfc9110/) (Accept-Encoding negotiation)
 
 ## Security
 
@@ -171,18 +201,23 @@ Response type is detected via `Content-Type` header:
 
 ## Compression (Optional)
 
-Zstd compression reduces bandwidth by **40-95%** for JSON/text.
+Zstd (RFC 8878) reduces bandwidth by **40-95%** for JSON/text. Gzip (RFC 1952) is used as fallback when zstd is unavailable.
+
+**Auto-negotiation:** Clients with `compress=True` automatically detect server capabilities via the `Accept-Encoding` header in discovery response. Priority: zstd > gzip > identity.
 
 ```python
-HPKEMiddleware(..., compress=True)      # Server
-HPKEClientSession(..., compress=True)   # Client
+# Client auto-negotiates best available encoding
+async with HPKEClientSession(base_url=url, psk=key, compress=True) as client:
+    # Check server capabilities (after first request triggers discovery)
+    print(client.server_supports_zstd)  # True or False
+    print(client.server_supports_gzip)  # True (always, stdlib)
 ```
 
-| Choice | Rationale |
-| ------ | --------- |
-| Compress-then-encrypt | Encrypted data is incompressible |
-| Zstd (RFC 8878) | Best ratio/speed, Python 3.14 native |
-| 64B threshold | Smaller payloads skip compression |
+**Server config:** Enable with `compress=True`. Server advertises supported encodings (`identity, gzip, zstd` or `identity, gzip` if zstd unavailable).
+
+**Request compression:** Client compresses body before encryption when `compress=True`, using best mutually-supported encoding. Payloads < 64 bytes skip compression.
+
+**Response compression:** Server compresses response chunks (both SSE and standard) when `compress=True`. Payloads < 64 bytes skip compression.
 
 ## Pitfalls
 

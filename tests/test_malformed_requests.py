@@ -118,16 +118,17 @@ class TestMalformedCompressionHeaders:
     """Test server handling of invalid compression headers.
 
     Tests X-HPKE-Encoding header edge cases with properly encrypted requests.
-    Only 'zstd' (lowercase) triggers decompression; other values are ignored.
+    'zstd' and 'gzip' (lowercase) trigger decompression; other values are ignored.
     """
 
     @pytest.mark.parametrize(
         ("encoding_value", "expected_status", "description"),
         [
-            ("gzip", 200, "invalid encoding ignored"),
+            ("gzip", 400, "gzip with uncompressed body fails"),
             ("zstd", 400, "zstd with uncompressed body fails"),
             ("", 200, "empty header treated as identity"),
             ("ZSTD", 200, "uppercase ignored (case-sensitive)"),
+            ("GZIP", 200, "uppercase ignored (case-sensitive)"),
             ("deflate", 200, "deflate ignored"),
             ("br", 200, "brotli ignored"),
         ],

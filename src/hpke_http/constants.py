@@ -14,7 +14,7 @@ References:
 - RFC 9180 §5.1.2 (PSK mode)
 """
 
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Final
 
 # =============================================================================
@@ -226,8 +226,52 @@ class SSEEncodingId(IntEnum):
     """No compression - raw plaintext."""
     ZSTD = 0x01
     """Zstandard compression (RFC 8878)."""
+    GZIP = 0x02
+    """Gzip compression (RFC 1952). Stdlib fallback when zstd unavailable."""
     # Reserved for future:
-    # BROTLI = 0x02  # Brotli (RFC 7932)
+    # BROTLI = 0x03  # Brotli (RFC 7932)
+
+
+class EncodingName(str, Enum):
+    """Encoding algorithm names for HTTP headers (X-HPKE-Encoding, Accept-Encoding).
+
+    Uses str base class so enum values can be used directly as strings.
+    Maps to SSEEncodingId for wire format conversion.
+    """
+
+    IDENTITY = "identity"
+    """No compression."""
+    ZSTD = "zstd"
+    """Zstandard compression (RFC 8878)."""
+    GZIP = "gzip"
+    """Gzip compression (RFC 1952)."""
+
+    def __str__(self) -> str:
+        """Return the value for HTTP header serialization.
+
+        Python 3.10's str+Enum returns 'EncodingName.ZSTD' from __str__,
+        but we need 'zstd' for HTTP headers.
+        """
+        return self.value
+
+
+# Base encodings always supported (gzip is stdlib)
+_BASE_ENCODINGS: Final[list[EncodingName]] = [EncodingName.IDENTITY, EncodingName.GZIP]
+
+
+def build_accept_encoding(*, zstd_available: bool) -> str:
+    """Build Accept-Encoding header value based on available algorithms.
+
+    Args:
+        zstd_available: Whether zstd compression is available
+
+    Returns:
+        Comma-separated encoding names (e.g., "identity, gzip, zstd")
+    """
+    encodings: list[EncodingName] = _BASE_ENCODINGS.copy()
+    if zstd_available:
+        encodings.append(EncodingName.ZSTD)
+    return ", ".join(encodings)
 
 
 ZSTD_COMPRESSION_LEVEL: Final[int] = 3
@@ -264,3 +308,25 @@ Set low (1KB) because compressed JSON often expands 100-1000x, so even
 tiny compressed payloads can decompress to large sizes where RAM savings
 outweigh CPU cost.
 """
+
+# =============================================================================
+# Gzip Compression Constants (RFC 1952)
+# =============================================================================
+
+GZIP_COMPRESSION_LEVEL: Final[int] = 6
+"""Gzip compression level (0-9). Level 6 = default balance (same as gzip CLI).
+
+Level 9 is ~3x slower than level 6 for only ~1% better compression.
+"""
+
+GZIP_MIN_SIZE: Final[int] = 64
+"""Minimum payload size for gzip compression. Same threshold as zstd."""
+
+GZIP_STREAMING_THRESHOLD: Final[int] = 1024 * 1024  # 1MB
+"""Threshold for using streaming gzip compression vs in-memory.
+
+Matches zstd threshold for consistency.
+"""
+
+GZIP_STREAMING_CHUNK_SIZE: Final[int] = 4 * 1024 * 1024  # 4MB
+"""Chunk size for streaming gzip compression. Matches zstd for consistency."""

@@ -124,7 +124,7 @@ class TestRFC9180Vectors:
             expected_nonce = bytes.fromhex(enc_data["nonce"])
 
             # Verify nonce matches (before seal increments seq)
-            actual_nonce = sender_ctx._compute_nonce()  # pyright: ignore[reportPrivateUsage]
+            actual_nonce = sender_ctx._compute_nonce()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             assert actual_nonce == expected_nonce, f"nonce mismatch at seq {sender_ctx.seq}"
 
             # Encrypt

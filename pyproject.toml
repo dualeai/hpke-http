@@ -1,7 +1,7 @@
 [project]
 name = "hpke_http"
 version = "0.1.0"
-description = "End-to-end encryption for HTTP APIs using RFC 9180 HPKE"
+description = "End-to-end encryption for HTTP APIs using RFC 9180 HPKE. Drop-in middleware for FastAPI, aiohttp, and httpx."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -19,6 +19,7 @@ keywords = [
     "x25519",
     "fastapi",
     "aiohttp",
+    "httpx",
     "sse",
     "streaming",
 ]
@@ -45,6 +46,7 @@ dependencies = [
 dev = [
     "granian~=2.0",              # Rust ASGI server for E2E tests
     "hypothesis~=6.148",         # Property-based fuzz testing
+    "py-spy~=0.4",               # Sampling profiler for flamegraph generation
     "pyright~=1.1",
     "pytest-asyncio~=0.24",
     "pytest-cov~=7.0",
@@ -69,6 +71,10 @@ fastapi = [
 # aiohttp client (optional for client-side)
 aiohttp = [
     "aiohttp~=3.13",  # Upgraded from ~=3.11 for security fixes
+]
+# httpx client (optional for client-side)
+httpx = [
+    "httpx~=0.28",
 ]
 # Zstd compression (optional, RFC 8878)
 zstd = [
@@ -164,14 +170,9 @@ select = [
 ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use secrets)
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["PLR2004", "PLR0915", "S101", "S603", "S607", "SIM115", "ASYNC109", "ASYNC220", "ASYNC230", "SIM117", "F841", "RUF059", "PLC0415"]  # Tests: magic values, too many statements, assert, subprocess, async patterns, nested with, unused vars, local imports
-"tests/**/test_rfc9180*.py" = ["SLF001"]  # Vector tests need internal state access
-"tests/**/test_fuzz.py" = ["SLF001"]  # Fuzz tests need internal state access for overflow testing
-"tests/**/test_aiohttp_client.py" = ["SLF001"]  # Unit tests for private parsing methods
-"tests/**/test_streaming_errors.py" = ["SLF001"]  # Error tests need internal cipher access
-"tests/**/bench*.py" = ["T201", "BLE001", "SIM102", "PERF401", "PERF402"]  # Benchmark scripts: print, broad except, nested if, list patterns
-"tests/**/benchmark*.py" = ["T201", "F401", "RET505"]  # Benchmark scripts: print, unused imports, elif after return
+"tests/**/*.py" = ["PLR2004", "PLR0915", "S101", "S603", "S607", "SIM115", "ASYNC109", "ASYNC220", "ASYNC230", "SIM117", "F841", "RUF059", "PLC0415", "ARG001"]  # Tests: magic values, too many statements, assert, subprocess, async patterns, nested with, unused vars, local imports, unused args (callback signatures)
 "src/**/streaming.py" = ["PLW0603", "PLC0415", "RUF002"]  # Optional zstd: module caching requires global, lazy import for optional deps, unicode multiplication sign
+"src/**/middleware/fastapi.py" = ["PLC0415"]  # Lazy import for optional zstd dependency
 
 [tool.vulture]
 exclude = [".venv/"]  # Exclude deps

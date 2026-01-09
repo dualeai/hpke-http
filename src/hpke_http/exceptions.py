@@ -55,3 +55,12 @@ class ReplayAttackError(CryptoError):
         self.received = received
         # Don't expose counter values in message to prevent information leakage
         super().__init__("SSE event counter validation failed")
+
+
+class EncryptionRequiredError(CryptoError):
+    """Encryption was required but request/response was plaintext.
+
+    Raised when:
+    - Server has require_encryption=True and receives a plaintext request
+    - Client has require_encryption=True and receives a plaintext response
+    """
