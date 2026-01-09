@@ -19,7 +19,7 @@ Reference: RFC-065 §4.4, §5.2
 import json as json_module
 import types
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import timedelta
 from http import HTTPStatus
 from typing import Any
@@ -29,9 +29,10 @@ from httpx._content import encode_multipart_data
 from typing_extensions import Self
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM, KemId
+from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM, KemId
 from hpke_http.core import (
     BaseHPKEClient,
+    RequestEncryptor,
     ResponseDecryptor,
     SSEDecryptor,
     SSELineParser,
@@ -46,6 +47,33 @@ __all__ = [
 ]
 
 _logger = get_logger(__name__)
+
+
+def _rechunk_iter(
+    source: Iterator[bytes],
+    chunk_size: int = CHUNK_SIZE,
+) -> Iterator[bytes]:
+    """
+    Re-chunk an iterator to yield bounded chunks.
+
+    httpx's MultipartStream yields full file content for in-memory bytes.
+    This function re-chunks large pieces into bounded chunks for memory-efficient
+    streaming encryption (same pattern as aiohttp's _stream_multipart).
+
+    Args:
+        source: Iterator yielding bytes (may yield large chunks)
+        chunk_size: Maximum chunk size to yield (default: 64KB)
+
+    Yields:
+        Chunks of at most chunk_size bytes
+    """
+    for chunk in source:
+        if len(chunk) <= chunk_size:
+            yield chunk
+        else:
+            # Re-chunk large pieces (e.g., full file content from bytes input)
+            for offset in range(0, len(chunk), chunk_size):
+                yield chunk[offset : offset + chunk_size]
 
 
 class DecryptedResponse:
@@ -384,6 +412,72 @@ class HPKEAsyncClient(BaseHPKEClient):
 
         return (async_stream(), headers, ctx)
 
+    def _encrypt_stream_sync(
+        self,
+        chunks: Iterator[bytes],
+        keys: dict[KemId, bytes],
+    ) -> tuple[Iterator[bytes], dict[str, str], SenderContext]:
+        """
+        Encrypt sync stream using RequestEncryptor.feed/finalize API.
+
+        Mirrors aiohttp's _encrypt_stream_async but for sync iterators.
+        Uses the same RequestEncryptor API that handles buffering internally.
+
+        Note: Does NOT support whole-body compression (same as aiohttp).
+        Each chunk is encrypted as-is with IDENTITY encoding.
+
+        Args:
+            chunks: Sync iterator of raw bytes (from MultipartStream)
+            keys: Platform public keys from discovery
+
+        Returns:
+            Tuple of (sync_encrypted_iterator, headers_dict, sender_context)
+        """
+        pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
+        if not pk_r:
+            raise KeyDiscoveryError("No X25519 key available from platform")
+
+        # Create encryptor without compression (streaming doesn't support whole-body)
+        # Same pattern as aiohttp.py:515-520
+        encryptor = RequestEncryptor(
+            public_key=pk_r,
+            psk=self.psk,
+            psk_id=self.psk_id,
+            compress=False,  # Streaming doesn't support whole-body compression
+        )
+
+        def encrypt_gen() -> Iterator[bytes]:
+            for chunk in chunks:
+                yield from encryptor.feed(chunk)
+            yield from encryptor.finalize()
+
+        return encrypt_gen(), encryptor.get_headers(), encryptor.context
+
+    async def _encrypt_multipart_stream(
+        self,
+        multipart_iter: Iterator[bytes],
+    ) -> tuple[AsyncIterator[bytes], dict[str, str], SenderContext]:
+        """
+        Encrypt streaming multipart with O(chunk_size) memory.
+
+        Async wrapper around _encrypt_stream_sync for httpx compatibility.
+        Mirrors aiohttp's _encrypt_stream_async pattern.
+
+        Args:
+            multipart_iter: Iterator from httpx encode_multipart_data()
+
+        Returns:
+            Tuple of (async_encrypted_iterator, headers_dict, sender_context)
+        """
+        keys = await self._ensure_keys()
+        sync_iter, headers, ctx = self._encrypt_stream_sync(multipart_iter, keys)
+
+        async def async_stream() -> AsyncIterator[bytes]:
+            for chunk in sync_iter:
+                yield chunk
+
+        return async_stream(), headers, ctx
+
     def _prepare_body(
         self,
         *,
@@ -396,28 +490,22 @@ class HPKEAsyncClient(BaseHPKEClient):
         """
         Prepare request body for encryption, preserving original Content-Type.
 
+        Note: files/multipart is handled separately in request() with streaming.
+        This method only handles json, content, and raw bytes.
+
         Returns:
             Tuple of (body_bytes, original_content_type, files, data)
             - body_bytes: Serialized body ready for encryption (or None)
             - original_content_type: Original Content-Type to preserve (or None)
-            - files: Cleared to None if serialized into body
+            - files: Passed through unchanged (handled in request())
             - data: Cleared to None if serialized into body
         """
         body: bytes | None = None
         original_content_type: str | None = None
 
-        # Handle multipart files - serialize to bytes before encryption
-        if files is not None:
-            multipart_headers, multipart_stream = encode_multipart_data(
-                data=data or {},
-                files=files,
-                boundary=None,  # Let httpx generate random boundary
-            )
-            body = b"".join(multipart_stream)  # MultipartStream is iterable
-            original_content_type = multipart_headers.get("Content-Type", "")
-            files = None  # Clear since we're serializing to body
-            data = None
-        elif json is not None:
+        # Note: multipart files are handled in request() with streaming encryption
+        # to avoid O(payload_size) memory usage from b"".join()
+        if json is not None:
             # NOTE: json.dumps().encode() creates 2 allocations (str → bytes).
             # For higher throughput, consider orjson.dumps() which returns bytes
             # directly (1 allocation, ~10x faster). Not included as dependency
@@ -481,14 +569,41 @@ class HPKEAsyncClient(BaseHPKEClient):
         # Build headers dict early (needed for Content-Type preservation)
         request_headers = dict(headers or {})
 
-        # Prepare body for encryption (handles multipart, json, raw bytes)
+        sender_ctx: SenderContext | None = None
+        encrypted_content: Any = content
+
+        # Handle multipart files with streaming (avoids full materialization)
+        # Pattern from aiohttp.py:601-620 - handle BEFORE _prepare_body()
+        if files is not None:
+            multipart_headers, multipart_stream = encode_multipart_data(
+                data=data or {},
+                files=files,
+                boundary=None,  # Let httpx generate random boundary
+            )
+            original_content_type = multipart_headers.get("Content-Type", "")
+
+            # Use streaming encryption - memory O(chunk_size) instead of O(total_size)
+            # _rechunk_iter breaks large chunks (e.g., full file content) into 64KB pieces
+            encrypted_stream, crypto_headers, ctx = await self._encrypt_multipart_stream(
+                _rechunk_iter(iter(multipart_stream))
+            )
+            request_headers.update(crypto_headers)
+            request_headers[HEADER_HPKE_CONTENT_TYPE] = original_content_type
+            request_headers["Content-Type"] = "application/octet-stream"
+            sender_ctx = ctx
+            encrypted_content = encrypted_stream
+
+            _logger.debug("Multipart encrypted with streaming: method=%s url=%s", method, url)
+
+            # Clear to skip _prepare_body processing (multipart fully handled above)
+            files = data = json = None
+
+        # Prepare body for encryption (handles json, raw bytes - NOT multipart)
         body, original_content_type, files, data = self._prepare_body(
             content=content, data=data, files=files, json=json, headers=request_headers
         )
-        sender_ctx: SenderContext | None = None
 
-        # Encrypt if we have a body to encrypt
-        encrypted_content: Any = content
+        # Encrypt if we have a body to encrypt (non-multipart path)
         if body:
             keys = await self._ensure_keys()
             encrypted_stream, crypto_headers, ctx = self._encrypt_request(body, keys)
