@@ -13,6 +13,30 @@ Usage:
                 # chunk is exactly what server sent (event, comment, retry, etc.)
                 print(chunk)
 
+Architecture note:
+    This module uses a wrapper pattern (composition) rather than aiohttp's native
+    client middleware (added in 3.12) for the following reasons:
+
+    1. Response type limitation: Middleware must return ClientResponse, but HPKE
+       decryption requires returning DecryptedResponse to intercept read()/json()/text().
+       Middleware signature: async def(req, handler) -> ClientResponse
+       Note: Middleware CAN encrypt requests via req.update_body(), but cannot wrap
+       the response for transparent decryption.
+
+    2. SSE context tracking: Streaming decryption requires associating the SenderContext
+       with each response via _response_contexts. Middleware has no clean mechanism to
+       pass cryptographic state to the caller for later use in iter_sse().
+
+    3. propcache incompatibility: Subclassing ClientResponse is problematic because
+       aiohttp uses propcache.under_cached_property for headers/url, which breaks
+       pyright Protocol matching.
+
+    Native middleware is designed for cross-cutting concerns (auth headers, logging,
+    retries), not fundamental request/response body transformation with streaming
+    encryption and custom response types.
+
+    See also: httpx.py uses the same pattern for identical reasons.
+
 Reference: RFC-065 §4.4, §5.2
 """
 

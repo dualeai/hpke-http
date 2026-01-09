@@ -13,6 +13,29 @@ Usage:
             # chunk is exactly what server sent (event, comment, retry, etc.)
             print(chunk)
 
+Architecture note:
+    This module uses a wrapper pattern rather than httpx's native extensibility
+    mechanisms. Here's what was evaluated:
+
+    1. Custom Transport (AsyncBaseTransport): Can encrypt requests and attach context
+       via response.extensions, BUT handle_async_request() must return httpx.Response -
+       cannot return DecryptedResponse or add iter_sse() method.
+
+    2. Event Hooks: Read-only by design. Cannot mutate request/response objects,
+       only observe them. See github.com/encode/httpx/issues/1343.
+
+    3. Auth (auth_flow): Can modify requests by yielding new Request with encrypted
+       body, BUT cannot change response type or add methods to client.
+
+    All mechanisms share one fundamental limitation: they cannot change the return
+    type from httpx.Response to DecryptedResponse, nor add custom methods like
+    iter_sse(). The wrapper pattern is required for:
+    - Returning DecryptedResponse with transparent content/text/json() decryption
+    - Providing iter_sse() for streaming SSE decryption
+    - Async key discovery via HTTP (transport receives Request, not async context)
+
+    See also: aiohttp.py uses the same pattern for identical reasons.
+
 Reference: RFC-065 §4.4, §5.2
 """
 
