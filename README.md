@@ -261,6 +261,12 @@ All methods supported. **Encryption requires a request body** to establish the H
 
 Auto-negotiated via `Accept-Encoding` header on discovery endpoint (`/.well-known/hpke-keys`).
 
+#### Why HTTP-Level Compression Doesn't Help
+
+**Disable gzip/brotli on your load balancer or CDN for HPKE endpoints.** The library compresses plaintext *before* encryption (the only effective order). Ciphertext has ~8 bits/byte entropy and is mathematically incompressible—HTTP compression only adds framing overhead and wastes CPU. Use `compress=True` on the client instead.
+
+> **Security note:** Unlike TLS compression (disabled since CRIME/BREACH), hpke-http's compression is safe because it uses per-request ephemeral keys and doesn't mix attacker-controlled input with secrets in the same compressed payload.
+
 ## Encryption Scope
 
 > Applies when request has a body (see [HTTP Methods](#http-methods) above).
