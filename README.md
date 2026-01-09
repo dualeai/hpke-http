@@ -1,6 +1,6 @@
 # hpke-http
 
-End-to-end encryption for HTTP APIs using RFC 9180 HPKE.
+End-to-end encryption for HTTP APIs using RFC 9180 HPKE. Drop-in middleware for FastAPI, aiohttp, and httpx.
 
 [![CI](https://github.com/dualeai/hpke-http/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/hpke-http/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/hpke-http)](https://pypi.org/project/hpke-http/)
