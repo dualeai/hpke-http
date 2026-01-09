@@ -2268,3 +2268,563 @@ class TestReleaseEncryptedHTTPX:
         # Underlying response body should NOT be cleared
         underlying = resp.unwrap()
         assert underlying._content != b""  # type: ignore[attr-defined]
+
+
+# =============================================================================
+# HTTPX Wire Encryption Tests
+# =============================================================================
+# Mirror of aiohttp wire encryption tests to ensure both clients are tested.
+
+
+class TestEncryptionStateValidationHTTPX:
+    """
+    E2E tests that validate encryption at the wire level for httpx.
+
+    These tests verify that:
+    1. When protocol expects encryption, raw content IS encrypted (not plaintext)
+    2. When protocol does NOT expect encryption, raw content is plaintext
+    3. Violations of expected encryption state raise appropriate errors
+    """
+
+    async def test_encrypted_response_is_not_plaintext(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify encrypted response body is NOT readable as plaintext JSON."""
+        resp = await httpx_client.post("/echo", json={"secret": "data"})
+
+        # The response should be encrypted - verify by trying to parse as JSON
+        # Get raw bytes from underlying response using public unwrap() method
+        assert isinstance(resp, HTTPXDecryptedResponse)
+        raw_body = resp.unwrap().content
+
+        # Raw body should NOT be valid JSON (it's encrypted)
+        try:
+            json.loads(raw_body)
+            # If this succeeds, the response was NOT encrypted - FAIL
+            raise AssertionError(
+                f"Response body was readable as plaintext JSON - encryption expected! "
+                f"Raw body starts with: {raw_body[:100]!r}"
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Expected - raw body is encrypted, not plaintext JSON
+            # UnicodeDecodeError can occur when encrypted bytes are invalid UTF
+            pass
+
+        # But decrypted response SHOULD be valid JSON
+        decrypted = resp.json()
+        assert "echo" in decrypted
+
+    async def test_encrypted_sse_is_not_plaintext(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify encrypted SSE events are NOT readable as plaintext SSE."""
+        resp = await httpx_client.post("/stream", json={"start": True})
+
+        # Read raw chunks from underlying response
+        underlying = resp.unwrap() if isinstance(resp, HTTPXDecryptedResponse) else resp
+        raw_chunks = [chunk async for chunk in underlying.aiter_bytes()]
+
+        # Combine all raw data
+        raw_data = b"".join(raw_chunks)
+
+        # Raw data should be encrypted SSE format (event: enc)
+        # NOT plaintext SSE (event: progress, etc.)
+        assert b"event: enc" in raw_data, "Encrypted SSE should use 'event: enc' format"
+        assert b"event: progress" not in raw_data, "Raw SSE should NOT contain plaintext events"
+
+        # The data field should be base64url encoded, not plaintext JSON
+        # Check that we don't see unencrypted JSON in the raw data
+        assert b'"progress"' not in raw_data, "Raw SSE should NOT contain plaintext JSON"
+
+    async def test_encryption_header_presence_matches_content(
+        self,
+        httpx_client: HPKEAsyncClient,
+        granian_server: E2EServer,
+    ) -> None:
+        """Verify X-HPKE-Stream header presence matches actual encryption."""
+        import httpx
+
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        # Case 1: Encrypted request → should get encrypted response with header
+        resp = await httpx_client.post("/echo", json={"test": 1})
+
+        assert HEADER_HPKE_STREAM in resp.headers, "Encrypted response MUST have X-HPKE-Stream header"
+
+        # Verify content is actually encrypted
+        assert isinstance(resp, HTTPXDecryptedResponse)
+        raw_body = resp.unwrap().content
+        if raw_body:
+            try:
+                json.loads(raw_body)
+                raise AssertionError("Header claims encryption but body is plaintext")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass  # Expected - body is encrypted
+
+        # Case 2: Unencrypted request → should get unencrypted response without header
+        async with httpx.AsyncClient() as plain_client:
+            resp = await plain_client.get(f"{base_url}/health")
+            assert HEADER_HPKE_STREAM not in resp.headers, "Unencrypted response MUST NOT have X-HPKE-Stream header"
+
+            # Verify content is actually plaintext
+            raw_body = resp.content
+            try:
+                json.loads(raw_body)  # Should succeed
+            except json.JSONDecodeError as e:
+                raise AssertionError("No encryption header but body is not plaintext") from e
+
+
+class TestRawWireFormatValidationHTTPX:
+    """
+    Tests that validate the exact wire format of encrypted data for httpx.
+
+    These tests ensure the encryption format matches the protocol specification.
+    """
+
+    async def test_standard_response_wire_format(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify standard response wire format: [length(4B) || counter(4B) || ciphertext]."""
+        resp = await httpx_client.post("/echo", json={"format": "test"})
+
+        # Access raw encrypted body using public unwrap() method
+        assert isinstance(resp, HTTPXDecryptedResponse)
+        raw_body = resp.unwrap().content
+
+        # Wire format validation:
+        # - Minimum size: length(4) + counter(4) + encoding_id(1) + tag(16) = 25 bytes
+        assert len(raw_body) >= 25, f"Encrypted body too short: {len(raw_body)} bytes"
+
+        # - First 4 bytes are length prefix
+        length = int.from_bytes(raw_body[:4], "big")
+        assert length >= 21, f"Chunk length should be >= 21, got {length}"
+
+        # - Bytes 4-8 are counter (should be 1 for first chunk)
+        counter = int.from_bytes(raw_body[4:8], "big")
+        assert counter == 1, f"First chunk counter should be 1, got {counter}"
+
+    async def test_sse_wire_format(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify SSE wire format: event: enc\\ndata: <base64>\\n\\n.
+
+        SSEFormat uses standard base64 (not base64url) for ~1.7x faster encoding.
+        See streaming.py SSEFormat docstring for rationale.
+        """
+        resp = await httpx_client.post("/stream", json={"start": True})
+
+        # Get underlying response for raw access
+        underlying = resp.unwrap() if isinstance(resp, HTTPXDecryptedResponse) else resp
+
+        # Read enough raw chunks to get a complete event
+        raw_chunks: list[bytes] = []
+        async for chunk in underlying.aiter_bytes():
+            raw_chunks.append(chunk)
+            # Check if we have at least one complete event (contains data field)
+            combined = b"".join(raw_chunks).decode("utf-8", errors="replace")
+            if "data:" in combined and "\n\n" in combined:
+                break
+
+        raw_str = b"".join(raw_chunks).decode("utf-8", errors="replace")
+
+        # SSE format validation
+        assert "event: enc" in raw_str, f"SSE should have 'event: enc', got: {raw_str[:100]}"
+        assert "data:" in raw_str, f"SSE should have 'data:' field, got: {raw_str[:100]}"
+
+        # Data field should be standard base64 encoded (A-Za-z0-9+/=)
+        for line in raw_str.split("\n"):
+            if line.startswith("data:"):
+                data_value = line[5:].strip()
+                assert re.match(r"^[A-Za-z0-9+/=]+$", data_value), (
+                    f"Data field should be base64, got: {data_value[:50]}"
+                )
+                break
+
+
+class TestCryptographicPropertiesHTTPX:
+    """Tests that verify encryption is ACTUALLY happening at the wire level for httpx."""
+
+    async def test_encrypted_body_has_cryptographic_entropy(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify encrypted output has high Shannon entropy (> 7.0 bits/byte)."""
+        payload = {"data": "A" * 10000, "secret": "password123"}
+
+        resp = await httpx_client.post("/echo", json=payload)
+        assert resp.status_code == 200
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        raw_body = resp.unwrap().content
+        assert len(raw_body) > 256, "Response too short for entropy analysis"
+
+        entropy = calculate_shannon_entropy(raw_body)
+        assert entropy > 7.0, (
+            f"Entropy {entropy:.2f} bits/byte too low for encrypted data. "
+            f"Expected > 7.0. May indicate encryption bypass."
+        )
+
+    async def test_encrypted_body_uniform_distribution(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify encrypted data has uniform byte distribution (chi-square p > 0.01)."""
+        payload = {"message": "Hello World " * 1000}
+
+        resp = await httpx_client.post("/echo", json=payload)
+        assert resp.status_code == 200
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        raw_body = resp.unwrap().content
+        assert len(raw_body) >= 1000, "Response too short for chi-square test"
+
+        chi2, p_value = chi_square_byte_uniformity(raw_body)
+        assert p_value > 0.01, (
+            f"Chi-square p-value {p_value:.4f} indicates non-uniform distribution. "
+            f"Encrypted data should appear random (chi2={chi2:.2f})."
+        )
+
+    async def test_known_plaintext_not_visible_on_wire(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify known plaintext values never appear in encrypted wire data."""
+        canary = "CANARY_SECRET_12345_XYZ"
+        payload = {"secret": canary, "data": "Hello World Test Message"}
+
+        resp = await httpx_client.post("/echo", json=payload)
+        assert resp.status_code == 200
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        raw_body = resp.unwrap().content
+
+        forbidden_patterns = [
+            canary.encode(),
+            b'"secret"',
+            b'"echo"',
+            b"Hello World",
+        ]
+
+        for pattern in forbidden_patterns:
+            assert pattern not in raw_body, (
+                f"Known plaintext '{pattern.decode(errors='replace')}' found in "
+                f"encrypted wire data! Encryption may be bypassed."
+            )
+
+    async def test_wire_format_cryptographic_structure(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify wire format has valid cryptographic structure."""
+        resp = await httpx_client.post("/echo", json={"test": "structure"})
+        assert resp.status_code == 200
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        raw_body = resp.unwrap().content
+        assert len(raw_body) >= 25, f"Response too short: {len(raw_body)} bytes"
+
+        chunk_len = int.from_bytes(raw_body[:4], "big")
+        assert chunk_len >= 21, f"Chunk length {chunk_len} too short"
+
+        counter = int.from_bytes(raw_body[4:8], "big")
+        assert counter >= 1, f"Counter {counter} invalid - must start at 1"
+
+
+class TestStreamingBehaviorHTTPX:
+    """Tests that verify chunking/streaming is ACTUALLY happening for httpx."""
+
+    async def test_sse_chunks_arrive_progressively(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify SSE chunks arrive with inter-arrival timing gaps.
+
+        This test verifies progressive delivery: events arrive as the server sends them,
+        not all buffered at the end. Uses client.send(stream=True) for true streaming.
+        """
+        resp = await httpx_client.post("/stream-delayed", json={"start": True})
+        assert resp.status_code == 200
+
+        # Use iter_sse() which consumes the stream progressively
+        arrival_times: list[float] = []
+        async for _chunk in httpx_client.iter_sse(resp):
+            arrival_times.append(time.monotonic())
+            if len(arrival_times) >= 6:
+                break
+
+        assert len(arrival_times) >= 5, f"Expected 5+ chunks, got {len(arrival_times)}"
+
+        gaps = [arrival_times[i + 1] - arrival_times[i] for i in range(len(arrival_times) - 1)]
+        significant_gaps = sum(1 for g in gaps if g > 0.05)
+
+        # At least one significant gap proves progressive delivery (not all buffered until end).
+        # TCP and encryption layer may batch adjacent events, so we only require 1 gap.
+        assert significant_gaps >= 1, (
+            f"No gaps > 50ms found. All chunks arrived instantly - not streaming. "
+            f"Gaps: {[f'{g * 1000:.0f}ms' for g in gaps]}"
+        )
+
+    async def test_large_request_is_chunked(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify large requests are sent in multiple chunks."""
+        size_mb = 10
+        large_content = "X" * (size_mb * 1024 * 1024)
+
+        resp = await httpx_client.post("/echo-chunks", content=large_content.encode())
+        assert resp.status_code == 200
+
+        data = resp.json()
+
+        assert data["chunk_count"] > 1, f"Large {size_mb}MB request sent as single chunk!"
+
+        min_expected = (size_mb * 1024 * 1024) // (64 * 1024) // 2
+        assert data["chunk_count"] >= min_expected, (
+            f"Expected >= {min_expected} chunks for {size_mb}MB, got {data['chunk_count']}"
+        )
+
+    async def test_response_chunk_boundaries_valid(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify response chunk boundaries align with length prefix format."""
+        size_mb = 5
+        large_content = "Y" * (size_mb * 1024 * 1024)
+
+        resp = await httpx_client.post("/echo", content=large_content.encode())
+        assert resp.status_code == 200
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        raw_body = resp.unwrap().content
+
+        offset = 0
+        counters: list[int] = []
+
+        while offset < len(raw_body):
+            assert offset + 4 <= len(raw_body), f"Truncated length at offset {offset}"
+            chunk_len = int.from_bytes(raw_body[offset : offset + 4], "big")
+            assert chunk_len > 0, f"Zero-length chunk at offset {offset}"
+            assert offset + 4 + chunk_len <= len(raw_body), f"Chunk overflow at offset {offset}"
+
+            counter = int.from_bytes(raw_body[offset + 4 : offset + 8], "big")
+            counters.append(counter)
+            offset += 4 + chunk_len
+
+        assert offset == len(raw_body), f"Chunk boundaries misaligned: {offset} vs {len(raw_body)}"
+        assert counters == list(range(1, len(counters) + 1)), f"Counters not monotonic: {counters[:10]}"
+
+
+@pytest.mark.requires_root
+class TestNetworkLevelVerificationHTTPX:
+    """Tests that verify encryption at the network packet level for httpx.
+
+    These tests require root/sudo to run tcpdump for packet capture.
+    They must run serially (-n 0) due to timing sensitivity.
+    """
+
+    async def test_wire_traffic_contains_no_plaintext(
+        self,
+        tcpdump_capture: str,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify captured network traffic contains no plaintext."""
+        import asyncio
+
+        canaries = ["HTTPX_WIRE_CANARY_ABC123", "HTTPX_NETWORK_SECRET_XYZ"]
+
+        for canary in canaries:
+            resp = await httpx_client.post("/echo", json={"secret": canary})
+            assert resp.status_code == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        for canary in canaries:
+            assert canary.encode() not in pcap_data, f"Plaintext canary '{canary}' found in network capture!"
+        assert b'"secret"' not in pcap_data, "JSON key found in network capture"
+
+    async def test_sse_wire_traffic_is_encrypted(
+        self,
+        tcpdump_capture: str,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify SSE streaming content is encrypted on the wire.
+
+        The SSE transport format (event:, data:) is visible on the wire, but
+        the actual event content must be encrypted. Original event types and
+        data should NOT appear - only 'event: enc' with base64 ciphertext.
+        """
+        import asyncio
+
+        # Trigger SSE stream with unique canary values
+        sse_canary = "HTTPX_SSE_WIRE_CANARY_789"
+        resp = await httpx_client.post("/stream", json={"canary": sse_canary})
+        assert resp.status_code == 200
+
+        # Consume the SSE stream to generate wire traffic
+        event_count = 0
+        async for _chunk in httpx_client.iter_sse(resp):
+            event_count += 1
+            if event_count >= 5:
+                break
+
+        # Wait for packets to flush
+        await asyncio.sleep(0.5)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # Original event types should NEVER appear (they're encrypted)
+        # The wire should only show "event: enc" not "event: tick" or "event: done"
+        assert b"event: tick" not in pcap_data, "Raw SSE event type 'tick' found in network capture!"
+        assert b"event: done" not in pcap_data, "Raw SSE event type 'done' found in network capture!"
+
+        # Original JSON data keys should NOT be visible
+        assert b'"count"' not in pcap_data, "SSE data key 'count' found in network capture!"
+        assert b'"timestamp"' not in pcap_data, "SSE data key 'timestamp' found in network capture!"
+
+        # Canary value should NOT be visible
+        assert sse_canary.encode() not in pcap_data, f"SSE canary '{sse_canary}' found in network capture!"
+
+        # Verify encrypted SSE format IS present (proves SSE encryption is working)
+        assert b"event: enc" in pcap_data, "Encrypted SSE 'event: enc' not found - encryption may not be active!"
+
+    async def test_nonce_uniqueness_different_ciphertext(
+        self,
+        tcpdump_capture: str,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify same plaintext produces different ciphertext (nonce uniqueness).
+
+        This is critical for security - if nonces are reused, an attacker can
+        XOR ciphertexts to recover plaintext. Each encryption MUST produce
+        unique ciphertext even for identical input.
+        """
+        import asyncio
+
+        identical_payload = {"test": "nonce_uniqueness", "data": "identical_content_123"}
+
+        # Send same payload twice
+        resp1 = await httpx_client.post("/echo", json=identical_payload)
+        assert resp1.status_code == 200
+        assert isinstance(resp1, HTTPXDecryptedResponse)
+        raw1 = resp1.unwrap().content
+
+        resp2 = await httpx_client.post("/echo", json=identical_payload)
+        assert resp2.status_code == 200
+        assert isinstance(resp2, HTTPXDecryptedResponse)
+        raw2 = resp2.unwrap().content
+
+        # Ciphertexts MUST be different (due to different nonces/ephemeral keys)
+        assert raw1 != raw2, (
+            "CRITICAL: Identical plaintext produced identical ciphertext! "
+            "This indicates nonce reuse - catastrophic for security."
+        )
+
+        # Wait for pcap to capture all traffic
+        await asyncio.sleep(0.3)
+
+        # Verify traffic was captured (sanity check)
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+        assert len(pcap_data) > 100, "No traffic captured in pcap"
+
+    async def test_request_body_encrypted_in_pcap(
+        self,
+        tcpdump_capture: str,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """Verify request body is encrypted on the wire (not just response).
+
+        Previous tests focused on response encryption. This verifies the
+        request body sent BY the client is also encrypted in the network capture.
+        """
+        import asyncio
+
+        # Unique canary that should appear in request body
+        request_canary = "HTTPX_REQUEST_BODY_CANARY_XYZ789"
+        request_payload = {
+            "secret_request_data": request_canary,
+            "password": "httpx_super_secret_password_123",
+            "api_key": "httpx-sk-live-abcdef123456",
+        }
+
+        resp = await httpx_client.post("/echo", json=request_payload)
+        assert resp.status_code == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # Request body canaries should NOT be visible
+        assert request_canary.encode() not in pcap_data, (
+            f"Request body canary '{request_canary}' found in pcap! Request not encrypted."
+        )
+        assert b"httpx_super_secret_password" not in pcap_data, "Password found in pcap!"
+        assert b"httpx-sk-live-" not in pcap_data, "API key prefix found in pcap!"
+        assert b'"secret_request_data"' not in pcap_data, "JSON key found in pcap!"
+
+    async def test_no_psk_on_wire(
+        self,
+        tcpdump_capture: str,
+        httpx_client: HPKEAsyncClient,
+        test_psk: bytes,
+    ) -> None:
+        """Verify pre-shared key never appears in network traffic.
+
+        The PSK is used for authentication but should NEVER be transmitted.
+        It's used locally to derive keys, not sent over the wire.
+        """
+        import asyncio
+
+        # Generate some traffic
+        resp = await httpx_client.post("/echo", json={"test": "httpx_psk_leak_check"})
+        assert resp.status_code == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # PSK should never appear in any form
+        assert test_psk not in pcap_data, "CRITICAL: Raw PSK found in network capture!"
+        # Also check hex-encoded form
+        assert test_psk.hex().encode() not in pcap_data, "PSK (hex) found in pcap!"
+
+    async def test_no_session_key_material_on_wire(
+        self,
+        tcpdump_capture: str,
+        httpx_client: HPKEAsyncClient,
+        platform_keypair: tuple[bytes, bytes],
+    ) -> None:
+        """Verify private key and derived session keys never appear in traffic.
+
+        Only the ephemeral PUBLIC key should be visible (the 'enc' field in HPKE).
+        Private keys and derived session keys must never be transmitted.
+        """
+        import asyncio
+
+        private_key, _public_key = platform_keypair
+
+        # Generate traffic
+        resp = await httpx_client.post("/echo", json={"test": "httpx_key_leak_check"})
+        assert resp.status_code == 200
+
+        await asyncio.sleep(0.3)
+
+        with open(tcpdump_capture, "rb") as f:
+            pcap_data = f.read()
+
+        # Private key should NEVER appear
+        assert private_key not in pcap_data, "CRITICAL: Private key found in network capture!"
+
+        # Note: Server's static public key IS visible in /.well-known/hpke-keys response
+        # (that's expected - it's public). We only check private key doesn't leak.
