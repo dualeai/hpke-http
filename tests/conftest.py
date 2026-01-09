@@ -508,6 +508,10 @@ async def granian_server_gzip_only(
 
 # === HPKE Client Fixtures (Separate) ===
 
+# Default timeouts (httpx 5s, aiohttp 300s) are misaligned and can cause flaky
+# failures on slower x64 CI runners during large encrypted uploads. Use 60s for
+# both clients to ensure consistent behavior across architectures.
+_TEST_TIMEOUT_SECS = 60.0
 
 # --- aiohttp fixtures ---
 
@@ -526,6 +530,7 @@ async def aiohttp_client(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -545,6 +550,7 @@ async def aiohttp_client_compressed(
         psk=test_psk,
         psk_id=test_psk_id,
         compress=True,
+        timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -585,6 +591,7 @@ async def aiohttp_client_no_compress_server_compress(
         psk=test_psk,
         psk_id=test_psk_id,
         compress=False,
+        timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -604,6 +611,7 @@ async def aiohttp_client_gzip_only(
         psk=test_psk,
         psk_id=test_psk_id,
         compress=True,
+        timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -625,6 +633,7 @@ async def httpx_client(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -644,6 +653,7 @@ async def httpx_client_compressed(
         psk=test_psk,
         psk_id=test_psk_id,
         compress=True,
+        timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -663,6 +673,7 @@ async def httpx_client_no_compress_server_compress(
         psk=test_psk,
         psk_id=test_psk_id,
         compress=False,
+        timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -682,6 +693,7 @@ async def httpx_client_gzip_only(
         psk=test_psk,
         psk_id=test_psk_id,
         compress=True,
+        timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -704,6 +716,7 @@ async def aiohttp_client_release_encrypted(
         psk=test_psk,
         psk_id=test_psk_id,
         release_encrypted=True,
+        timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
@@ -723,6 +736,7 @@ async def httpx_client_release_encrypted(
         psk=test_psk,
         psk_id=test_psk_id,
         release_encrypted=True,
+        timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
 
