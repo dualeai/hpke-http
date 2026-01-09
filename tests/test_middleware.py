@@ -3796,74 +3796,68 @@ class TestMultipartMemoryHttpx:
 
     async def test_multipart_peak_memory_ratio(
         self,
-        httpx_client: HPKEAsyncClient,  # noqa: ARG002
+        httpx_client: HPKEAsyncClient,
     ) -> None:
-        """Streaming multipart upload uses O(chunk_size) memory, not O(payload_size).
+        """REAL test: actual client.post() with file-backed content uses bounded memory.
 
-        With streaming encryption via _rechunk_iter + feed/finalize:
-        - Memory is bounded by chunk size (64KB) regardless of payload size
-        - Peak allocation should be ~512KB (buffers, headers, crypto state)
-        - NOT 100MB (the payload size)
+        This tests the full end-to-end path:
+        - File on disk (not pre-allocated in-memory bytes)
+        - Actual httpx_client.post() call
+        - Real encryption pipeline
 
-        This test verifies the streaming implementation doesn't regress to
-        the old b"".join() path which would allocate full payload.
+        Memory should be O(chunk_size), not O(file_size).
         """
         import gc
         import os
+        import tempfile
         import tracemalloc
 
-        from httpx._content import encode_multipart_data
+        file_size = 50 * 1024 * 1024  # 50MB file
 
-        # Test internal streaming function (intentionally accessing private API)
-        from hpke_http.middleware.httpx import _rechunk_iter  # pyright: ignore[reportPrivateUsage]
-
-        size = 100 * 1024 * 1024  # 100MB
-        content = os.urandom(size)
-        files = {"file": ("test.bin", content, "application/octet-stream")}
-
-        # Warmup - exercise the streaming path
-        _, stream = encode_multipart_data(data={}, files=files, boundary=None)
-        for _ in _rechunk_iter(iter(stream)):
-            pass
+        # Create file on disk (content NOT in Python memory)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+            # Write in chunks to avoid large allocation
+            chunk = os.urandom(1024 * 1024)  # 1MB chunk
+            for _ in range(file_size // len(chunk)):
+                f.write(chunk)
+            temp_path = f.name
+        del chunk
         gc.collect()
 
-        # Measure streaming multipart using ABSOLUTE peak (not diff)
-        # This catches bugs where we return references to large buffers
-        tracemalloc.start()
-        tracemalloc.reset_peak()
+        try:
+            # Warmup - exercise full path
+            with open(temp_path, "rb") as f:
+                files = {"file": ("test.bin", f, "application/octet-stream")}
+                resp = await httpx_client.post("/upload", files=files)
+                assert resp.status_code == 200
+            gc.collect()
 
-        _, stream = encode_multipart_data(data={}, files=files, boundary=None)
+            # Measure REAL upload with file handle
+            tracemalloc.start()
+            tracemalloc.reset_peak()
 
-        # Stream chunks without holding full body
-        total_streamed = 0
-        max_chunk_size = 0
-        for chunk in _rechunk_iter(iter(stream)):
-            total_streamed += len(chunk)
-            max_chunk_size = max(max_chunk_size, len(chunk))
-            # Simulate processing each chunk (encryption would happen here)
-            _ = bytes(len(chunk))
+            with open(temp_path, "rb") as f:
+                files = {"file": ("test.bin", f, "application/octet-stream")}
+                resp = await httpx_client.post("/upload", files=files)
+                assert resp.status_code == 200
+                result = resp.json()
+                # Verify upload succeeded and correct size
+                assert result["parts"][0]["size"] == file_size
 
-        _current, peak_alloc = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+            _current, peak_alloc = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
 
-        # Verify we streamed the full payload
-        assert total_streamed > size, f"Streamed {total_streamed} bytes, expected > {size}"
+            # Real streaming should use bounded memory
+            # Allow 5MB for buffers, crypto state, HTTP overhead (but NOT 50MB)
+            max_memory = 5 * 1024 * 1024  # 5MB
+            assert peak_alloc < max_memory, (
+                f"Peak memory {peak_alloc / 1024 / 1024:.1f}MB exceeds {max_memory // 1024 // 1024}MB limit. "
+                f"Full upload path should stream, not buffer entire file. "
+                f"Ratio: {peak_alloc / file_size:.1%} of file size"
+            )
 
-        # Verify chunks are bounded (64KB default)
-        chunk_limit = 128 * 1024  # 128KB (allow some margin)
-        assert max_chunk_size < chunk_limit, (
-            f"Max chunk {max_chunk_size / 1024:.1f}KB exceeds {chunk_limit // 1024}KB. "
-            f"Streaming should yield small chunks, not full payload."
-        )
-
-        # Streaming should use O(chunk_size) memory, not O(payload_size)
-        # Allow 512KB max (buffers, headers, crypto overhead) for 100MB payload
-        max_memory = 512 * 1024  # 512KB
-        assert peak_alloc < max_memory, (
-            f"Peak memory {peak_alloc / 1024:.1f}KB exceeds {max_memory // 1024}KB limit. "
-            f"Streaming should use O(chunk_size) not O(payload_size). "
-            f"Ratio: {peak_alloc / size:.2%} of payload"
-        )
+        finally:
+            os.unlink(temp_path)
 
 
 class TestMultipartMemoryAiohttp:
@@ -3916,75 +3910,70 @@ class TestMultipartMemoryAiohttp:
 
     async def test_multipart_peak_memory_ratio(
         self,
-        aiohttp_client: HPKEClientSession,  # noqa: ARG002
+        aiohttp_client: HPKEClientSession,
     ) -> None:
-        """Streaming multipart upload uses O(chunk_size) memory, not O(payload_size).
+        """REAL test: actual client.post() with file-backed content uses bounded memory.
 
-        With streaming encryption via _stream_multipart + _encrypt_stream_async:
-        - Memory is bounded by chunk size (64KB) regardless of payload size
-        - Peak allocation should be ~512KB (buffers, headers, crypto state)
-        - NOT 100MB (the payload size)
+        This tests the full end-to-end path:
+        - File on disk (not pre-allocated in-memory bytes)
+        - Actual aiohttp_client.post() call
+        - Real encryption pipeline
 
-        This test verifies the streaming implementation doesn't regress to
-        the old as_bytes() path which would allocate full payload.
+        Memory should be O(chunk_size), not O(file_size).
         """
         import gc
         import os
+        import tempfile
         import tracemalloc
 
-        # Test internal streaming function (intentionally accessing private API)
-        from hpke_http.middleware.aiohttp import _stream_multipart  # pyright: ignore[reportPrivateUsage]
+        file_size = 50 * 1024 * 1024  # 50MB file
 
-        size = 100 * 1024 * 1024  # 100MB
-        content = os.urandom(size)
-
-        # Warmup - exercise the streaming path
-        form = aiohttp.FormData()
-        form.add_field("file", content, filename="test.bin", content_type="application/octet-stream")
-        payload: aiohttp.MultipartWriter = form()  # type: ignore[assignment]
-        async for _ in _stream_multipart(payload):
-            pass
+        # Create file on disk (content NOT in Python memory)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+            # Write in chunks to avoid large allocation
+            chunk = os.urandom(1024 * 1024)  # 1MB chunk
+            for _ in range(file_size // len(chunk)):
+                f.write(chunk)
+            temp_path = f.name
+        del chunk
         gc.collect()
 
-        # Measure streaming multipart using ABSOLUTE peak (not diff)
-        # This catches bugs where we return references to large buffers
-        tracemalloc.start()
-        tracemalloc.reset_peak()
+        try:
+            # Warmup - exercise full path
+            with open(temp_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field("file", f, filename="test.bin", content_type="application/octet-stream")
+                resp = await aiohttp_client.post("/upload", data=form)
+                assert resp.status == 200
+            gc.collect()
 
-        form = aiohttp.FormData()
-        form.add_field("file", content, filename="test.bin", content_type="application/octet-stream")
-        payload = form()  # type: ignore[assignment]
+            # Measure REAL upload with file handle
+            tracemalloc.start()
+            tracemalloc.reset_peak()
 
-        # Stream chunks without holding full body
-        total_streamed = 0
-        max_chunk_size = 0
-        async for chunk in _stream_multipart(payload):
-            total_streamed += len(chunk)
-            max_chunk_size = max(max_chunk_size, len(chunk))
-            # Simulate processing each chunk (encryption would happen here)
-            _ = bytes(len(chunk))
+            with open(temp_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field("file", f, filename="test.bin", content_type="application/octet-stream")
+                resp = await aiohttp_client.post("/upload", data=form)
+                assert resp.status == 200
+                result = await resp.json()
+                # Verify upload succeeded and correct size
+                assert result["parts"][0]["size"] == file_size
 
-        _current, peak_alloc = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+            _current, peak_alloc = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
 
-        # Verify we streamed the full payload
-        assert total_streamed > size, f"Streamed {total_streamed} bytes, expected > {size}"
+            # Real streaming should use bounded memory
+            # Allow 5MB for buffers, crypto state, HTTP overhead (but NOT 50MB)
+            max_memory = 5 * 1024 * 1024  # 5MB
+            assert peak_alloc < max_memory, (
+                f"Peak memory {peak_alloc / 1024 / 1024:.1f}MB exceeds {max_memory // 1024 // 1024}MB limit. "
+                f"Full upload path should stream, not buffer entire file. "
+                f"Ratio: {peak_alloc / file_size:.1%} of file size"
+            )
 
-        # Verify chunks are bounded (64KB default)
-        chunk_limit = 128 * 1024  # 128KB (allow some margin)
-        assert max_chunk_size < chunk_limit, (
-            f"Max chunk {max_chunk_size / 1024:.1f}KB exceeds {chunk_limit // 1024}KB. "
-            f"Streaming should yield small chunks, not full payload."
-        )
-
-        # Streaming should use O(chunk_size) memory, not O(payload_size)
-        # Allow 512KB max (buffers, headers, crypto overhead) for 100MB payload
-        max_memory = 512 * 1024  # 512KB
-        assert peak_alloc < max_memory, (
-            f"Peak memory {peak_alloc / 1024:.1f}KB exceeds {max_memory // 1024}KB limit. "
-            f"Streaming should use O(chunk_size) not O(payload_size). "
-            f"Ratio: {peak_alloc / size:.2%} of payload"
-        )
+        finally:
+            os.unlink(temp_path)
 
 
 class TestServerMemoryBounded:
