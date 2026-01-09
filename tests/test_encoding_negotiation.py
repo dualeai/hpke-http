@@ -7,7 +7,6 @@ and reject unsupported encodings with HTTP 415.
 import aiohttp
 import pytest
 
-from hpke_http.core import parse_accept_encoding
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     HEADER_HPKE_ENC,
@@ -15,6 +14,7 @@ from hpke_http.constants import (
     HEADER_HPKE_STREAM,
     REQUEST_KEY_LABEL,
 )
+from hpke_http.core import parse_accept_encoding
 from hpke_http.headers import b64url_encode
 from hpke_http.hpke import setup_sender_psk
 from hpke_http.streaming import ChunkEncryptor, RawFormat, StreamingSession
@@ -63,9 +63,7 @@ class TestDiscoveryAcceptEncoding:
     ) -> None:
         """Server with zstd available advertises 'identity, zstd'."""
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"http://{granian_server.host}:{granian_server.port}/.well-known/hpke-keys"
-            ) as resp:
+            async with session.get(f"http://{granian_server.host}:{granian_server.port}/.well-known/hpke-keys") as resp:
                 assert resp.status == 200
                 assert "Accept-Encoding" in resp.headers
                 encodings = [e.strip() for e in resp.headers["Accept-Encoding"].split(",")]
@@ -513,11 +511,11 @@ class TestServerConfigValidation:
         from typing import Any
         from unittest.mock import patch
 
-        from hpke_http.constants import KemId
-        from hpke_http.middleware.fastapi import HPKEMiddleware
-
         # Generate a valid test keypair
         from cryptography.hazmat.primitives.asymmetric import x25519
+
+        from hpke_http.constants import KemId
+        from hpke_http.middleware.fastapi import HPKEMiddleware
 
         private_key = x25519.X25519PrivateKey.generate()
         sk = private_key.private_bytes_raw()
@@ -537,7 +535,7 @@ class TestServerConfigValidation:
                 psk_resolver=mock_psk_resolver,
                 compress=False,
             )
-            assert not middleware._zstd_available
+            assert not middleware._zstd_available  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 # =============================================================================
@@ -749,12 +747,12 @@ class TestEncodingCacheBehavior:
             # First request triggers discovery
             resp1 = await client.post("/echo", json={"request": 1})
             assert resp1.status == 200
-            encodings_after_first = client._server_encodings.copy()
+            encodings_after_first = client._server_encodings.copy()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
             # Second request should use cache
             resp2 = await client.post("/echo", json={"request": 2})
             assert resp2.status == 200
-            encodings_after_second = client._server_encodings
+            encodings_after_second = client._server_encodings  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
             # Encodings should be the same (cached)
             assert encodings_after_first == encodings_after_second

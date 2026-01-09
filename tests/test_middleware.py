@@ -1980,28 +1980,28 @@ class TestAiohttpConnectionLeaks:
 
     async def test_post_releases_connection(self, aiohttp_client: Any) -> None:
         """POST /echo releases connection."""
-        connector = aiohttp_client._session.connector
+        connector = aiohttp_client._session.connector  # noqa: SLF001
 
         resp = await aiohttp_client.post("/echo", json={"test": "leak"})
         assert resp.status == 200
 
         await asyncio.sleep(0.01)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
     async def test_sequential_requests(self, aiohttp_client: Any) -> None:
         """10 sequential requests don't leak."""
-        connector = aiohttp_client._session.connector
+        connector = aiohttp_client._session.connector  # noqa: SLF001
 
         for i in range(10):
             resp = await aiohttp_client.post("/echo", json={"seq": i})
             assert resp.status == 200
 
         await asyncio.sleep(0.01)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
     async def test_concurrent_requests(self, aiohttp_client: Any) -> None:
         """5 concurrent requests don't leak."""
-        connector = aiohttp_client._session.connector
+        connector = aiohttp_client._session.connector  # noqa: SLF001
 
         async def req(n: int) -> None:
             resp = await aiohttp_client.post("/echo", json={"n": n})
@@ -2010,11 +2010,11 @@ class TestAiohttpConnectionLeaks:
         await asyncio.gather(*[req(i) for i in range(5)])
 
         await asyncio.sleep(0.01)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
     async def test_sse_stream_releases(self, aiohttp_client: Any) -> None:
         """SSE stream releases connection after consumption."""
-        connector = aiohttp_client._session.connector
+        connector = aiohttp_client._session.connector  # noqa: SLF001
 
         resp = await aiohttp_client.post("/stream", json={"start": True})
         assert resp.status == 200
@@ -2025,11 +2025,11 @@ class TestAiohttpConnectionLeaks:
 
         assert event_count >= 1
         await asyncio.sleep(0.01)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
     async def test_sse_many_events(self, aiohttp_client: Any) -> None:
         """50-event SSE doesn't leak."""
-        connector = aiohttp_client._session.connector
+        connector = aiohttp_client._session.connector  # noqa: SLF001
 
         resp = await aiohttp_client.post("/stream-many", json={"start": True})
         assert resp.status == 200
@@ -2040,11 +2040,11 @@ class TestAiohttpConnectionLeaks:
 
         assert count >= 50
         await asyncio.sleep(0.01)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
     async def test_sse_cancelled_early(self, aiohttp_client: Any) -> None:
         """Early SSE cancellation releases connection."""
-        connector = aiohttp_client._session.connector
+        connector = aiohttp_client._session.connector  # noqa: SLF001
 
         resp = await aiohttp_client.post("/stream-many", json={"start": True})
         assert resp.status == 200
@@ -2056,7 +2056,7 @@ class TestAiohttpConnectionLeaks:
                 break
 
         await asyncio.sleep(0.05)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
 
 class TestAiohttpConnectionLeaksCompressed:
@@ -2064,17 +2064,17 @@ class TestAiohttpConnectionLeaksCompressed:
 
     async def test_compressed_post(self, aiohttp_client_compressed: Any) -> None:
         """Compressed POST releases connection."""
-        connector = aiohttp_client_compressed._session.connector
+        connector = aiohttp_client_compressed._session.connector  # noqa: SLF001
 
         resp = await aiohttp_client_compressed.post("/echo", json={"compressed": True})
         assert resp.status == 200
 
         await asyncio.sleep(0.01)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
     async def test_compressed_sse(self, aiohttp_client_compressed: Any) -> None:
         """Compressed SSE releases connection."""
-        connector = aiohttp_client_compressed._session.connector
+        connector = aiohttp_client_compressed._session.connector  # noqa: SLF001
 
         resp = await aiohttp_client_compressed.post("/stream", json={"start": True})
         assert resp.status == 200
@@ -2083,7 +2083,7 @@ class TestAiohttpConnectionLeaksCompressed:
             pass
 
         await asyncio.sleep(0.01)
-        assert len(connector._acquired) == 0
+        assert len(connector._acquired) == 0  # noqa: SLF001
 
 
 class TestAiohttpPoolExhaustion:
@@ -2399,7 +2399,7 @@ class TestReleaseEncryptedAiohttp:
         # Underlying response body should be cleared
         underlying = resp.unwrap()
         # aiohttp stores body in _body attribute
-        assert underlying._body == b""  # type: ignore[attr-defined]
+        assert underlying._body == b""  # type: ignore[attr-defined]  # noqa: SLF001
 
     async def test_multiple_reads_still_work(
         self,
@@ -2430,7 +2430,7 @@ class TestReleaseEncryptedAiohttp:
 
         # Underlying response body should NOT be cleared
         underlying = resp.unwrap()
-        assert underlying._body != b""  # type: ignore[attr-defined]
+        assert underlying._body != b""  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 class TestReleaseEncryptedHTTPX:
@@ -2464,7 +2464,7 @@ class TestReleaseEncryptedHTTPX:
         # Underlying response body should be cleared
         underlying = resp.unwrap()
         # httpx stores body in _content attribute
-        assert underlying._content == b""  # type: ignore[attr-defined]
+        assert underlying._content == b""  # type: ignore[attr-defined]  # noqa: SLF001
 
     async def test_multiple_reads_still_work(
         self,
@@ -2495,7 +2495,7 @@ class TestReleaseEncryptedHTTPX:
 
         # Underlying response body should NOT be cleared
         underlying = resp.unwrap()
-        assert underlying._content != b""  # type: ignore[attr-defined]
+        assert underlying._content != b""  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 # =============================================================================

@@ -116,7 +116,7 @@ class DecryptedResponse:
         # Release encrypted content to reduce held memory (2x → 1x)
         if self._release_encrypted:
             # Clear aiohttp's internal body cache
-            self._response._body = b""  # type: ignore[attr-defined]
+            self._response._body = b""  # type: ignore[attr-defined]  # noqa: SLF001
 
         _logger.debug(
             "Response decrypted: url=%s size=%d release_encrypted=%s",

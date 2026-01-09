@@ -186,10 +186,7 @@ class HPKEMiddleware:
 
         # Validate compress config - fail fast if zstd unavailable
         if compress and not self._zstd_available:
-            raise ImportError(
-                "HPKEMiddleware compress=True requires zstd. "
-                "Install with: pip install hpke-http[zstd]"
-            )
+            raise ImportError("HPKEMiddleware compress=True requires zstd. Install with: pip install hpke-http[zstd]")
 
         # Derive public keys for discovery endpoint
         self._public_keys: dict[KemId, bytes] = {}

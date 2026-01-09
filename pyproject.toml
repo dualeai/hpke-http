@@ -169,15 +169,11 @@ select = [
 ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use secrets)
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["PLR2004", "PLR0915", "S101", "S603", "S607", "SIM115", "ASYNC109", "ASYNC220", "ASYNC230", "SIM117", "F841", "RUF059", "PLC0415"]  # Tests: magic values, too many statements, assert, subprocess, async patterns, nested with, unused vars, local imports
-"tests/**/test_rfc9180*.py" = ["SLF001"]  # Vector tests need internal state access
-"tests/**/test_fuzz.py" = ["SLF001"]  # Fuzz tests need internal state access for overflow testing
-"tests/**/test_base_client.py" = ["SLF001"]  # Tests for BaseHPKEClient private methods
-"tests/**/test_streaming_errors.py" = ["SLF001"]  # Error tests need internal cipher access
-"tests/**/test_middleware.py" = ["SLF001"]  # Connection leak tests need connector._acquired access
+"tests/**/*.py" = ["PLR2004", "PLR0915", "S101", "S603", "S607", "SIM115", "ASYNC109", "ASYNC220", "ASYNC230", "SIM117", "F841", "RUF059", "PLC0415", "ARG001"]  # Tests: magic values, too many statements, assert, subprocess, async patterns, nested with, unused vars, local imports, unused args (callback signatures)
 "tests/**/bench*.py" = ["T201", "BLE001", "SIM102", "PERF401", "PERF402"]  # Benchmark scripts: print, broad except, nested if, list patterns
 "tests/**/benchmark*.py" = ["T201", "F401", "RET505"]  # Benchmark scripts: print, unused imports, elif after return
 "src/**/streaming.py" = ["PLW0603", "PLC0415", "RUF002"]  # Optional zstd: module caching requires global, lazy import for optional deps, unicode multiplication sign
+"src/**/middleware/fastapi.py" = ["PLC0415"]  # Lazy import for optional zstd dependency
 
 [tool.vulture]
 exclude = [".venv/"]  # Exclude deps

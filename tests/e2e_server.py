@@ -20,7 +20,7 @@ if os.environ.get("HPKE_DISABLE_ZSTD") == "true":
 
     hpke_http.streaming.import_zstd = _mock_import_zstd
     # Also clear any cached module
-    hpke_http.streaming._zstd_module = None
+    hpke_http.streaming._zstd_module = None  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 from starlette.applications import Starlette
 from starlette.requests import Request

@@ -105,7 +105,7 @@ class DecryptedResponse:
         if self._release_encrypted:
             # Clear httpx's internal content cache
             # pyright: ignore[reportPrivateUsage] - intentional for memory optimization
-            self._response._content = b""  # type: ignore[attr-defined]
+            self._response._content = b""  # type: ignore[attr-defined]  # noqa: SLF001
 
         _logger.debug(
             "Response decrypted: url=%s size=%d release_encrypted=%s",

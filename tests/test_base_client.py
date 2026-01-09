@@ -117,11 +117,11 @@ class TestBaseHPKEClientKeyCache:
 
         # First client fetches keys (cache miss)
         async with HPKEClientSession(base_url, test_psk, test_psk_id) as client1:
-            keys1 = await client1._ensure_keys()
+            keys1 = await client1._ensure_keys()  # noqa: SLF001
 
         # Second client should hit cache
         async with HPKEClientSession(base_url, test_psk, test_psk_id) as client2:
-            keys2 = await client2._ensure_keys()
+            keys2 = await client2._ensure_keys()  # noqa: SLF001
 
         assert keys1 == keys2
 
@@ -137,7 +137,7 @@ class TestBaseHPKEClientKeyCache:
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEClientSession(base_url, test_psk, test_psk_id) as client:
-            keys = await client._ensure_keys()
+            keys = await client._ensure_keys()  # noqa: SLF001
 
         assert KemId.DHKEM_X25519_HKDF_SHA256 in keys
         assert len(keys[KemId.DHKEM_X25519_HKDF_SHA256]) == 32
@@ -158,8 +158,8 @@ class TestEncryptRequestSync:
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEClientSession(base_url, test_psk, test_psk_id) as client:
-            keys = await client._ensure_keys()
-            iterator, headers, ctx = client._encrypt_request_sync(b"test body", keys)
+            keys = await client._ensure_keys()  # noqa: SLF001
+            iterator, headers, ctx = client._encrypt_request_sync(b"test body", keys)  # noqa: SLF001
 
             # Iterator should be iterable
             assert hasattr(iterator, "__iter__")
@@ -185,10 +185,10 @@ class TestEncryptRequestSync:
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEClientSession(base_url, test_psk, test_psk_id, compress=True) as client:
-            keys = await client._ensure_keys()
+            keys = await client._ensure_keys()  # noqa: SLF001
             # Use large body to trigger compression (>= ZSTD_MIN_SIZE)
             large_body = b"x" * 100
-            _iterator, headers, _ctx = client._encrypt_request_sync(large_body, keys)
+            _iterator, headers, _ctx = client._encrypt_request_sync(large_body, keys)  # noqa: SLF001
 
             # Compression header should be present for large bodies
             # (exact behavior depends on ZSTD_MIN_SIZE)
