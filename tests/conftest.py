@@ -499,6 +499,65 @@ async def aiohttp_client_no_compress_server_compress(
         yield client
 
 
+# --- httpx fixtures ---
+
+
+@pytest_asyncio.fixture
+async def httpx_client(
+    granian_server: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """httpx HPKEAsyncClient connected to test server."""
+    from hpke_http.middleware.httpx import HPKEAsyncClient
+
+    base_url = f"http://{granian_server.host}:{granian_server.port}"
+    async with HPKEAsyncClient(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def httpx_client_compressed(
+    granian_server_compressed: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """httpx HPKEAsyncClient with compression enabled."""
+    from hpke_http.middleware.httpx import HPKEAsyncClient
+
+    base_url = f"http://{granian_server_compressed.host}:{granian_server_compressed.port}"
+    async with HPKEAsyncClient(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        compress=True,
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def httpx_client_no_compress_server_compress(
+    granian_server_compressed: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """httpx client without compression, server with compression."""
+    from hpke_http.middleware.httpx import HPKEAsyncClient
+
+    base_url = f"http://{granian_server_compressed.host}:{granian_server_compressed.port}"
+    async with HPKEAsyncClient(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        compress=False,
+    ) as client:
+        yield client
+
+
 # --- release_encrypted fixtures ---
 
 
@@ -513,6 +572,25 @@ async def aiohttp_client_release_encrypted(
 
     base_url = f"http://{granian_server.host}:{granian_server.port}"
     async with HPKEClientSession(
+        base_url=base_url,
+        psk=test_psk,
+        psk_id=test_psk_id,
+        release_encrypted=True,
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def httpx_client_release_encrypted(
+    granian_server: E2EServer,
+    test_psk: bytes,
+    test_psk_id: bytes,
+) -> AsyncIterator[Any]:
+    """httpx HPKEAsyncClient with release_encrypted=True."""
+    from hpke_http.middleware.httpx import HPKEAsyncClient
+
+    base_url = f"http://{granian_server.host}:{granian_server.port}"
+    async with HPKEAsyncClient(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,

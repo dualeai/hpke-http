@@ -23,6 +23,8 @@ from typing_extensions import assert_type
 
 from hpke_http.constants import HEADER_HPKE_STREAM
 from hpke_http.middleware.aiohttp import DecryptedResponse, HPKEClientSession
+from hpke_http.middleware.httpx import DecryptedResponse as HTTPXDecryptedResponse
+from hpke_http.middleware.httpx import HPKEAsyncClient
 from tests.conftest import E2EServer, calculate_shannon_entropy, chi_square_byte_uniformity
 
 
@@ -1902,3 +1904,367 @@ class TestActiveAttackResistance:
             raise AssertionError("Out-of-order attack not detected! chunk3 before chunk2.")
         except ReplayAttackError:
             pass  # Expected - out of order detected
+
+
+# =============================================================================
+# HTTPX Client Tests
+# =============================================================================
+# Fixtures are defined in conftest.py: httpx_client, httpx_client_compressed
+
+
+class TestEncryptedRequestsHTTPX:
+    """Test encrypted request/response flow with HTTPX client."""
+
+    async def test_encrypted_request_roundtrip(self, httpx_client: HPKEAsyncClient) -> None:
+        """Client encrypts -> Server decrypts -> Response works."""
+        test_data = {"message": "Hello, HPKE via HTTPX!", "count": 42}
+
+        resp = await httpx_client.post("/echo", json=test_data)
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["path"] == "/echo"
+        assert data["method"] == "POST"
+        # Echo contains the JSON string we sent
+        assert "Hello, HPKE via HTTPX!" in data["echo"]
+        assert "42" in data["echo"]
+
+    async def test_large_payload(self, httpx_client: HPKEAsyncClient) -> None:
+        """Large payloads encrypt/decrypt correctly."""
+        large_content = "x" * 100_000  # 100KB
+        test_data = {"data": large_content}
+
+        resp = await httpx_client.post("/echo", json=test_data)
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # Verify the large content made it through
+        assert large_content in data["echo"]
+
+    async def test_binary_payload(self, httpx_client: HPKEAsyncClient) -> None:
+        """Binary data encrypts/decrypts correctly."""
+        binary_data = bytes(range(256)) * 10  # Various byte values
+
+        resp = await httpx_client.post("/echo", content=binary_data)
+        assert resp.status_code == 200
+        data = resp.json()
+        # Binary data should be in the echo (may be escaped)
+        assert len(data["echo"]) > 0
+
+    async def test_get_request(self, httpx_client: HPKEAsyncClient) -> None:
+        """GET requests work (no body encryption needed)."""
+        resp = await httpx_client.get("/health")
+        assert resp.status_code == 200
+
+    async def test_all_http_methods(self, httpx_client: HPKEAsyncClient) -> None:
+        """All HTTP methods work correctly."""
+        # POST
+        resp = await httpx_client.post("/echo", json={"method": "POST"})
+        assert resp.status_code == 200
+        assert resp.json()["method"] == "POST"
+
+        # PUT
+        resp = await httpx_client.put("/echo", json={"method": "PUT"})
+        assert resp.status_code == 200
+        assert resp.json()["method"] == "PUT"
+
+        # PATCH
+        resp = await httpx_client.patch("/echo", json={"method": "PATCH"})
+        assert resp.status_code == 200
+        assert resp.json()["method"] == "PATCH"
+
+        # DELETE
+        resp = await httpx_client.delete("/echo")
+        assert resp.status_code == 200
+        assert resp.json()["method"] == "DELETE"
+
+        # HEAD (no body in response)
+        resp = await httpx_client.head("/health")
+        assert resp.status_code == 200
+
+        # OPTIONS (may or may not be supported by test server)
+        resp = await httpx_client.options("/echo")
+        # Just verify it doesn't crash
+
+
+class TestStandardResponseEncryptionHTTPX:
+    """Test encrypted standard (non-SSE) responses with HTTPX."""
+
+    async def test_response_has_hpke_stream_header(self, httpx_client: HPKEAsyncClient) -> None:
+        """Encrypted request triggers encrypted response with X-HPKE-Stream header."""
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        assert resp.status_code == 200
+
+        # HTTPXDecryptedResponse wraps the underlying response
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        # X-HPKE-Stream header should be present (contains salt)
+        assert HEADER_HPKE_STREAM in resp.headers
+
+        # Content-Type should NOT be text/event-stream (that's for SSE)
+        content_type = resp.headers.get("Content-Type", "")
+        assert "text/event-stream" not in content_type
+
+    async def test_decrypted_response_json(self, httpx_client: HPKEAsyncClient) -> None:
+        """HTTPXDecryptedResponse.json() returns decrypted data."""
+        test_data = {"message": "secret", "value": 42}
+        resp = await httpx_client.post("/echo", json=test_data)
+
+        # json() should return decrypted data
+        data = resp.json()
+        assert "message" in data["echo"]
+        assert "secret" in data["echo"]
+
+    async def test_decrypted_response_content(self, httpx_client: HPKEAsyncClient) -> None:
+        """HTTPXDecryptedResponse.content returns raw decrypted bytes."""
+        resp = await httpx_client.post("/echo", json={"raw": "test"})
+
+        # content should return decrypted bytes
+        raw_bytes = resp.content
+        assert b"raw" in raw_bytes
+        assert b"test" in raw_bytes
+
+    async def test_decrypted_response_text(self, httpx_client: HPKEAsyncClient) -> None:
+        """HTTPXDecryptedResponse.text returns decrypted text."""
+        resp = await httpx_client.post("/echo", json={"text": "hello"})
+
+        # text should return decrypted string
+        text = resp.text
+        assert "text" in text
+        assert "hello" in text
+
+
+class TestSSEEncryptionHTTPX:
+    """Test encrypted SSE streaming with HTTPX."""
+
+    async def test_sse_stream_roundtrip(self, httpx_client: HPKEAsyncClient) -> None:
+        """SSE events are encrypted end-to-end."""
+        resp = await httpx_client.post("/stream", json={"start": True})
+        assert resp.status_code == 200
+        events = [parse_sse_chunk(chunk) async for chunk in httpx_client.iter_sse(resp)]
+
+        # Should have 4 events: 3 progress + 1 complete
+        assert len(events) == 4
+
+        # Verify progress events
+        for i in range(3):
+            event_type, event_data = events[i]
+            assert event_type == "progress"
+            assert event_data is not None
+            assert event_data["step"] == i + 1
+
+        # Verify complete event
+        event_type, event_data = events[3]
+        assert event_type == "complete"
+        assert event_data is not None
+        assert event_data["result"] == "success"
+
+    async def test_sse_counter_monotonicity(self, httpx_client: HPKEAsyncClient) -> None:
+        """SSE events have monotonically increasing counters."""
+        event_count = 0
+
+        resp = await httpx_client.post("/stream", json={"start": True})
+        assert resp.status_code == 200
+        async for _chunk in httpx_client.iter_sse(resp):
+            event_count += 1
+
+        # Verify all events were processed (counter worked correctly)
+        assert event_count == 4
+
+    async def test_sse_many_events(self, httpx_client: HPKEAsyncClient) -> None:
+        """Many SSE events work correctly."""
+        resp = await httpx_client.post("/stream-many", json={"start": True})
+        assert resp.status_code == 200
+        events = [parse_sse_chunk(chunk) async for chunk in httpx_client.iter_sse(resp)]
+
+        # Should have 51 events: 50 tick + 1 done
+        assert len(events) == 51
+
+
+class TestDecryptedResponseHTTPXCompat:
+    """Test HTTPXDecryptedResponse API compatibility with httpx.Response."""
+
+    async def test_status_code_property(self, httpx_client: HPKEAsyncClient) -> None:
+        """status_code property works."""
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        assert resp.status_code == 200
+
+    async def test_is_success_property(self, httpx_client: HPKEAsyncClient) -> None:
+        """is_success property works for 2xx responses."""
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        assert resp.is_success is True
+
+    async def test_headers_property(self, httpx_client: HPKEAsyncClient) -> None:
+        """headers property returns httpx.Headers-compatible object."""
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        assert "content-type" in resp.headers or "Content-Type" in resp.headers
+
+    async def test_url_property(self, httpx_client: HPKEAsyncClient) -> None:
+        """url property works."""
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        assert "/echo" in str(resp.url)
+
+    async def test_raise_for_status(self, httpx_client: HPKEAsyncClient) -> None:
+        """raise_for_status() doesn't raise for 2xx."""
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        # Should not raise
+        resp.raise_for_status()
+
+    async def test_unwrap_returns_httpx_response(self, httpx_client: HPKEAsyncClient) -> None:
+        """unwrap() returns the underlying httpx.Response."""
+        import httpx
+
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        assert isinstance(resp, HTTPXDecryptedResponse)
+        unwrapped = resp.unwrap()
+        assert isinstance(unwrapped, httpx.Response)
+
+
+class TestCompressionE2EHTTPX:
+    """Test Zstd compression with HTTPX."""
+
+    async def test_compressed_request_roundtrip(
+        self,
+        httpx_client_compressed: HPKEAsyncClient,
+    ) -> None:
+        """Compressed requests roundtrip correctly."""
+        large_data = {"message": "x" * 1000, "nested": {"key": "value" * 100}}
+        resp = await httpx_client_compressed.post("/echo", json=large_data)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "x" * 1000 in data["echo"]
+
+
+# =============================================================================
+# TEST: release_encrypted flag
+# =============================================================================
+
+
+class TestReleaseEncryptedAiohttp:
+    """Test release_encrypted flag for aiohttp middleware."""
+
+    async def test_decrypted_content_accessible(
+        self,
+        aiohttp_client_release_encrypted: HPKEClientSession,
+    ) -> None:
+        """Decrypted content is accessible when release_encrypted=True."""
+        resp = await aiohttp_client_release_encrypted.post("/echo", json={"test": 1})
+        assert isinstance(resp, DecryptedResponse)
+
+        # Decrypted content should be accessible
+        data = await resp.json()
+        assert "echo" in data
+        # Echo returns the raw request body as a string
+        assert "test" in data["echo"]
+
+    async def test_encrypted_content_released(
+        self,
+        aiohttp_client_release_encrypted: HPKEClientSession,
+    ) -> None:
+        """Encrypted content is released after decryption when release_encrypted=True."""
+        resp = await aiohttp_client_release_encrypted.post("/echo", json={"test": 1})
+        assert isinstance(resp, DecryptedResponse)
+
+        # Trigger decryption
+        _ = await resp.read()
+
+        # Underlying response body should be cleared
+        underlying = resp.unwrap()
+        # aiohttp stores body in _body attribute
+        assert underlying._body == b""  # type: ignore[attr-defined]
+
+    async def test_multiple_reads_still_work(
+        self,
+        aiohttp_client_release_encrypted: HPKEClientSession,
+    ) -> None:
+        """Multiple reads return cached decrypted content even after encrypted is released."""
+        resp = await aiohttp_client_release_encrypted.post("/echo", json={"test": 1})
+        assert isinstance(resp, DecryptedResponse)
+
+        # First read triggers decryption and release
+        body1 = await resp.read()
+        # Second read should return cached decrypted content
+        body2 = await resp.read()
+
+        assert body1 == body2
+        assert len(body1) > 0
+
+    async def test_flag_default_false(
+        self,
+        aiohttp_client: HPKEClientSession,
+    ) -> None:
+        """By default, release_encrypted is False and encrypted content is retained."""
+        resp = await aiohttp_client.post("/echo", json={"test": 1})
+        assert isinstance(resp, DecryptedResponse)
+
+        # Trigger decryption
+        _ = await resp.read()
+
+        # Underlying response body should NOT be cleared
+        underlying = resp.unwrap()
+        assert underlying._body != b""  # type: ignore[attr-defined]
+
+
+class TestReleaseEncryptedHTTPX:
+    """Test release_encrypted flag for httpx middleware."""
+
+    async def test_decrypted_content_accessible(
+        self,
+        httpx_client_release_encrypted: HPKEAsyncClient,
+    ) -> None:
+        """Decrypted content is accessible when release_encrypted=True."""
+        resp = await httpx_client_release_encrypted.post("/echo", json={"test": 1})
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        # Decrypted content should be accessible
+        data = resp.json()
+        assert "echo" in data
+        # Echo returns the raw request body as a string
+        assert "test" in data["echo"]
+
+    async def test_encrypted_content_released(
+        self,
+        httpx_client_release_encrypted: HPKEAsyncClient,
+    ) -> None:
+        """Encrypted content is released after decryption when release_encrypted=True."""
+        resp = await httpx_client_release_encrypted.post("/echo", json={"test": 1})
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        # Trigger decryption
+        _ = resp.content
+
+        # Underlying response body should be cleared
+        underlying = resp.unwrap()
+        # httpx stores body in _content attribute
+        assert underlying._content == b""  # type: ignore[attr-defined]
+
+    async def test_multiple_reads_still_work(
+        self,
+        httpx_client_release_encrypted: HPKEAsyncClient,
+    ) -> None:
+        """Multiple reads return cached decrypted content even after encrypted is released."""
+        resp = await httpx_client_release_encrypted.post("/echo", json={"test": 1})
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        # First read triggers decryption and release
+        body1 = resp.content
+        # Second read should return cached decrypted content
+        body2 = resp.content
+
+        assert body1 == body2
+        assert len(body1) > 0
+
+    async def test_flag_default_false(
+        self,
+        httpx_client: HPKEAsyncClient,
+    ) -> None:
+        """By default, release_encrypted is False and encrypted content is retained."""
+        resp = await httpx_client.post("/echo", json={"test": 1})
+        assert isinstance(resp, HTTPXDecryptedResponse)
+
+        # Trigger decryption
+        _ = resp.content
+
+        # Underlying response body should NOT be cleared
+        underlying = resp.unwrap()
+        assert underlying._content != b""  # type: ignore[attr-defined]

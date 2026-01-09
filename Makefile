@@ -20,7 +20,7 @@ install:
 	$(MAKE) install-deps
 
 install-deps:
-	uv sync --extra dev --extra fastapi --extra aiohttp --extra zstd
+	uv sync --extra dev --extra fastapi --extra aiohttp --extra httpx --extra zstd
 
 # Test vectors
 VECTORS_DIR := tests/vectors

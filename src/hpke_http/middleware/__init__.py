@@ -6,4 +6,7 @@ Server (FastAPI):
 
 Client (aiohttp):
     from hpke_http.middleware.aiohttp import HPKEClientSession
+
+Client (httpx):
+    from hpke_http.middleware.httpx import HPKEAsyncClient
 """

@@ -19,6 +19,7 @@ keywords = [
     "x25519",
     "fastapi",
     "aiohttp",
+    "httpx",
     "sse",
     "streaming",
 ]
@@ -69,6 +70,10 @@ fastapi = [
 # aiohttp client (optional for client-side)
 aiohttp = [
     "aiohttp~=3.13",  # Upgraded from ~=3.11 for security fixes
+]
+# httpx client (optional for client-side)
+httpx = [
+    "httpx~=0.28",
 ]
 # Zstd compression (optional, RFC 8878)
 zstd = [
