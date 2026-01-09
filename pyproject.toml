@@ -53,6 +53,7 @@ dev = [
     "pytest-mock~=3.14",
     "pytest-xdist[psutil]~=3.8",
     "pytest~=8.3",
+    "python-multipart~=0.0",     # Multipart form parsing for upload tests
     "ruff~=0.7",
     "scipy~=1.14",               # Statistical tests for encryption verification
     "twine~=6.1",                # Package verification before PyPI upload

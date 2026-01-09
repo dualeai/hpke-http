@@ -25,10 +25,11 @@ from http import HTTPStatus
 from typing import Any
 
 import httpx
+from httpx._content import encode_multipart_data
 from typing_extensions import Self
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import HEADER_HPKE_STREAM, KemId
+from hpke_http.constants import HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM, KemId
 from hpke_http.core import (
     BaseHPKEClient,
     ResponseDecryptor,
@@ -383,6 +384,56 @@ class HPKEAsyncClient(BaseHPKEClient):
 
         return (async_stream(), headers, ctx)
 
+    def _prepare_body(
+        self,
+        *,
+        content: Any,
+        data: Any,
+        files: Any,
+        json: Any,
+        headers: dict[str, Any],
+    ) -> tuple[bytes | None, str | None, Any, Any]:
+        """
+        Prepare request body for encryption, preserving original Content-Type.
+
+        Returns:
+            Tuple of (body_bytes, original_content_type, files, data)
+            - body_bytes: Serialized body ready for encryption (or None)
+            - original_content_type: Original Content-Type to preserve (or None)
+            - files: Cleared to None if serialized into body
+            - data: Cleared to None if serialized into body
+        """
+        body: bytes | None = None
+        original_content_type: str | None = None
+
+        # Handle multipart files - serialize to bytes before encryption
+        if files is not None:
+            multipart_headers, multipart_stream = encode_multipart_data(
+                data=data or {},
+                files=files,
+                boundary=None,  # Let httpx generate random boundary
+            )
+            body = b"".join(multipart_stream)  # MultipartStream is iterable
+            original_content_type = multipart_headers.get("Content-Type", "")
+            files = None  # Clear since we're serializing to body
+            data = None
+        elif json is not None:
+            # NOTE: json.dumps().encode() creates 2 allocations (str → bytes).
+            # For higher throughput, consider orjson.dumps() which returns bytes
+            # directly (1 allocation, ~10x faster). Not included as dependency
+            # to keep the library lightweight.
+            body = json_module.dumps(json).encode()
+            original_content_type = "application/json"
+        elif content is not None and isinstance(content, bytes):
+            body = content
+            # Preserve Content-Type from headers if present
+            original_content_type = headers.get("Content-Type")
+        elif data is not None and isinstance(data, bytes):
+            body = data
+            original_content_type = headers.get("Content-Type")
+
+        return body, original_content_type, files, data
+
     async def request(
         self,
         method: str,
@@ -427,17 +478,13 @@ class HPKEAsyncClient(BaseHPKEClient):
         if not self._client:
             raise RuntimeError("Client not initialized. Use 'async with' context manager.")
 
-        # Prepare body for encryption
-        body: bytes | None = None
-        if json is not None:
-            body = json_module.dumps(json).encode()
-        elif content is not None and isinstance(content, bytes):
-            body = content
-        elif data is not None and isinstance(data, bytes):
-            body = data
-
-        # Build headers dict
+        # Build headers dict early (needed for Content-Type preservation)
         request_headers = dict(headers or {})
+
+        # Prepare body for encryption (handles multipart, json, raw bytes)
+        body, original_content_type, files, data = self._prepare_body(
+            content=content, data=data, files=files, json=json, headers=request_headers
+        )
         sender_ctx: SenderContext | None = None
 
         # Encrypt if we have a body to encrypt
@@ -446,6 +493,9 @@ class HPKEAsyncClient(BaseHPKEClient):
             keys = await self._ensure_keys()
             encrypted_stream, crypto_headers, ctx = self._encrypt_request(body, keys)
             request_headers.update(crypto_headers)
+            # Preserve original Content-Type for downstream middleware
+            if original_content_type:
+                request_headers[HEADER_HPKE_CONTENT_TYPE] = original_content_type
             request_headers["Content-Type"] = "application/octet-stream"
             sender_ctx = ctx
             # Pass iterator for streaming upload (chunked transfer encoding)

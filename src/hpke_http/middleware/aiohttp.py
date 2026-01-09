@@ -30,7 +30,7 @@ from typing_extensions import Self
 from yarl import URL
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import HEADER_HPKE_STREAM
+from hpke_http.constants import HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM
 from hpke_http.core import (
     BaseHPKEClient,
     ResponseDecryptor,
@@ -416,13 +416,51 @@ class HPKEClientSession(BaseHPKEClient):
 
         return (async_stream(), headers, ctx)
 
+    async def _prepare_body(
+        self,
+        *,
+        json: Any,
+        data: bytes | aiohttp.FormData | None,
+        headers: dict[str, Any],
+    ) -> tuple[bytes | None, str | None]:
+        """
+        Prepare request body for encryption, preserving original Content-Type.
+
+        Returns:
+            Tuple of (body_bytes, original_content_type)
+            - body_bytes: Serialized body ready for encryption (or None)
+            - original_content_type: Original Content-Type to preserve (or None)
+        """
+        body: bytes | None = None
+        original_content_type: str | None = None
+
+        # Handle FormData - serialize to bytes before encryption
+        if isinstance(data, aiohttp.FormData):
+            # FormData() returns MultipartWriter, which has async as_bytes()
+            payload = data()
+            body = await payload.as_bytes()
+            original_content_type = payload.content_type
+        elif json is not None:
+            # NOTE: json.dumps().encode() creates 2 allocations (str → bytes).
+            # For higher throughput, consider orjson.dumps() which returns bytes
+            # directly (1 allocation, ~10x faster). Not included as dependency
+            # to keep the library lightweight.
+            body = json_module.dumps(json).encode()
+            original_content_type = "application/json"
+        elif data is not None:
+            body = data
+            # Preserve Content-Type from headers if present
+            original_content_type = headers.get("Content-Type")
+
+        return body, original_content_type
+
     async def request(
         self,
         method: str,
         url: str,
         *,
         json: Any = None,
-        data: bytes | None = None,
+        data: bytes | aiohttp.FormData | None = None,
         **kwargs: Any,
     ) -> aiohttp.ClientResponse | DecryptedResponse:
         """
@@ -432,7 +470,7 @@ class HPKEClientSession(BaseHPKEClient):
             method: HTTP method
             url: URL (relative to base_url or absolute)
             json: JSON body (will be serialized and encrypted)
-            data: Raw body bytes (will be encrypted)
+            data: Raw body bytes or aiohttp.FormData (will be encrypted)
             **kwargs: Additional arguments passed to aiohttp
 
         Returns:
@@ -446,19 +484,20 @@ class HPKEClientSession(BaseHPKEClient):
         if not url.startswith(("http://", "https://")):
             url = urljoin(self.base_url + "/", url.lstrip("/"))
 
-        # Prepare body
-        body: bytes | None = None
-        if json is not None:
-            body = json_module.dumps(json).encode()
-        elif data is not None:
-            body = data
-
-        # Encrypt if we have a body
+        # Build headers dict early (needed for Content-Type preservation)
         headers = dict(kwargs.pop("headers", {}))
+
+        # Prepare body for encryption (handles FormData, json, raw bytes)
+        body, original_content_type = await self._prepare_body(
+            json=json, data=data, headers=headers
+        )
         sender_ctx: SenderContext | None = None
         if body:
             encrypted_stream, crypto_headers, ctx = await self._encrypt_request(body)
             headers.update(crypto_headers)
+            # Preserve original Content-Type for downstream middleware
+            if original_content_type:
+                headers[HEADER_HPKE_CONTENT_TYPE] = original_content_type
             headers["Content-Type"] = "application/octet-stream"
             sender_ctx = ctx
             # Pass async generator for streaming upload (chunked transfer encoding)

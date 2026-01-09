@@ -152,6 +152,15 @@ HEADER_HPKE_STREAM: Final[str] = "X-HPKE-Stream"
 HEADER_HPKE_ENCODING: Final[str] = "X-HPKE-Encoding"
 """Header specifying compression algorithm for request body (RFC 8878)."""
 
+HEADER_HPKE_CONTENT_TYPE: Final[str] = "X-HPKE-Content-Type"
+"""Header preserving original Content-Type before encryption.
+
+Used to restore Content-Type after decryption so frameworks can properly
+parse multipart/form-data and other content types. The encrypted body is
+sent as application/octet-stream, and this header allows the server to
+restore the original Content-Type for the application layer.
+"""
+
 RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"
 """Export label for deriving response encryption key from HPKE context."""
 
