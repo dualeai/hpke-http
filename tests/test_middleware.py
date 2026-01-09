@@ -124,6 +124,38 @@ class TestEncryptedRequests:
         # Binary data should be in the echo (may be escaped)
         assert len(data["echo"]) > 0
 
+    async def test_put_method(self, aiohttp_client: HPKEClientSession) -> None:
+        """PUT request encrypts and decrypts correctly."""
+        resp = await aiohttp_client.put("/echo", json={"method": "PUT"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["method"] == "PUT"
+
+    async def test_patch_method(self, aiohttp_client: HPKEClientSession) -> None:
+        """PATCH request encrypts and decrypts correctly."""
+        resp = await aiohttp_client.patch("/echo", json={"method": "PATCH"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["method"] == "PATCH"
+
+    async def test_delete_method(self, aiohttp_client: HPKEClientSession) -> None:
+        """DELETE request works correctly."""
+        resp = await aiohttp_client.delete("/echo")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["method"] == "DELETE"
+
+    async def test_head_method(self, aiohttp_client: HPKEClientSession) -> None:
+        """HEAD request works correctly."""
+        resp = await aiohttp_client.head("/health")
+        assert resp.status == 200
+
+    async def test_options_method(self, aiohttp_client: HPKEClientSession) -> None:
+        """OPTIONS request works correctly."""
+        resp = await aiohttp_client.options("/echo")
+        # Just verify it doesn't crash - server may or may not support OPTIONS
+        assert resp.status in (200, 405)
+
 
 class TestStandardResponseEncryption:
     """Test encrypted standard (non-SSE) responses."""

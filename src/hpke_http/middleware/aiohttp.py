@@ -468,6 +468,25 @@ class HPKEClientSession(BaseHPKEClient):
         """DELETE request."""
         return await self.request("DELETE", url, **kwargs)
 
+    async def patch(
+        self,
+        url: str,
+        *,
+        json: Any = None,
+        data: bytes | None = None,
+        **kwargs: Any,
+    ) -> aiohttp.ClientResponse | DecryptedResponse:
+        """PATCH request."""
+        return await self.request("PATCH", url, json=json, data=data, **kwargs)
+
+    async def head(self, url: str, **kwargs: Any) -> aiohttp.ClientResponse | DecryptedResponse:
+        """HEAD request."""
+        return await self.request("HEAD", url, **kwargs)
+
+    async def options(self, url: str, **kwargs: Any) -> aiohttp.ClientResponse | DecryptedResponse:
+        """OPTIONS request."""
+        return await self.request("OPTIONS", url, **kwargs)
+
     async def iter_sse(
         self,
         response: aiohttp.ClientResponse | DecryptedResponse,
