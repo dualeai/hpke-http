@@ -479,26 +479,41 @@ class HPKEAsyncClient(BaseHPKEClient):
             **{k: v for k, v in optional_kwargs.items() if v is not None},
         }
 
-        response = await self._client.request(**kwargs)
+        # Use manual streaming mode for progressive SSE delivery
+        # See: https://www.python-httpx.org/async/#streaming-responses
+        # client.request() buffers entire response; stream=True enables true streaming
+        request = self._client.build_request(**kwargs)
+        response = await self._client.send(request, stream=True)
 
         # Store context per-response for concurrent request safety (needed for SSE)
         if sender_ctx:
             self._response_contexts[response] = sender_ctx
 
-            # Return DecryptedResponse wrapper for encrypted standard responses
+            # Detect response type from headers (available before body is read)
             # Detection: X-HPKE-Stream present AND Content-Type is NOT text/event-stream
             if HEADER_HPKE_STREAM in response.headers:
                 content_type = response.headers.get("Content-Type", "")
                 if "text/event-stream" not in content_type:
+                    # Non-SSE: read full body into memory for DecryptedResponse
+                    await response.aread()
                     _logger.debug("Encrypted response detected: url=%s", url)
                     return DecryptedResponse(
                         response,
                         sender_ctx,
                         release_encrypted=self._release_encrypted,
                     )
+                # SSE: keep stream open for iter_sse() to consume progressively
+                _logger.debug("SSE streaming response: url=%s", url)
             elif self.require_encryption:
                 # We sent encrypted request but got plaintext response
+                await response.aclose()
                 raise EncryptionRequiredError("Response was not encrypted")
+            else:
+                # Unencrypted response: read full body
+                await response.aread()
+        else:
+            # No encryption context: read full body for non-encrypted request
+            await response.aread()
 
         return response
 
@@ -718,6 +733,10 @@ class HPKEAsyncClient(BaseHPKEClient):
 
         Yields:
             Raw SSE chunks as bytes exactly as the server sent them
+
+        Note:
+            Response is automatically closed when iteration completes or on error.
+            With stream=True, we must call aclose() to avoid connection leaks.
         """
         # Extract underlying response if wrapped
         if isinstance(response, DecryptedResponse):
@@ -736,14 +755,20 @@ class HPKEAsyncClient(BaseHPKEClient):
         current_event_lines: list[bytes] = []
 
         # httpx uses aiter_bytes() for streaming
-        async for chunk in response.aiter_bytes():
-            for line in line_parser.feed(chunk):
-                if not line:
-                    # Empty line = event boundary (WHATWG spec)
-                    data_value = extract_sse_data(current_event_lines)
-                    if data_value:
-                        raw_chunk = decryptor.decrypt(data_value)
-                        yield raw_chunk
-                    current_event_lines = []
-                else:
-                    current_event_lines.append(line)
+        # Ensure response is closed when done (required for stream=True mode)
+        try:
+            async for chunk in response.aiter_bytes():
+                for line in line_parser.feed(chunk):
+                    if not line:
+                        # Empty line = event boundary (WHATWG spec)
+                        data_value = extract_sse_data(current_event_lines)
+                        if data_value:
+                            raw_chunk = decryptor.decrypt(data_value)
+                            yield raw_chunk
+                        current_event_lines = []
+                    else:
+                        current_event_lines.append(line)
+        finally:
+            # Clean up response context and close connection
+            self._response_contexts.pop(response, None)
+            await response.aclose()
