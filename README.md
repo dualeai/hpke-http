@@ -22,7 +22,7 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE.
 uv add "hpke-http[fastapi]"       # Server
 uv add "hpke-http[aiohttp]"       # Client (aiohttp)
 uv add "hpke-http[httpx]"         # Client (httpx)
-uv add "hpke-http[fastapi,zstd]"  # + compression
+uv add "hpke-http[fastapi,zstd]"  # + zstd compression (gzip fallback is stdlib)
 ```
 
 ## Quick Start
@@ -76,7 +76,7 @@ async with HPKEClientSession(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
-    # compress=True,           # Zstd compression, reduces bandwidth 40-95%
+    # compress=True,           # Compression (zstd preferred, gzip fallback)
     # require_encryption=True, # Raise if server responds unencrypted
     # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
 ) as session:
@@ -100,7 +100,7 @@ async with HPKEAsyncClient(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
     psk_id=tenant_id,
-    # compress=True,           # Zstd compression, reduces bandwidth 40-95%
+    # compress=True,           # Compression (zstd preferred, gzip fallback)
     # require_encryption=True, # Raise if server responds unencrypted
     # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
 ) as client:
@@ -121,7 +121,8 @@ async with HPKEAsyncClient(
 - [RFC 7748 - X25519](https://datatracker.ietf.org/doc/rfc7748/)
 - [RFC 5869 - HKDF](https://datatracker.ietf.org/doc/rfc5869/)
 - [RFC 8439 - ChaCha20-Poly1305](https://datatracker.ietf.org/doc/rfc8439/)
-- [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (optional compression)
+- [RFC 8878 - Zstandard](https://datatracker.ietf.org/doc/rfc8878/) (preferred compression)
+- [RFC 1952 - Gzip](https://datatracker.ietf.org/doc/rfc1952/) (fallback compression, stdlib)
 - [RFC 9110 - HTTP Semantics](https://datatracker.ietf.org/doc/rfc9110/) (Accept-Encoding negotiation)
 
 ## Security
@@ -200,20 +201,21 @@ Response type is detected via `Content-Type` header:
 
 ## Compression (Optional)
 
-Zstd (RFC 8878) reduces bandwidth by **40-95%** for JSON/text.
+Zstd (RFC 8878) reduces bandwidth by **40-95%** for JSON/text. Gzip (RFC 1952) is used as fallback when zstd is unavailable.
 
-**Auto-negotiation:** Clients with `compress=True` automatically detect server capabilities via the `Accept-Encoding` header in discovery response. If server lacks zstd, client sends uncompressed - no 415 errors.
+**Auto-negotiation:** Clients with `compress=True` automatically detect server capabilities via the `Accept-Encoding` header in discovery response. Priority: zstd > gzip > identity.
 
 ```python
-# Client auto-negotiates - safe even if server lacks zstd
+# Client auto-negotiates best available encoding
 async with HPKEClientSession(base_url=url, psk=key, compress=True) as client:
-    # Check server capability (after first request triggers discovery)
+    # Check server capabilities (after first request triggers discovery)
     print(client.server_supports_zstd)  # True or False
+    print(client.server_supports_gzip)  # True (always, stdlib)
 ```
 
-**Server config:** Enable with `compress=True`. Middleware validates zstd availability at startup - raises `ImportError` if zstd package missing.
+**Server config:** Enable with `compress=True`. Server advertises supported encodings (`identity, gzip, zstd` or `identity, gzip` if zstd unavailable).
 
-**Request compression:** Client compresses body before encryption when `compress=True` and server supports zstd. Payloads < 64 bytes skip compression.
+**Request compression:** Client compresses body before encryption when `compress=True`, using best mutually-supported encoding. Payloads < 64 bytes skip compression.
 
 **Response compression:** Server compresses response chunks (both SSE and standard) when `compress=True`. Payloads < 64 bytes skip compression.
 
