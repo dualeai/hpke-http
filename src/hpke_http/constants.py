@@ -287,7 +287,7 @@ ZSTD_COMPRESSION_LEVEL: Final[int] = 3
 """Zstd compression level (1-22). Level 3 = fast compression."""
 
 ZSTD_MIN_SIZE: Final[int] = 64
-"""Minimum payload size for compression. Smaller payloads skip compression."""
+"""Minimum payload size for compression (zstd or gzip). Smaller payloads skip compression."""
 
 ZSTD_STREAMING_THRESHOLD: Final[int] = 1024 * 1024  # 1MB
 """Threshold for using streaming compression vs in-memory.
@@ -327,9 +327,6 @@ GZIP_COMPRESSION_LEVEL: Final[int] = 6
 
 Level 9 is ~3x slower than level 6 for only ~1% better compression.
 """
-
-GZIP_MIN_SIZE: Final[int] = 64
-"""Minimum payload size for gzip compression. Same threshold as zstd."""
 
 GZIP_STREAMING_THRESHOLD: Final[int] = 1024 * 1024  # 1MB
 """Threshold for using streaming gzip compression vs in-memory.

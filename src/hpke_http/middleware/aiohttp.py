@@ -25,14 +25,16 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
+from aiohttp.payload import BytesPayload, IOBasePayload, StringPayload
 from multidict import CIMultiDictProxy
 from typing_extensions import Self
 from yarl import URL
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM
+from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM, KemId
 from hpke_http.core import (
     BaseHPKEClient,
+    RequestEncryptor,
     ResponseDecryptor,
     SSEDecryptor,
     SSELineParser,
@@ -47,6 +49,69 @@ __all__ = [
 ]
 
 _logger = get_logger(__name__)
+
+
+async def _stream_multipart(
+    mp: aiohttp.MultipartWriter,
+    chunk_size: int = CHUNK_SIZE,
+) -> AsyncIterator[bytes]:
+    """
+    Stream multipart payload without full materialization.
+
+    Yields chunks from the MultipartWriter without calling as_bytes(), which
+    would allocate the entire payload in memory. This enables O(chunk_size)
+    memory usage instead of O(total_size).
+
+    Args:
+        mp: aiohttp MultipartWriter from FormData()
+        chunk_size: Maximum chunk size to yield (default: 64KB)
+
+    Yields:
+        Chunks of the multipart body
+
+    Note:
+        Uses internal aiohttp attributes (_boundary, _parts, _binary_headers).
+        These are stable across aiohttp 3.x but may change in future versions.
+    """
+    boundary = mp._boundary  # type: ignore[attr-defined]  # noqa: SLF001
+
+    for part, _encoding, _te_encoding in mp._parts:  # type: ignore[attr-defined]  # noqa: SLF001
+        # Emit boundary delimiter
+        yield b"--" + boundary + b"\r\n"
+
+        # Emit part headers
+        yield part._binary_headers  # type: ignore[attr-defined]  # noqa: SLF001
+
+        # Stream part body based on payload type
+        if isinstance(part, IOBasePayload):
+            # File-like payload - read in chunks for memory efficiency
+            # IOBase type is abstract, actual value is file-like with seek/read
+            value = part._value  # type: ignore[attr-defined]  # noqa: SLF001
+            if hasattr(value, "seek"):
+                value.seek(0)  # type: ignore[union-attr]
+            while chunk := value.read(chunk_size):  # type: ignore[union-attr]
+                yield chunk if isinstance(chunk, bytes) else chunk.encode()  # type: ignore[union-attr]
+        elif isinstance(part, BytesPayload):
+            # BytesPayload - stream in chunks for memory efficiency
+            value: bytes = part._value  # type: ignore[attr-defined]  # noqa: SLF001
+            for offset in range(0, len(value), chunk_size):
+                yield value[offset : offset + chunk_size]
+        elif isinstance(part, StringPayload):
+            # StringPayload - encode and stream in chunks
+            value_str = part._value  # type: ignore[attr-defined]  # noqa: SLF001
+            encoded = value_str.encode() if isinstance(value_str, str) else value_str
+            for offset in range(0, len(encoded), chunk_size):
+                yield encoded[offset : offset + chunk_size]
+        else:
+            # Other payload types - fallback to as_bytes() (materializes but rare)
+            body = await part.as_bytes()
+            yield body
+
+        # Part terminator
+        yield b"\r\n"
+
+    # Final boundary
+    yield b"--" + boundary + b"--\r\n"
 
 
 class DecryptedResponse:
@@ -416,15 +481,63 @@ class HPKEClientSession(BaseHPKEClient):
 
         return (async_stream(), headers, ctx)
 
+    async def _encrypt_stream_async(
+        self,
+        chunks: AsyncIterator[bytes],
+    ) -> tuple[AsyncIterator[bytes], dict[str, str], SenderContext]:
+        """
+        Encrypt async stream using feed/finalize API for memory efficiency.
+
+        This method handles arbitrary async byte streams (like multipart) without
+        materializing the full payload. Buffers input until CHUNK_SIZE (64KB) before
+        encrypting to maintain efficient wire format.
+
+        Note: This does NOT support whole-body compression. Each chunk is encrypted
+        as-is with IDENTITY encoding. For compressed uploads, use _encrypt_request()
+        with the complete body instead.
+
+        Args:
+            chunks: Async iterator of raw bytes
+
+        Returns:
+            Tuple of (async_encrypted_generator, headers_dict, sender_context)
+        """
+        keys = await self._ensure_keys()
+
+        # Get X25519 key (default suite)
+        pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
+        if not pk_r:
+            raise KeyDiscoveryError("No X25519 key available from platform")
+
+        # Create encryptor without compression (streaming doesn't support whole-body compression)
+        encryptor = RequestEncryptor(
+            public_key=pk_r,
+            psk=self.psk,
+            psk_id=self.psk_id,
+            compress=False,  # Streaming doesn't support whole-body compression
+        )
+
+        async def encrypt_gen() -> AsyncIterator[bytes]:
+            async for chunk in chunks:
+                for encrypted in encryptor.feed(chunk):
+                    yield encrypted
+            for encrypted in encryptor.finalize():
+                yield encrypted
+
+        return encrypt_gen(), encryptor.get_headers(), encryptor.context
+
     async def _prepare_body(
         self,
         *,
         json: Any,
-        data: bytes | aiohttp.FormData | None,
+        data: bytes | None,
         headers: dict[str, Any],
     ) -> tuple[bytes | None, str | None]:
         """
         Prepare request body for encryption, preserving original Content-Type.
+
+        Note: FormData is handled separately in request() with streaming.
+        This method only handles json and raw bytes.
 
         Returns:
             Tuple of (body_bytes, original_content_type)
@@ -434,13 +547,7 @@ class HPKEClientSession(BaseHPKEClient):
         body: bytes | None = None
         original_content_type: str | None = None
 
-        # Handle FormData - serialize to bytes before encryption
-        if isinstance(data, aiohttp.FormData):
-            # FormData() returns MultipartWriter, which has async as_bytes()
-            payload = data()
-            body = await payload.as_bytes()
-            original_content_type = payload.content_type
-        elif json is not None:
+        if json is not None:
             # NOTE: json.dumps().encode() creates 2 allocations (str → bytes).
             # For higher throughput, consider orjson.dumps() which returns bytes
             # directly (1 allocation, ~10x faster). Not included as dependency
@@ -487,11 +594,29 @@ class HPKEClientSession(BaseHPKEClient):
         # Build headers dict early (needed for Content-Type preservation)
         headers = dict(kwargs.pop("headers", {}))
 
-        # Prepare body for encryption (handles FormData, json, raw bytes)
-        body, original_content_type = await self._prepare_body(
-            json=json, data=data, headers=headers
-        )
         sender_ctx: SenderContext | None = None
+
+        # Handle FormData with streaming (avoids full materialization)
+        if isinstance(data, aiohttp.FormData):
+            # FormData() returns MultipartWriter (typed as Payload for compatibility)
+            payload: aiohttp.MultipartWriter = data()  # type: ignore[assignment]
+            # Use streaming encryption - memory O(chunk_size) instead of O(total_size)
+            encrypted_stream, crypto_headers, ctx = await self._encrypt_stream_async(_stream_multipart(payload))
+            headers.update(crypto_headers)
+            headers[HEADER_HPKE_CONTENT_TYPE] = payload.content_type
+            headers["Content-Type"] = "application/octet-stream"
+            sender_ctx = ctx
+            kwargs["data"] = encrypted_stream
+            _logger.debug(
+                "FormData encrypted with streaming: method=%s url=%s",
+                method,
+                url,
+            )
+            # Clear data to skip _prepare_body processing
+            data = None
+
+        # Prepare body for encryption (handles json, raw bytes - NOT FormData)
+        body, original_content_type = await self._prepare_body(json=json, data=data, headers=headers)
         if body:
             encrypted_stream, crypto_headers, ctx = await self._encrypt_request(body)
             headers.update(crypto_headers)
@@ -543,7 +668,7 @@ class HPKEClientSession(BaseHPKEClient):
         url: str,
         *,
         json: Any = None,
-        data: bytes | None = None,
+        data: bytes | aiohttp.FormData | None = None,
         **kwargs: Any,
     ) -> aiohttp.ClientResponse | DecryptedResponse:
         """POST request."""
@@ -554,7 +679,7 @@ class HPKEClientSession(BaseHPKEClient):
         url: str,
         *,
         json: Any = None,
-        data: bytes | None = None,
+        data: bytes | aiohttp.FormData | None = None,
         **kwargs: Any,
     ) -> aiohttp.ClientResponse | DecryptedResponse:
         """PUT request."""
@@ -569,7 +694,7 @@ class HPKEClientSession(BaseHPKEClient):
         url: str,
         *,
         json: Any = None,
-        data: bytes | None = None,
+        data: bytes | aiohttp.FormData | None = None,
         **kwargs: Any,
     ) -> aiohttp.ClientResponse | DecryptedResponse:
         """PATCH request."""

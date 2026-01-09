@@ -739,6 +739,10 @@ class RequestEncryptor:
         # use per-chunk compression where encoding ID is self-describing).
         self._encryptor = ChunkEncryptor(self._session, format=RawFormat(), compress=False)
 
+        # Buffer for streaming feed() API
+        self._buffer = bytearray()
+        self._has_output = False
+
     def get_headers(self) -> dict[str, str]:
         """
         Get headers to send with the request.
@@ -833,6 +837,60 @@ class RequestEncryptor:
             Encrypted body ready for transmission
         """
         return b"".join(self.encrypt_iter(body))
+
+    def feed(self, chunk: bytes) -> Iterator[bytes]:
+        """
+        Feed input chunk, yield encrypted chunks when buffer reaches CHUNK_SIZE.
+
+        Use this for streaming multipart or other async sources where data
+        arrives in arbitrary sizes. Buffers until CHUNK_SIZE (64KB) before
+        encrypting to maintain efficient wire format.
+
+        Note: This API does NOT support whole-body compression (compress=True).
+        Each chunk is encrypted as-is with IDENTITY encoding. For compressed
+        uploads, use encrypt_iter() with the complete body instead.
+
+        Args:
+            chunk: Raw bytes to buffer
+
+        Yields:
+            Encrypted chunks when buffer reaches CHUNK_SIZE
+
+        Example (async multipart streaming):
+            async for chunk in stream_multipart(payload):
+                for encrypted in encryptor.feed(chunk):
+                    yield encrypted
+            for encrypted in encryptor.finalize():
+                yield encrypted
+        """
+        self._buffer.extend(chunk)
+        while len(self._buffer) >= CHUNK_SIZE:
+            out_chunk = bytes(self._buffer[:CHUNK_SIZE])
+            del self._buffer[:CHUNK_SIZE]
+            self._has_output = True
+            yield self._encryptor.encrypt(out_chunk)
+
+    def finalize(self) -> Iterator[bytes]:
+        """
+        Flush remaining buffer as final encrypted chunk.
+
+        Must be called after all data has been fed to complete the stream.
+        Handles empty body case by yielding an encrypted empty chunk.
+
+        Yields:
+            Final encrypted chunk (if any data remaining or empty body)
+
+        Example:
+            # After streaming is complete
+            for encrypted in encryptor.finalize():
+                yield encrypted
+        """
+        if self._buffer:
+            yield self._encryptor.encrypt(bytes(self._buffer))
+            self._buffer.clear()
+        elif not self._has_output:
+            # Empty body case - must yield at least one chunk
+            yield self._encryptor.encrypt(b"")
 
     @property
     def context(self) -> SenderContext:
