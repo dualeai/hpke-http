@@ -209,7 +209,7 @@ class HPKEMiddleware:
         except ImportError:
             return False
 
-    async def __call__(
+    async def __call__(  # noqa: PLR0911 - ASGI entry point with auth + encryption guards
         self,
         scope: dict[str, Any],
         receive: Callable[[], Awaitable[dict[str, Any]]],
@@ -232,12 +232,34 @@ class HPKEMiddleware:
         headers = dict(scope.get("headers", []))
         enc_header = headers.get(HEADER_HPKE_ENC.lower().encode())
 
+        # Parse X-HPKE-PSK-ID header if present (for PSK-based auth on all requests)
+        psk_id_header = headers.get(HEADER_HPKE_PSK_ID.lower().encode())
+        if psk_id_header:
+            try:
+                scope[SCOPE_HPKE_PSK_ID] = bytes(b64url_decode(psk_id_header.decode("ascii")))
+            except (ValueError, UnicodeDecodeError):
+                await self._send_error(send, 400, f"Invalid {HEADER_HPKE_PSK_ID} header")
+                return
+
         if not enc_header:
             # Not encrypted - reject or pass through based on configuration
             if self.require_encryption:
                 _logger.debug("Rejected plaintext request: method=%s path=%s", method, path)
                 await self._send_error(send, 426, "Encryption required")
                 return
+
+            # Auth: PSK ID required on all requests, validated via psk_resolver
+            if SCOPE_HPKE_PSK_ID not in scope:
+                _logger.debug("Missing PSK ID: method=%s path=%s", method, path)
+                await self._send_error(send, 401, "Missing X-HPKE-PSK-ID header")
+                return
+            try:
+                await self.psk_resolver(scope)
+            except Exception:  # noqa: BLE001 - psk_resolver is user callback
+                _logger.debug("PSK resolution failed: method=%s path=%s", method, path)
+                await self._send_error(send, 401, "PSK authentication failed")
+                return
+
             _logger.debug("Unencrypted request: method=%s path=%s", method, path)
             await self.app(scope, receive, send)
             return
@@ -686,17 +708,6 @@ class HPKEMiddleware:
 
         # Get encoding header for compression detection
         encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
-
-        # Parse X-HPKE-PSK-ID header if present (RFC 9180 §5.1)
-        # Store decoded PSK ID in scope for psk_resolver to use for lookup
-        psk_id_header = headers.get(HEADER_HPKE_PSK_ID.lower().encode())
-        if psk_id_header:
-            try:
-                decoded_psk_id = bytes(b64url_decode(psk_id_header.decode("ascii")))
-                scope[SCOPE_HPKE_PSK_ID] = decoded_psk_id
-                _logger.debug("PSK ID from header: %d bytes", len(decoded_psk_id))
-            except Exception as e:
-                raise DecryptionError(f"Invalid {HEADER_HPKE_PSK_ID} header: {e}") from e
 
         # Set up decryption context (resolves PSK, creates RequestDecryptor)
         decryptor = await self._setup_decryption(scope, enc_header, stream_header, encoding_header)

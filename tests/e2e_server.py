@@ -27,7 +27,7 @@ from starlette.applications import Starlette
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 from hpke_http.constants import KemId
 from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -166,6 +166,14 @@ async def echo_chunks(request: Request) -> JSONResponse:
     )
 
 
+async def whoami(request: Request) -> JSONResponse:
+    """Auth-protected endpoint - returns client identity from PSK ID."""
+    psk_id = request.scope.get("hpke_psk_id")
+    if not psk_id:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return JSONResponse({"psk_id": psk_id.hex()})
+
+
 async def upload(request: Request) -> JSONResponse:
     """Handle multipart upload, return SHA256 hash + metadata for each part.
 
@@ -202,8 +210,8 @@ async def upload(request: Request) -> JSONResponse:
     return JSONResponse({"parts": parts})
 
 
-def _create_app() -> HPKEMiddleware:
-    """Create ASGI app wrapped with HPKEMiddleware.
+def _create_app() -> Starlette:
+    """Create ASGI app with public routes + HPKE-protected routes.
 
     Reads configuration from environment variables:
     - TEST_HPKE_PRIVATE_KEY: Hex-encoded X25519 private key
@@ -224,9 +232,8 @@ def _create_app() -> HPKEMiddleware:
     psk = bytes.fromhex(psk_hex) if psk_hex else b""
     psk_id = bytes.fromhex(psk_id_hex) if psk_id_hex else b""
 
-    # Create base Starlette app
-    routes = [
-        Route("/health", health, methods=["GET"]),
+    # Protected routes (behind HPKE middleware with PSK auth)
+    protected_routes = [
         Route("/echo", echo, methods=["POST", "PUT", "PATCH", "DELETE"]),
         Route("/echo-headers", echo_headers, methods=["POST"]),
         Route("/echo-chunks", echo_chunks, methods=["POST"]),
@@ -235,20 +242,38 @@ def _create_app() -> HPKEMiddleware:
         Route("/stream-large", stream_large, methods=["POST"]),
         Route("/stream-many", stream_many, methods=["POST"]),
         Route("/upload", upload, methods=["POST"]),
+        Route("/whoami", whoami, methods=["GET"]),
     ]
-    starlette_app = Starlette(routes=routes)
+    protected_app = Starlette(routes=protected_routes)
 
-    # PSK resolver callback
-    async def psk_resolver(_scope: dict[str, Any]) -> tuple[bytes, bytes]:
-        """Return PSK and PSK ID for request."""
-        return (psk, psk_id)
+    # Multi-account PSK store (simulates real multi-tenant auth)
+    psk_store: dict[bytes, bytes] = {
+        psk_id: psk,  # primary test account (from env vars)
+        b"second-tenant": b"second-key-for-hpke-psk-mode!!!",  # 32 bytes
+    }
 
-    # Wrap with HPKE middleware
-    return HPKEMiddleware(
-        app=starlette_app,
+    # PSK resolver callback - strict scope-based lookup, no fallback
+    async def psk_resolver(scope: dict[str, Any]) -> tuple[bytes, bytes]:
+        """Look up PSK by client ID from scope."""
+        client_psk_id = scope.get("hpke_psk_id")
+        if client_psk_id and client_psk_id in psk_store:
+            return (psk_store[client_psk_id], client_psk_id)
+        raise ValueError(f"Unknown PSK ID: {client_psk_id!r}")
+
+    # HPKE middleware wraps only the protected app
+    hpke_app = HPKEMiddleware(
+        app=protected_app,
         private_keys={KemId.DHKEM_X25519_HKDF_SHA256: private_key},
         psk_resolver=psk_resolver,
         compress=compress_enabled,
+    )
+
+    # Outer app: /health is public (no auth), everything else goes through HPKE
+    return Starlette(
+        routes=[
+            Route("/health", health, methods=["GET"]),
+            Mount("/", app=hpke_app),  # type: ignore[arg-type]  # HPKEMiddleware is ASGI-compatible
+        ],
     )
 
 

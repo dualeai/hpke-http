@@ -55,7 +55,7 @@ from typing_extensions import Self
 from yarl import URL
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM, KemId
+from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_PSK_ID, HEADER_HPKE_STREAM, KemId
 from hpke_http.core import (
     BaseHPKEClient,
     RequestEncryptor,
@@ -65,6 +65,7 @@ from hpke_http.core import (
     extract_sse_data,
 )
 from hpke_http.exceptions import EncryptionRequiredError, KeyDiscoveryError
+from hpke_http.headers import b64url_encode
 from hpke_http.hpke import SenderContext
 
 __all__ = [
@@ -617,6 +618,9 @@ class HPKEClientSession(BaseHPKEClient):
 
         # Build headers dict early (needed for Content-Type preservation)
         headers = dict(kwargs.pop("headers", {}))
+
+        # Always send PSK ID for server-side client identification (even on bodyless requests)
+        headers[HEADER_HPKE_PSK_ID] = b64url_encode(self.psk_id)
 
         sender_ctx: SenderContext | None = None
 

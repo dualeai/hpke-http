@@ -318,21 +318,30 @@ return {"data": "value"}  # Auto-encrypted as binary chunks
 
 ### HTTP Methods
 
-All methods supported. **Encryption requires a request body** to establish the HPKE context.
+All methods supported. **Encryption requires a request body** to establish the HPKE context. The `X-HPKE-PSK-ID` header is sent on **all requests** (including bodyless) for client identification.
 
 | Method | Typical Use | With Body | Without Body |
 | ------ | ----------- | --------- | ------------ |
-| POST | Create | Encrypted (both directions) | Plaintext* |
-| PUT | Replace | Encrypted (both directions) | Plaintext* |
-| PATCH | Update | Encrypted (both directions) | Plaintext* |
-| DELETE | Remove | Encrypted (both directions) | Plaintext |
-| GET | Read | Encrypted (both directions) | Plaintext |
-| HEAD | Metadata | N/A | Plaintext (no response body) |
-| OPTIONS | Preflight | Encrypted (both directions) | Plaintext |
+| POST | Create | Encrypted (both directions) | PSK ID only* |
+| PUT | Replace | Encrypted (both directions) | PSK ID only* |
+| PATCH | Update | Encrypted (both directions) | PSK ID only* |
+| DELETE | Remove | Encrypted (both directions) | PSK ID only |
+| GET | Read | Encrypted (both directions) | PSK ID only |
+| HEAD | Metadata | N/A | PSK ID only (no response body) |
+| OPTIONS | Preflight | Encrypted (both directions) | PSK ID only |
 
 *Unusual - these methods typically have a body.
 
 > **Tip:** For read-only endpoints needing E2E encryption, use POST with a body (no body = no encryption context).
+
+### Authentication vs Content Encryption
+
+`X-HPKE-PSK-ID` is sent on every request. `psk_resolver` is called on every request that has one — bodyless or not. The only difference is whether body content is encrypted.
+
+| Request type | Authenticated via `psk_resolver` | Body encrypted |
+|---|---|---|
+| **With body** | Yes — PSK ID validated + HPKE proves key possession | Yes |
+| **Without body** | Yes — PSK ID validated | No body to encrypt |
 
 ### Response Encryption (Server)
 
@@ -397,7 +406,7 @@ Disable gzip/brotli on CDN/LB for HPKE endpoints. Ciphertext is incompressible�
 | `Content-Length` | Auto (chunked) | Removed | Size changes after encryption |
 | `X-HPKE-Enc` | Added | - | Ephemeral public key |
 | `X-HPKE-Stream` | Added | Added | Session salt for nonces |
-| `X-HPKE-PSK-ID` | Added | - | Derived PSK identifier for key lookup (see [PSK Authentication](#psk-authentication)) |
+| `X-HPKE-PSK-ID` | Always | - | Derived PSK identifier for key lookup (see [PSK Authentication](#psk-authentication)) — sent on **all** requests including bodyless |
 | `X-HPKE-Encoding` | Added (if compressed) | - | Compression algorithm |
 | `X-HPKE-Content-Type` | Added (if body) | - | Original Content-Type for server parsing |
 
