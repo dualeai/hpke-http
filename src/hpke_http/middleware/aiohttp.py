@@ -661,6 +661,13 @@ class HPKEClientSession(BaseHPKEClient):
                 url,
                 len(body),
             )
+        elif sender_ctx is None:
+            # Bodyless request (GET, DELETE, HEAD, OPTIONS) — perform HPKE
+            # encapsulation so the server can encrypt the response.
+            crypto_headers, ctx = await self._create_bodyless_encryptor()
+            headers.update(crypto_headers)
+            sender_ctx = ctx
+            _logger.debug("Bodyless encapsulation: method=%s url=%s", method, url)
 
         kwargs["headers"] = headers
         response = await self._session.request(method, url, **kwargs)
@@ -683,6 +690,9 @@ class HPKEClientSession(BaseHPKEClient):
             elif self.require_encryption:
                 # We sent encrypted request but got plaintext response
                 raise EncryptionRequiredError("Response was not encrypted")
+            else:
+                # Unencrypted response (e.g. HEAD with no body, or public endpoint)
+                _logger.debug("Plaintext response from encrypted request: url=%s", url)
 
         return response
 
@@ -772,7 +782,10 @@ class HPKEClientSession(BaseHPKEClient):
 
         sender_ctx = self._response_contexts.get(response)
         if not sender_ctx:
-            raise RuntimeError("No encryption context for this response. Was the request encrypted?")
+            raise RuntimeError(
+                "No encryption context for this response. "
+                "Ensure the request was made through this HPKEClientSession instance."
+            )
 
         # Use centralized SSEDecryptor - handles header parsing and key derivation
         decryptor = SSEDecryptor(response.headers, sender_ctx)

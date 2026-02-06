@@ -145,6 +145,37 @@ async def stream_many(request: Request) -> StreamingResponse:
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
+async def echo_bodyless(request: Request) -> JSONResponse:
+    """Bodyless echo endpoint - returns request metadata without reading body.
+
+    Used to test HPKE key exchange on bodyless requests (GET, DELETE).
+    """
+    _logger.debug("%s /echo-bodyless", request.method)
+    return JSONResponse(
+        {
+            "path": request.url.path,
+            "method": request.method,
+        }
+    )
+
+
+async def stream_bodyless(request: Request) -> StreamingResponse:
+    """Bodyless SSE endpoint - streams events without reading body.
+
+    Used to test HPKE key exchange + SSE decryption on GET requests.
+    """
+    _logger.debug("%s /stream-bodyless", request.method)
+
+    async def sse_generator() -> AsyncGenerator[bytes]:
+        """Generate SSE chunks: 3 tick + 1 done."""
+        for i in range(1, 4):
+            yield f"event: tick\ndata: {json.dumps({'count': i})}\n\n".encode()
+        yield f"event: done\ndata: {json.dumps({'total': 3})}\n\n".encode()
+        _logger.debug("%s /stream-bodyless: SSE done", request.method)
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+
 async def echo_chunks(request: Request) -> JSONResponse:
     """Diagnostic endpoint reporting how request body arrived in chunks."""
     import time
@@ -236,9 +267,11 @@ def _create_app() -> Starlette:
     # Protected routes (behind HPKE middleware with PSK auth)
     protected_routes = [
         Route("/echo", echo, methods=["POST", "PUT", "PATCH", "DELETE"]),
+        Route("/echo-bodyless", echo_bodyless, methods=["GET", "DELETE"]),
         Route("/echo-headers", echo_headers, methods=["POST"]),
         Route("/echo-chunks", echo_chunks, methods=["POST"]),
         Route("/stream", stream, methods=["POST"]),
+        Route("/stream-bodyless", stream_bodyless, methods=["GET", "DELETE"]),
         Route("/stream-delayed", stream_delayed, methods=["POST"]),
         Route("/stream-large", stream_large, methods=["POST"]),
         Route("/stream-many", stream_many, methods=["POST"]),

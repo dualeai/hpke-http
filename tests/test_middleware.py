@@ -4291,3 +4291,258 @@ class TestContentTypePreservationAiohttp:
         data = await resp.json()
         # Empty body means no encryption, Content-Type passes through as-is
         assert data["body_size"] == 0
+
+
+class TestBodylessKeyExchange:
+    """Test HPKE key exchange on bodyless requests (GET, DELETE, HEAD, OPTIONS).
+
+    Before this fix, bodyless requests skipped HPKE encapsulation entirely,
+    so the server couldn't encrypt the response back.
+    """
+
+    # --- Normal cases: GET → encrypted JSON response ---
+
+    async def test_get_encrypted_json_aiohttp(self, aiohttp_client: HPKEClientSession) -> None:
+        """GET request triggers HPKE encapsulation and returns encrypted JSON."""
+        resp = await aiohttp_client.get("/echo-bodyless")
+        assert resp.status == 200
+
+        # Response should be encrypted (DecryptedResponse wrapper)
+        assert isinstance(resp, DecryptedResponse)
+        assert HEADER_HPKE_STREAM in resp.headers
+
+        data = await resp.json()
+        assert data["method"] == "GET"
+        assert data["path"] == "/echo-bodyless"
+
+    async def test_get_encrypted_json_httpx(self, httpx_client: HPKEAsyncClient) -> None:
+        """GET request triggers HPKE encapsulation and returns encrypted JSON (httpx)."""
+        resp = await httpx_client.get("/echo-bodyless")
+        assert resp.status_code == 200
+
+        # Response should be encrypted (DecryptedResponse wrapper)
+        assert isinstance(resp, HTTPXDecryptedResponse)
+        assert HEADER_HPKE_STREAM in resp.headers
+
+        data = resp.json()
+        assert data["method"] == "GET"
+        assert data["path"] == "/echo-bodyless"
+
+    # --- Normal cases: GET → encrypted SSE via iter_sse() ---
+
+    async def test_get_sse_aiohttp(self, aiohttp_client: HPKEClientSession) -> None:
+        """GET request with SSE response decrypts correctly via iter_sse()."""
+        resp = await aiohttp_client.get("/stream-bodyless")
+        assert resp.status == 200
+
+        events = [parse_sse_chunk(chunk) async for chunk in aiohttp_client.iter_sse(resp)]
+
+        # Should have 4 events: 3 tick + 1 done
+        assert len(events) == 4
+        for i in range(3):
+            event_type, event_data = events[i]
+            assert event_type == "tick"
+            assert event_data is not None
+            assert event_data["count"] == i + 1
+
+        event_type, event_data = events[3]
+        assert event_type == "done"
+        assert event_data is not None
+        assert event_data["total"] == 3
+
+    async def test_get_sse_httpx(self, httpx_client: HPKEAsyncClient) -> None:
+        """GET request with SSE response decrypts correctly via iter_sse() (httpx)."""
+        resp = await httpx_client.get("/stream-bodyless")
+        assert resp.status_code == 200
+
+        events = [parse_sse_chunk(chunk) async for chunk in httpx_client.iter_sse(resp)]
+
+        # Should have 4 events: 3 tick + 1 done
+        assert len(events) == 4
+        for i in range(3):
+            event_type, event_data = events[i]
+            assert event_type == "tick"
+            assert event_data is not None
+            assert event_data["count"] == i + 1
+
+        event_type, event_data = events[3]
+        assert event_type == "done"
+        assert event_data is not None
+        assert event_data["total"] == 3
+
+    # --- Edge cases: DELETE (bodyless) → encrypted JSON ---
+
+    async def test_delete_bodyless_encrypted_json_aiohttp(self, aiohttp_client: HPKEClientSession) -> None:
+        """DELETE without body triggers HPKE encapsulation and returns encrypted JSON."""
+        resp = await aiohttp_client.delete("/echo-bodyless")
+        assert resp.status == 200
+
+        assert isinstance(resp, DecryptedResponse)
+        assert HEADER_HPKE_STREAM in resp.headers
+
+        data = await resp.json()
+        assert data["method"] == "DELETE"
+
+    async def test_delete_bodyless_encrypted_json_httpx(self, httpx_client: HPKEAsyncClient) -> None:
+        """DELETE without body triggers HPKE encapsulation and returns encrypted JSON (httpx)."""
+        resp = await httpx_client.delete("/echo-bodyless")
+        assert resp.status_code == 200
+
+        assert isinstance(resp, HTTPXDecryptedResponse)
+        assert HEADER_HPKE_STREAM in resp.headers
+
+        data = resp.json()
+        assert data["method"] == "DELETE"
+
+    async def test_delete_bodyless_sse_aiohttp(self, aiohttp_client: HPKEClientSession) -> None:
+        """DELETE bodyless + SSE response decrypts correctly via iter_sse()."""
+        resp = await aiohttp_client.delete("/stream-bodyless")
+        assert resp.status == 200
+
+        events = [parse_sse_chunk(chunk) async for chunk in aiohttp_client.iter_sse(resp)]
+        assert len(events) == 4
+        assert events[3][0] == "done"
+
+    async def test_delete_bodyless_sse_httpx(self, httpx_client: HPKEAsyncClient) -> None:
+        """DELETE bodyless + SSE response decrypts correctly via iter_sse() (httpx)."""
+        resp = await httpx_client.delete("/stream-bodyless")
+        assert resp.status_code == 200
+
+        events = [parse_sse_chunk(chunk) async for chunk in httpx_client.iter_sse(resp)]
+        assert len(events) == 4
+        assert events[3][0] == "done"
+
+    # --- Weird cases: HTTP methods with unusual response semantics ---
+
+    async def test_head_behind_hpke_middleware(self, aiohttp_client: HPKEClientSession) -> None:
+        """HEAD to HPKE-protected endpoint — no body in response, verify no crash.
+
+        Per HTTP spec, HEAD responses strip the body. The server may still set
+        X-HPKE-Stream in headers, but the body is empty. The client must handle
+        this gracefully (no decryption error on empty body).
+        """
+        resp = await aiohttp_client.head("/echo-bodyless")
+        # Starlette auto-handles HEAD for routes that accept GET → 200 with empty body
+        assert resp.status == 200
+
+    async def test_head_behind_hpke_middleware_httpx(self, httpx_client: HPKEAsyncClient) -> None:
+        """HEAD to HPKE-protected endpoint — no body in response, verify no crash (httpx)."""
+        resp = await httpx_client.head("/echo-bodyless")
+        assert resp.status_code == 200
+
+    async def test_options_behind_hpke_middleware(self, aiohttp_client: HPKEClientSession) -> None:
+        """OPTIONS to HPKE-protected endpoint — response is encrypted, status proxied.
+
+        /echo-bodyless only allows GET and DELETE, so OPTIONS returns 405.
+        The encrypted 405 should be handled correctly by the client.
+        """
+        resp = await aiohttp_client.options("/echo-bodyless")
+        # /echo-bodyless only allows GET and DELETE → OPTIONS returns 405
+        assert resp.status == 405
+
+    async def test_options_behind_hpke_middleware_httpx(self, httpx_client: HPKEAsyncClient) -> None:
+        """OPTIONS to HPKE-protected endpoint — response is encrypted, status proxied (httpx)."""
+        resp = await httpx_client.options("/echo-bodyless")
+        assert resp.status_code == 405
+
+    # --- Out-of-bound: iter_sse() called with wrong response ---
+
+    async def test_iter_sse_plain_aiohttp_response(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """iter_sse() with a plain aiohttp.ClientResponse raises clear error."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+        async with HPKEClientSession(
+            base_url=base_url, psk=b"test-api-key-for-hpke-psk-mode!!", psk_id=b"tenant-123"
+        ) as session:
+            # Make a request via plain aiohttp (not through HPKE session)
+            async with aiohttp.ClientSession() as plain_session:
+                async with plain_session.get(f"{base_url}/health") as plain_resp:
+                    with pytest.raises(
+                        RuntimeError, match="Ensure the request was made through this HPKEClientSession"
+                    ):
+                        async for _chunk in session.iter_sse(plain_resp):
+                            pass
+
+    async def test_iter_sse_plain_httpx_response(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """iter_sse() with a plain httpx.Response raises clear error."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+        async with HPKEAsyncClient(
+            base_url=base_url, psk=b"test-api-key-for-hpke-psk-mode!!", psk_id=b"tenant-123"
+        ) as client:
+            # Make a request via plain httpx (not through HPKE client)
+            async with httpx.AsyncClient() as plain_client:
+                plain_resp = await plain_client.get(f"{base_url}/health")
+                with pytest.raises(RuntimeError, match="Ensure the request was made through this HPKEAsyncClient"):
+                    async for _chunk in client.iter_sse(plain_resp):
+                        pass
+
+    async def test_iter_sse_different_aiohttp_session(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """iter_sse() with response from a different HPKEClientSession raises error.
+
+        WeakKeyDictionary is per-instance, so a response from session A
+        has no context in session B.
+        """
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with (
+            HPKEClientSession(base_url=base_url, psk=test_psk, psk_id=test_psk_id) as session_a,
+            HPKEClientSession(base_url=base_url, psk=test_psk, psk_id=test_psk_id) as session_b,
+        ):
+            # Make SSE request via session A
+            resp = await session_a.post("/stream", json={"start": True})
+
+            # Try to iterate via session B — different WeakKeyDictionary
+            with pytest.raises(RuntimeError, match="Ensure the request was made through this HPKEClientSession"):
+                async for _chunk in session_b.iter_sse(resp):
+                    pass
+
+    async def test_iter_sse_different_httpx_client(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """iter_sse() with response from a different HPKEAsyncClient raises error (httpx)."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with (
+            HPKEAsyncClient(base_url=base_url, psk=test_psk, psk_id=test_psk_id) as client_a,
+            HPKEAsyncClient(base_url=base_url, psk=test_psk, psk_id=test_psk_id) as client_b,
+        ):
+            # Make SSE request via client A
+            resp = await client_a.post("/stream", json={"start": True})
+
+            # Try to iterate via client B — different WeakKeyDictionary
+            with pytest.raises(RuntimeError, match="Ensure the request was made through this HPKEAsyncClient"):
+                async for _chunk in client_b.iter_sse(resp):
+                    pass
+
+    # --- Regression: POST+body+SSE still works ---
+
+    async def test_post_body_sse_regression_aiohttp(self, aiohttp_client: HPKEClientSession) -> None:
+        """POST with body + SSE still works (guards against bodyless code path breakage)."""
+        resp = await aiohttp_client.post("/stream", json={"start": True})
+        assert resp.status == 200
+
+        events = [parse_sse_chunk(chunk) async for chunk in aiohttp_client.iter_sse(resp)]
+        assert len(events) == 4
+        assert events[3][0] == "complete"
+
+    async def test_post_body_sse_regression_httpx(self, httpx_client: HPKEAsyncClient) -> None:
+        """POST with body + SSE still works (guards against bodyless code path breakage, httpx)."""
+        resp = await httpx_client.post("/stream", json={"start": True})
+        assert resp.status_code == 200
+
+        events = [parse_sse_chunk(chunk) async for chunk in httpx_client.iter_sse(resp)]
+        assert len(events) == 4
+        assert events[3][0] == "complete"
