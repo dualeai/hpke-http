@@ -11,6 +11,7 @@ from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
+    HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     REQUEST_KEY_LABEL,
 )
@@ -27,11 +28,11 @@ def _encrypt_request(
     pk_r: bytes,
     psk: bytes,
     psk_id: bytes,
-) -> tuple[bytes, str, str]:
+) -> tuple[bytes, str, str, str]:
     """Encrypt request body for testing using chunked streaming format.
 
     Returns:
-        Tuple of (encrypted_body, enc_header_value, stream_header_value)
+        Tuple of (encrypted_body, enc_header_value, stream_header_value, psk_id_header_value)
     """
     ctx = setup_sender_psk(
         pk_r=pk_r,
@@ -46,7 +47,8 @@ def _encrypt_request(
     encrypted_body = encryptor.encrypt(body) if body else encryptor.encrypt(b"")
     enc_header = b64url_encode(ctx.enc)
     stream_header = b64url_encode(session.session_salt)
-    return (encrypted_body, enc_header, stream_header)
+    psk_id_header = b64url_encode(psk_id)
+    return (encrypted_body, enc_header, stream_header, psk_id_header)
 
 
 # =============================================================================
@@ -99,7 +101,7 @@ class TestUnsupportedEncodingRejection:
         test_psk_id: bytes,
     ) -> None:
         """X-HPKE-Encoding: zstd to server without zstd returns 415."""
-        encrypted_body, enc_header, stream_header = _encrypt_request(
+        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
             b'{"test": "data"}',
             granian_server_no_zstd.public_key,
             test_psk,
@@ -111,6 +113,7 @@ class TestUnsupportedEncodingRejection:
                 headers={
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
+                    HEADER_HPKE_PSK_ID: psk_id_header,
                     HEADER_HPKE_ENCODING: "zstd",
                     "Content-Type": "application/octet-stream",
                 },
@@ -130,7 +133,7 @@ class TestUnsupportedEncodingRejection:
         test_psk_id: bytes,
     ) -> None:
         """X-HPKE-Encoding: ZSTD (uppercase) is ignored, not rejected."""
-        encrypted_body, enc_header, stream_header = _encrypt_request(
+        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
             b'{"test": "data"}',
             granian_server_no_zstd.public_key,
             test_psk,
@@ -142,6 +145,7 @@ class TestUnsupportedEncodingRejection:
                 headers={
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
+                    HEADER_HPKE_PSK_ID: psk_id_header,
                     HEADER_HPKE_ENCODING: "ZSTD",  # Uppercase - should be ignored
                     "Content-Type": "application/octet-stream",
                 },
@@ -162,7 +166,7 @@ class TestUnsupportedEncodingRejection:
         compressed, so it will fail with 400 during decompression, not 415.
         The point is that it passes the early 415 check.
         """
-        encrypted_body, enc_header, stream_header = _encrypt_request(
+        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
             b'{"test": "data"}',
             granian_server.public_key,
             test_psk,
@@ -174,6 +178,7 @@ class TestUnsupportedEncodingRejection:
                 headers={
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
+                    HEADER_HPKE_PSK_ID: psk_id_header,
                     HEADER_HPKE_ENCODING: "zstd",
                     "Content-Type": "application/octet-stream",
                 },
@@ -211,7 +216,7 @@ class TestEncodingEdgeCases:
         expected_status: int,
     ) -> None:
         """Test various X-HPKE-Encoding values against no-zstd server."""
-        encrypted_body, enc_header, stream_header = _encrypt_request(
+        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
             b'{"test": "data"}',
             granian_server_no_zstd.public_key,
             test_psk,
@@ -223,6 +228,7 @@ class TestEncodingEdgeCases:
                 headers={
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
+                    HEADER_HPKE_PSK_ID: psk_id_header,
                     HEADER_HPKE_ENCODING: encoding,
                     "Content-Type": "application/octet-stream",
                 },
@@ -237,7 +243,7 @@ class TestEncodingEdgeCases:
         test_psk_id: bytes,
     ) -> None:
         """Empty X-HPKE-Encoding header is treated as identity."""
-        encrypted_body, enc_header, stream_header = _encrypt_request(
+        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
             b'{"test": "data"}',
             granian_server_no_zstd.public_key,
             test_psk,
@@ -249,6 +255,7 @@ class TestEncodingEdgeCases:
                 headers={
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
+                    HEADER_HPKE_PSK_ID: psk_id_header,
                     HEADER_HPKE_ENCODING: "",
                     "Content-Type": "application/octet-stream",
                 },
@@ -263,7 +270,7 @@ class TestEncodingEdgeCases:
         test_psk_id: bytes,
     ) -> None:
         """Missing X-HPKE-Encoding header is treated as identity."""
-        encrypted_body, enc_header, stream_header = _encrypt_request(
+        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
             b'{"test": "data"}',
             granian_server_no_zstd.public_key,
             test_psk,
@@ -275,6 +282,7 @@ class TestEncodingEdgeCases:
                 headers={
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
+                    HEADER_HPKE_PSK_ID: psk_id_header,
                     # No X-HPKE-Encoding header
                     "Content-Type": "application/octet-stream",
                 },
@@ -488,18 +496,18 @@ class TestServerConfigValidation:
 
     async def test_compress_true_without_zstd_uses_gzip_fallback(self) -> None:
         """HPKEMiddleware(compress=True) uses gzip fallback when zstd unavailable."""
-        from typing import Any
         from unittest.mock import patch
 
         from cryptography.hazmat.primitives.asymmetric import x25519
+        from starlette.types import Receive, Scope, Send
 
         from hpke_http.constants import KemId
         from hpke_http.middleware.fastapi import HPKEMiddleware
 
-        async def mock_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        async def mock_app(scope: Scope, receive: Receive, send: Send) -> None:
             pass
 
-        async def mock_psk_resolver(scope: dict[str, Any]) -> tuple[bytes, bytes]:
+        async def mock_psk_resolver(scope: Scope) -> tuple[bytes, bytes]:
             return (b"psk", b"psk_id")
 
         # Generate a valid test keypair
@@ -521,11 +529,10 @@ class TestServerConfigValidation:
 
     async def test_compress_false_without_zstd_works(self) -> None:
         """HPKEMiddleware(compress=False) works even if zstd unavailable."""
-        from typing import Any
         from unittest.mock import patch
 
-        # Generate a valid test keypair
         from cryptography.hazmat.primitives.asymmetric import x25519
+        from starlette.types import Receive, Scope, Send
 
         from hpke_http.constants import KemId
         from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -533,10 +540,10 @@ class TestServerConfigValidation:
         private_key = x25519.X25519PrivateKey.generate()
         sk = private_key.private_bytes_raw()
 
-        async def mock_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        async def mock_app(scope: Scope, receive: Receive, send: Send) -> None:
             pass
 
-        async def mock_psk_resolver(scope: dict[str, Any]) -> tuple[bytes, bytes]:
+        async def mock_psk_resolver(scope: Scope) -> tuple[bytes, bytes]:
             return (b"", b"")
 
         # Mock _check_zstd_available to return False

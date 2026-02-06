@@ -11,6 +11,7 @@ from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
+    HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     REQUEST_KEY_LABEL,
 )
@@ -60,14 +61,16 @@ class TestMalformedRequests:
     async def test_plaintext_request_passes_through(
         self,
         granian_server: E2EServer,
+        test_psk_id: bytes,
     ) -> None:
-        """Plaintext request without X-HPKE-Enc header passes through."""
+        """Plaintext request without X-HPKE-Enc header passes through (with PSK auth)."""
         host, port = granian_server.host, granian_server.port
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"http://{host}:{port}/echo",
                 json={"test": "plaintext"},
+                headers={HEADER_HPKE_PSK_ID: b64url_encode(test_psk_id)},
             ) as resp:
                 assert resp.status == 200
 
@@ -90,11 +93,11 @@ def _encrypt_request(
     pk_r: bytes,
     psk: bytes,
     psk_id: bytes,
-) -> tuple[bytes, str, str]:
+) -> tuple[bytes, str, str, str]:
     """Encrypt request body for testing using chunked streaming format.
 
     Returns:
-        Tuple of (encrypted_body, enc_header_value, stream_header_value)
+        Tuple of (encrypted_body, enc_header_value, stream_header_value, psk_id_header_value)
     """
     ctx = setup_sender_psk(
         pk_r=pk_r,
@@ -111,7 +114,8 @@ def _encrypt_request(
     encrypted_body = encryptor.encrypt(body) if body else encryptor.encrypt(b"")
     enc_header = b64url_encode(ctx.enc)
     stream_header = b64url_encode(session.session_salt)
-    return (encrypted_body, enc_header, stream_header)
+    psk_id_header = b64url_encode(psk_id)
+    return (encrypted_body, enc_header, stream_header, psk_id_header)
 
 
 class TestMalformedCompressionHeaders:
@@ -146,7 +150,7 @@ class TestMalformedCompressionHeaders:
         host, port, pk = granian_server.host, granian_server.port, granian_server.public_key
         body = b'{"test": "compression header test"}'
 
-        encrypted_body, enc_header, stream_header = _encrypt_request(body, pk, test_psk, test_psk_id)
+        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(body, pk, test_psk, test_psk_id)
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -155,6 +159,7 @@ class TestMalformedCompressionHeaders:
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_ENCODING: encoding_value,
+                    HEADER_HPKE_PSK_ID: psk_id_header,
                     "Content-Type": "application/octet-stream",
                 },
                 data=encrypted_body,

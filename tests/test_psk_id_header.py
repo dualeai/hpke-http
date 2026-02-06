@@ -4,33 +4,28 @@ Tests that the PSK ID is correctly:
 - Sent by client in X-HPKE-PSK-ID header (base64url-encoded)
 - Parsed by server middleware and stored in scope["hpke_psk_id"]
 - Available to psk_resolver for PSK lookup
+- Sent on bodyless requests (GET, DELETE, HEAD) for auth
+- Rejected when missing, unknown, or malformed
 """
 
+import aiohttp
 import pytest
 
 from hpke_http.constants import HEADER_HPKE_PSK_ID
-from hpke_http.core import RequestEncryptor
-from hpke_http.headers import b64url_decode
+from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.middleware.aiohttp import HPKEClientSession
 from hpke_http.middleware.httpx import HPKEAsyncClient
 from tests.conftest import E2EServer
 
 
 class TestPSKIDHeaderEncoding:
-    """Test PSK ID header encoding in RequestEncryptor."""
+    """Test PSK ID base64url encoding/decoding roundtrip."""
 
-    def test_psk_id_header_present(self, platform_keypair: tuple[bytes, bytes], test_psk: bytes) -> None:
-        """RequestEncryptor includes X-HPKE-PSK-ID header."""
-        _sk, pk = platform_keypair
+    def test_psk_id_roundtrip(self) -> None:
+        """b64url_encode/b64url_decode roundtrip for PSK ID."""
         psk_id = b"tenant-123"
-
-        encryptor = RequestEncryptor(public_key=pk, psk=test_psk, psk_id=psk_id)
-        headers = encryptor.get_headers()
-
-        assert HEADER_HPKE_PSK_ID in headers
-        # Verify it's base64url encoded
-        decoded = b64url_decode(headers[HEADER_HPKE_PSK_ID])
-        assert decoded == psk_id
+        encoded = b64url_encode(psk_id)
+        assert b64url_decode(encoded) == psk_id
 
     @pytest.mark.parametrize(
         ("psk_id", "description"),
@@ -42,39 +37,24 @@ class TestPSKIDHeaderEncoding:
             (b"x" * 255, "maximum reasonable length"),
         ],
     )
-    def test_psk_id_encoding_parametrized(
-        self, platform_keypair: tuple[bytes, bytes], test_psk: bytes, psk_id: bytes, description: str
-    ) -> None:
+    def test_psk_id_encoding_parametrized(self, psk_id: bytes, description: str) -> None:
         """Various PSK ID formats encode correctly."""
-        _sk, pk = platform_keypair
-
-        encryptor = RequestEncryptor(public_key=pk, psk=test_psk, psk_id=psk_id)
-        headers = encryptor.get_headers()
-
-        decoded = b64url_decode(headers[HEADER_HPKE_PSK_ID])
+        encoded = b64url_encode(psk_id)
+        decoded = b64url_decode(encoded)
         assert decoded == psk_id, f"Failed for {description}"
 
-    def test_psk_id_binary_encoding(self, platform_keypair: tuple[bytes, bytes], test_psk: bytes) -> None:
+    def test_psk_id_binary_encoding(self) -> None:
         """Binary (non-UTF8) PSK ID encodes correctly."""
-        _sk, pk = platform_keypair
-        # Binary PSK ID with non-UTF8 bytes
         binary_psk_id = b"\x00\x01\x02\xff\xfe"
-
-        encryptor = RequestEncryptor(public_key=pk, psk=test_psk, psk_id=binary_psk_id)
-        headers = encryptor.get_headers()
-
-        decoded = b64url_decode(headers[HEADER_HPKE_PSK_ID])
+        encoded = b64url_encode(binary_psk_id)
+        decoded = b64url_decode(encoded)
         assert decoded == binary_psk_id
 
-    def test_psk_id_special_chars(self, platform_keypair: tuple[bytes, bytes], test_psk: bytes) -> None:
+    def test_psk_id_special_chars(self) -> None:
         """PSK ID with special characters encodes correctly."""
-        _sk, pk = platform_keypair
         psk_id = b"tenant/with/slashes+and+plus"
-
-        encryptor = RequestEncryptor(public_key=pk, psk=test_psk, psk_id=psk_id)
-        headers = encryptor.get_headers()
-
-        decoded = b64url_decode(headers[HEADER_HPKE_PSK_ID])
+        encoded = b64url_encode(psk_id)
+        decoded = b64url_decode(encoded)
         assert decoded == psk_id
 
 
@@ -231,3 +211,203 @@ class TestBackwardsCompatibility:
 
             data = await resp.json()
             assert "backwards" in data["echo"]
+
+
+class TestBodylessRequestPSKID:
+    """Test that bodyless requests (GET, DELETE, HEAD) send X-HPKE-PSK-ID.
+
+    Without this fix, GET /whoami returns 401 because scope["hpke_psk_id"]
+    is never populated on non-encrypted requests.
+    """
+
+    async def test_aiohttp_get_whoami(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """aiohttp GET /whoami returns 200 with correct PSK ID."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=test_psk_id,
+        ) as client:
+            resp = await client.get("/whoami")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["psk_id"] == test_psk_id.hex()
+
+    async def test_httpx_get_whoami(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """httpx GET /whoami returns 200 with correct PSK ID."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEAsyncClient(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=test_psk_id,
+        ) as client:
+            resp = await client.get("/whoami")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["psk_id"] == test_psk_id.hex()
+
+    async def test_aiohttp_delete_sends_psk_id(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """aiohttp DELETE sends X-HPKE-PSK-ID header."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=test_psk_id,
+        ) as client:
+            # /echo accepts DELETE, check headers are sent
+            resp = await client.delete("/echo")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["method"] == "DELETE"
+
+    async def test_httpx_head_sends_psk_id(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """httpx HEAD sends X-HPKE-PSK-ID header."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEAsyncClient(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=test_psk_id,
+        ) as client:
+            resp = await client.head("/health")
+            assert resp.status_code == 200
+
+    async def test_aiohttp_get_whoami_header_encoding(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """Verify the PSK ID header is base64url-encoded on bodyless requests."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        expected_header = b64url_encode(test_psk_id)
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=test_psk_id,
+        ) as client:
+            # Use echo-headers to verify the header value
+            # echo-headers only accepts POST, so use GET on /whoami for auth check
+            resp = await client.get("/whoami")
+            assert resp.status == 200
+
+            # Also verify round-trip: server decoded it correctly
+            data = await resp.json()
+            assert bytes.fromhex(data["psk_id"]) == test_psk_id
+
+            # Verify encoding consistency
+            assert expected_header == b64url_encode(test_psk_id)
+
+
+class TestBodylessRequestPSKIDDeny:
+    """Deny cases for bodyless requests - missing, unknown, or malformed PSK ID."""
+
+    async def test_no_psk_id_header_returns_401(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """Raw GET without X-HPKE-PSK-ID is rejected by middleware with 401."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{granian_server.host}:{granian_server.port}/whoami",
+            ) as resp:
+                assert resp.status == 401
+
+    async def test_unknown_psk_id_bodyless_rejected(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+    ) -> None:
+        """Bodyless GET with unknown PSK ID → psk_resolver rejects → 401."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=b"unknown-tenant",
+        ) as client:
+            resp = await client.get("/whoami")
+            assert resp.status == 401
+
+    async def test_unknown_psk_id_encrypted_rejected(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+    ) -> None:
+        """Encrypted POST with unknown PSK ID → psk_resolver rejects → 400."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=b"unknown-tenant",
+        ) as client:
+            resp = await client.post("/echo", json={"test": "deny"})
+            assert resp.status == 400
+
+    async def test_malformed_base64_psk_id_returns_400(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """Invalid base64url in X-HPKE-PSK-ID header returns 400."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{granian_server.host}:{granian_server.port}/whoami",
+                headers={HEADER_HPKE_PSK_ID: "a==="},  # 1 char + padding → invalid base64
+            ) as resp:
+                assert resp.status == 400
+
+    async def test_empty_psk_id_header_returns_401(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """Empty X-HPKE-PSK-ID header → empty bytes in scope → /whoami rejects."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{granian_server.host}:{granian_server.port}/whoami",
+                headers={HEADER_HPKE_PSK_ID: b64url_encode(b"")},
+            ) as resp:
+                # Empty PSK ID decodes to b"" which is falsy → 401
+                assert resp.status == 401
+
+    async def test_wrong_psk_id_encrypted_httpx(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        wrong_psk_id: bytes,
+    ) -> None:
+        """httpx encrypted POST with wrong PSK ID → psk_resolver rejects → 400."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEAsyncClient(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=wrong_psk_id,
+        ) as client:
+            resp = await client.post("/echo", json={"test": "deny"})
+            assert resp.status_code == 400

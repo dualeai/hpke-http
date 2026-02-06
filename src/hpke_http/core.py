@@ -53,7 +53,6 @@ from hpke_http.constants import (
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
-    HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     RAW_LENGTH_PREFIX_SIZE,
     REQUEST_KEY_LABEL,
@@ -752,12 +751,13 @@ class RequestEncryptor:
         Get headers to send with the request.
 
         Returns:
-            Dict with X-HPKE-Enc, X-HPKE-Stream, X-HPKE-PSK-ID, and optionally X-HPKE-Encoding
+            Dict with X-HPKE-Enc, X-HPKE-Stream, and optionally X-HPKE-Encoding.
+            Note: X-HPKE-PSK-ID is set unconditionally by the client session,
+            not here, so it's present on all requests (including bodyless).
         """
         headers = {
             HEADER_HPKE_ENC: _b64url_encode(self._ctx.enc),
             HEADER_HPKE_STREAM: _b64url_encode(self._session.session_salt),
-            HEADER_HPKE_PSK_ID: _b64url_encode(self._psk_id),
         }
         # Signal whole-body compression via header (chunks have 0x00 encoding ID)
         if self._was_compressed and self._encoding:

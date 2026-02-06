@@ -52,7 +52,7 @@ from httpx._content import encode_multipart_data
 from typing_extensions import Self
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_STREAM, KemId
+from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_PSK_ID, HEADER_HPKE_STREAM, KemId
 from hpke_http.core import (
     BaseHPKEClient,
     RequestEncryptor,
@@ -62,6 +62,7 @@ from hpke_http.core import (
     extract_sse_data,
 )
 from hpke_http.exceptions import EncryptionRequiredError, KeyDiscoveryError
+from hpke_http.headers import b64url_encode
 from hpke_http.hpke import SenderContext
 
 __all__ = [
@@ -592,6 +593,9 @@ class HPKEAsyncClient(BaseHPKEClient):
         # Build headers dict early (needed for Content-Type preservation)
         request_headers = dict(headers or {})
 
+        # Always send PSK ID for server-side client identification (even on bodyless requests)
+        request_headers[HEADER_HPKE_PSK_ID] = b64url_encode(self.psk_id)
+
         sender_ctx: SenderContext | None = None
         encrypted_content: Any = content
 
@@ -917,15 +921,28 @@ class HPKEAsyncClient(BaseHPKEClient):
         Transparent pass-through: yields the exact SSE chunks the server sent.
         Events, comments, retry directives - everything is preserved exactly.
 
+        Response is automatically closed when iteration completes or on error.
+        With stream=True, we must call aclose() to avoid connection leaks.
+
         Args:
             response: Response from an SSE endpoint
 
         Yields:
             Raw SSE chunks as bytes exactly as the server sent them
 
-        Note:
-            Response is automatically closed when iteration completes or on error.
-            With stream=True, we must call aclose() to avoid connection leaks.
+        Raises:
+            httpx.RemoteProtocolError: When the server closes the connection
+                before completing the HTTP transfer (e.g., server shutdown, network
+                interruption, load balancer timeout). This is common with long-lived
+                SSE streams. Callers should handle this to decide whether to retry
+                or abort::
+
+                    try:
+                        async for chunk in client.iter_sse(response):
+                            process(chunk)
+                    except httpx.RemoteProtocolError:
+                        # Server disconnected - retry or abort
+                        pass
         """
         # Extract underlying response if wrapped
         if isinstance(response, DecryptedResponse):
