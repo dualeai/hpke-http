@@ -921,15 +921,28 @@ class HPKEAsyncClient(BaseHPKEClient):
         Transparent pass-through: yields the exact SSE chunks the server sent.
         Events, comments, retry directives - everything is preserved exactly.
 
+        Response is automatically closed when iteration completes or on error.
+        With stream=True, we must call aclose() to avoid connection leaks.
+
         Args:
             response: Response from an SSE endpoint
 
         Yields:
             Raw SSE chunks as bytes exactly as the server sent them
 
-        Note:
-            Response is automatically closed when iteration completes or on error.
-            With stream=True, we must call aclose() to avoid connection leaks.
+        Raises:
+            httpx.RemoteProtocolError: When the server closes the connection
+                before completing the HTTP transfer (e.g., server shutdown, network
+                interruption, load balancer timeout). This is common with long-lived
+                SSE streams. Callers should handle this to decide whether to retry
+                or abort::
+
+                    try:
+                        async for chunk in client.iter_sse(response):
+                            process(chunk)
+                    except httpx.RemoteProtocolError:
+                        # Server disconnected - retry or abort
+                        pass
         """
         # Extract underlying response if wrapped
         if isinstance(response, DecryptedResponse):

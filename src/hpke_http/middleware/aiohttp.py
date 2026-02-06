@@ -751,6 +751,20 @@ class HPKEClientSession(BaseHPKEClient):
 
         Yields:
             Raw SSE chunks as bytes exactly as the server sent them
+
+        Raises:
+            aiohttp.ClientPayloadError: When the server closes the connection
+                before completing the HTTP transfer (e.g., server shutdown, network
+                interruption, load balancer timeout). This is common with long-lived
+                SSE streams. Callers should handle this to decide whether to retry
+                or abort::
+
+                    try:
+                        async for chunk in session.iter_sse(response):
+                            process(chunk)
+                    except aiohttp.ClientPayloadError:
+                        # Server disconnected - retry or abort
+                        pass
         """
         # Extract underlying response if wrapped
         if isinstance(response, DecryptedResponse):
@@ -768,14 +782,19 @@ class HPKEClientSession(BaseHPKEClient):
         line_parser = SSELineParser()
         current_event_lines: list[bytes] = []
 
-        async for chunk in response.content:
-            for line in line_parser.feed(chunk):
-                if not line:
-                    # Empty line = event boundary (WHATWG spec)
-                    data_value = extract_sse_data(current_event_lines)
-                    if data_value:
-                        raw_chunk = decryptor.decrypt(data_value)
-                        yield raw_chunk
-                    current_event_lines = []
-                else:
-                    current_event_lines.append(line)
+        # Ensure cleanup on completion or error (matching httpx iter_sse behavior)
+        try:
+            async for chunk in response.content:
+                for line in line_parser.feed(chunk):
+                    if not line:
+                        # Empty line = event boundary (WHATWG spec)
+                        data_value = extract_sse_data(current_event_lines)
+                        if data_value:
+                            raw_chunk = decryptor.decrypt(data_value)
+                            yield raw_chunk
+                        current_event_lines = []
+                    else:
+                        current_event_lines.append(line)
+        finally:
+            # Clean up response context
+            self._response_contexts.pop(response, None)
