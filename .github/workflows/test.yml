@@ -8,11 +8,12 @@ on:
 
 jobs:
   test:
-    runs-on: linux-${{ matrix.arch }}-ubuntu2404-${{ matrix.test-step == 'slow' && 'large' || 'small' }}-private
+    name: ${{ matrix.os }} / python ${{ matrix.python-version }} / ${{ matrix.test-step }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
         test-step: [standard, root, slow]
 

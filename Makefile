@@ -150,15 +150,3 @@ test-flamegraph-pattern:
 		-- uv run pytest tests/$(PATTERN) -v -n 0 --no-cov --basetemp=$(PYSPY_BASETEMP)
 	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
 	@echo "Open at https://speedscope.app for interactive filtering"
-
-# Build and publish
-build:
-	rm -rf dist/
-	uv build
-	uv run twine check dist/*
-
-publish-test:
-	uv publish --publish-url https://test.pypi.org/legacy/
-
-publish:
-	uv publish

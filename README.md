@@ -41,8 +41,12 @@ from hpke_http.constants import KemId
 app = FastAPI()
 
 async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
-    api_key = dict(scope["headers"]).get(b"authorization", b"").decode()
-    return (api_key.encode(), (await lookup_tenant(api_key)).encode())
+    # Get derived PSK ID from X-HPKE-PSK-ID header (already decoded)
+    psk_id = scope.get("hpke_psk_id")
+    # Look up API key by its derived ID (see "PSK Authentication" section)
+    record = await db.lookup_by_derived_id(psk_id)  # Returns {psk, tenant_id}
+    scope["tenant_id"] = record["tenant_id"]  # For authorization
+    return (record["psk"], psk_id)
 
 app.add_middleware(
     HPKEMiddleware,
@@ -71,13 +75,17 @@ async def chat(request: Request):
 ### Client (aiohttp)
 
 ```python
+import hashlib
 import aiohttp
 from hpke_http.middleware.aiohttp import HPKEClientSession
+
+# Derive PSK ID from API key (see "PSK Authentication" section)
+psk_id = hashlib.sha256(api_key).digest()
 
 async with HPKEClientSession(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
-    psk_id=tenant_id,
+    psk_id=psk_id,      # Derived from key, not tenant ID
     # compress=True,           # Compression (zstd preferred, gzip fallback)
     # require_encryption=True, # Raise if server responds unencrypted
     # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
@@ -102,12 +110,16 @@ async with HPKEClientSession(
 ### Client (httpx)
 
 ```python
+import hashlib
 from hpke_http.middleware.httpx import HPKEAsyncClient
+
+# Derive PSK ID from API key (see "PSK Authentication" section)
+psk_id = hashlib.sha256(api_key).digest()
 
 async with HPKEAsyncClient(
     base_url="https://api.example.com",
     psk=api_key,        # >= 32 bytes
-    psk_id=tenant_id,
+    psk_id=psk_id,      # Derived from key, not tenant ID
     # compress=True,           # Compression (zstd preferred, gzip fallback)
     # require_encryption=True, # Raise if server responds unencrypted
     # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
@@ -146,6 +158,82 @@ async with HPKEAsyncClient(
 | AEAD (Authenticated Encryption) | ChaCha20-Poly1305 | 0x0003 |
 | Mode | PSK (Pre-Shared Key) | 0x01 |
 
+## PSK Authentication
+
+HPKE PSK mode binds each request to a pre-shared key. This requires two values:
+
+| Value | What it is | Example |
+|-------|------------|---------|
+| **PSK** | The secret key material | API key bytes, `b"sk_live_7f3a9c..."` |
+| **PSK ID** | Identifies *which* PSK to use | `SHA256(api_key)` — 32 bytes recommended, min 1 byte |
+
+> **Data model:** One tenant typically has *many* API keys (dev/prod, per-service, per-team-member). The PSK ID identifies the specific key, not the tenant.
+
+### Security Considerations
+
+[RFC 9180 §9.4](https://www.rfc-editor.org/rfc/rfc9180.html#section-9.4) warns that `psk_id` **"might be considered sensitive, since, in a given application context, [it] might identify the sender."**
+
+The `X-HPKE-PSK-ID` header is sent in plaintext (only base64url-encoded, not encrypted). [RFC 9257](https://www.rfc-editor.org/rfc/rfc9257.html) documents the risks:
+
+| Risk | Description |
+|------|-------------|
+| **Passive linkability** | Observers correlate connections using the same PSK ID |
+| **Traffic analysis** | Identify specific API keys/users by their identifier |
+| **Active suppression** | Targeted blocking based on observed identifiers |
+
+### Mitigation: Derive PSK ID from the Key
+
+Per [RFC 9180 §9.4](https://www.rfc-editor.org/rfc/rfc9180.html#section-9.4), sensitive metadata should be protected. The recommended approach is to **derive `psk_id` deterministically from the PSK itself**:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    Note over C: psk_id = SHA256(psk)
+    C->>C: Encrypt body with (psk, psk_id)
+    C->>S: POST /api<br/>X-HPKE-PSK-ID: <derived_id>
+    S->>S: Lookup PSK by derived_id
+    S->>S: Decrypt with (psk, psk_id)
+    S-->>C: Encrypted response
+```
+
+### Implementation
+
+**Client** — derive PSK ID from key:
+
+```python
+import hashlib
+
+api_key = b"sk_live_7f3a9c..."  # Your API key (>= 32 bytes)
+# Derive PSK ID from the key itself
+psk_id = hashlib.sha256(api_key).digest()
+
+async with HPKEClientSession(
+    base_url="https://api.example.com",
+    psk=api_key,
+    psk_id=psk_id,
+) as client:
+    await client.post("/api", json=data)
+```
+
+**Server** — store derived ID when key created, lookup on request:
+
+```python
+import hashlib
+
+# Key creation: store derived_id → {psk, tenant_id}
+derived_id = hashlib.sha256(api_key).digest()
+db.store(derived_id, {"psk": api_key, "tenant_id": tenant_id})
+
+# psk_resolver: lookup by derived_id from header
+async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
+    derived_id = scope.get("hpke_psk_id")
+    record = await db.lookup(derived_id)
+    scope["tenant_id"] = record["tenant_id"]
+    return (record["psk"], derived_id)
+```
+
 ## Wire Format
 
 ### Request/Response (Chunked Binary)
@@ -156,6 +244,7 @@ See [Header Modifications](#header-modifications) for when headers are added.
 Headers:
   X-HPKE-Enc: <base64url(32B ephemeral key)>
   X-HPKE-Stream: <base64url(4B session salt)>
+  X-HPKE-PSK-ID: <base64url(derived key ID, 32B recommended)>
 
 Body (repeating chunks):
 ┌───────────┬────────────┬─────────────────────────────────┐
@@ -186,9 +275,13 @@ Zstd reduces bandwidth by **40-95%** for JSON/text. Enable with `compress=True` 
 ## Pitfalls
 
 ```python
-# PSK too short (applies to both aiohttp and httpx clients)
-HPKEClientSession(psk=b"short")                 # InvalidPSKError
-HPKEClientSession(psk=secrets.token_bytes(32))  # >= 32 bytes
+# PSK too short
+HPKEClientSession(psk=b"short", psk_id=...)     # InvalidPSKError
+HPKEClientSession(psk=secrets.token_bytes(32), psk_id=...)  # >= 32 bytes
+
+# PSK ID must be derived from the key (see "PSK Authentication" section)
+psk_id = hashlib.sha256(api_key).digest()
+HPKEClientSession(psk=api_key, psk_id=psk_id)   # Correct
 
 # SSE missing content-type (won't use SSE format)
 return StreamingResponse(gen())                                  # Binary format (wrong for SSE)
@@ -205,6 +298,7 @@ return {"data": "value"}  # Auto-encrypted as binary chunks
 | HPKE messages/context | 2^96-1 | All |
 | Chunks/session | 2^32-1 | All |
 | PSK minimum | 32 bytes | All |
+| PSK ID minimum | 1 byte | All |
 | Chunk size | 64KB | All |
 | Binary chunk overhead | 24B (length + counter + tag) | Requests & standard responses |
 | SSE event buffer | 64MB (configurable) | SSE only |
@@ -238,9 +332,7 @@ All methods supported. **Encryption requires a request body** to establish the H
 
 *Unusual - these methods typically have a body.
 
-> **Design note:** The HPKE encryption context is established during request encryption (key exchange + PSK). Without a request body, no encryption context exists for the response.
->
-> For read-only endpoints requiring E2E encryption, use POST with a body (common pattern for sensitive queries).
+> **Tip:** For read-only endpoints needing E2E encryption, use POST with a body (no body = no encryption context).
 
 ### Response Encryption (Server)
 
@@ -256,7 +348,7 @@ All methods supported. **Encryption requires a request body** to establish the H
 | Any non-SSE | `resp.json()`, `resp.content` | O(response size) | After full download |
 | `text/event-stream` | `async for chunk in iter_sse(resp)` | O(event size) | As events arrive |
 
-> **Tip:** For large non-SSE responses, use `release_encrypted=True` to free the encrypted buffer after decryption, reducing peak memory from 2× to 1× response size.
+> Use `release_encrypted=True` to free encrypted buffer after decryption (reduces peak memory).
 
 ### Compression
 
@@ -270,9 +362,7 @@ Auto-negotiated via `Accept-Encoding` header on discovery endpoint (`/.well-know
 
 #### Why HTTP-Level Compression Doesn't Help
 
-**Disable gzip/brotli on your load balancer or CDN for HPKE endpoints.** The library compresses plaintext *before* encryption (the only effective order). Ciphertext has ~8 bits/byte entropy and is mathematically incompressible—HTTP compression only adds framing overhead and wastes CPU. Use `compress=True` on the client instead.
-
-> **Security note:** Unlike TLS compression (disabled since CRIME/BREACH), hpke-http's compression is safe because it uses per-request ephemeral keys and doesn't mix attacker-controlled input with secrets in the same compressed payload.
+Disable gzip/brotli on CDN/LB for HPKE endpoints. Ciphertext is incompressible—HTTP compression wastes CPU. Use `compress=True` on the client instead (compresses before encryption).
 
 ## Encryption Scope
 
@@ -307,6 +397,7 @@ Auto-negotiated via `Accept-Encoding` header on discovery endpoint (`/.well-know
 | `Content-Length` | Auto (chunked) | Removed | Size changes after encryption |
 | `X-HPKE-Enc` | Added | - | Ephemeral public key |
 | `X-HPKE-Stream` | Added | Added | Session salt for nonces |
+| `X-HPKE-PSK-ID` | Added | - | Derived PSK identifier for key lookup (see [PSK Authentication](#psk-authentication)) |
 | `X-HPKE-Encoding` | Added (if compressed) | - | Compression algorithm |
 | `X-HPKE-Content-Type` | Added (if body) | - | Original Content-Type for server parsing |
 

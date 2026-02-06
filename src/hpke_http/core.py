@@ -53,6 +53,7 @@ from hpke_http.constants import (
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
+    HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     RAW_LENGTH_PREFIX_SIZE,
     REQUEST_KEY_LABEL,
@@ -725,6 +726,9 @@ class RequestEncryptor:
         # Check zstd availability only if compression enabled and zstd allowed
         self._zstd_available = _check_zstd_available() if (compress and zstd) else False
 
+        # Store PSK ID for header (RFC 9180 §5.1 - psk_id should be transported)
+        self._psk_id = psk_id
+
         # Set up HPKE context
         self._ctx = setup_sender_psk(pk_r=public_key, info=psk_id, psk=psk, psk_id=psk_id)
 
@@ -748,11 +752,12 @@ class RequestEncryptor:
         Get headers to send with the request.
 
         Returns:
-            Dict with X-HPKE-Enc, X-HPKE-Stream, and optionally X-HPKE-Encoding
+            Dict with X-HPKE-Enc, X-HPKE-Stream, X-HPKE-PSK-ID, and optionally X-HPKE-Encoding
         """
         headers = {
             HEADER_HPKE_ENC: _b64url_encode(self._ctx.enc),
             HEADER_HPKE_STREAM: _b64url_encode(self._session.session_salt),
+            HEADER_HPKE_PSK_ID: _b64url_encode(self._psk_id),
         }
         # Signal whole-body compression via header (chunks have 0x00 encoding ID)
         if self._was_compressed and self._encoding:

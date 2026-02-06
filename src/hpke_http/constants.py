@@ -161,6 +161,14 @@ sent as application/octet-stream, and this header allows the server to
 restore the original Content-Type for the application layer.
 """
 
+HEADER_HPKE_PSK_ID: Final[str] = "X-HPKE-PSK-ID"
+"""Header containing base64url-encoded PSK identifier for server-side PSK lookup.
+
+Per RFC 9180 Section 5.1, the psk_id should be transported between sender and
+recipient so the server knows which PSK to use. The middleware stores the decoded
+value in scope["hpke_psk_id"] for use by the psk_resolver callback.
+"""
+
 RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"
 """Export label for deriving response encryption key from HPKE context."""
 
@@ -176,6 +184,13 @@ CHUNK_SIZE: Final[int] = 64 * 1024  # 64KB
 
 SCOPE_HPKE_CONTEXT: Final[str] = "hpke_context"
 """ASGI scope key for storing HPKE recipient context after request decryption."""
+
+SCOPE_HPKE_PSK_ID: Final[str] = "hpke_psk_id"
+"""ASGI scope key for storing decoded PSK ID from X-HPKE-PSK-ID header.
+
+Populated by middleware when X-HPKE-PSK-ID header is present. The psk_resolver
+callback can use scope.get("hpke_psk_id") to look up the appropriate PSK.
+"""
 
 # =============================================================================
 # SSE Streaming Constants
