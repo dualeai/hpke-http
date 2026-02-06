@@ -28,6 +28,7 @@ from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Mount, Route
+from starlette.types import Scope
 
 from hpke_http.constants import KemId
 from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -253,7 +254,7 @@ def _create_app() -> Starlette:
     }
 
     # PSK resolver callback - strict scope-based lookup, no fallback
-    async def psk_resolver(scope: dict[str, Any]) -> tuple[bytes, bytes]:
+    async def psk_resolver(scope: Scope) -> tuple[bytes, bytes]:
         """Look up PSK by client ID from scope."""
         client_psk_id = scope.get("hpke_psk_id")
         if client_psk_id and client_psk_id in psk_store:
@@ -272,7 +273,7 @@ def _create_app() -> Starlette:
     return Starlette(
         routes=[
             Route("/health", health, methods=["GET"]),
-            Mount("/", app=hpke_app),  # type: ignore[arg-type]  # HPKEMiddleware is ASGI-compatible
+            Mount("/", app=hpke_app),
         ],
     )
 

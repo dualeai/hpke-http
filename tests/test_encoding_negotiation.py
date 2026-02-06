@@ -496,18 +496,18 @@ class TestServerConfigValidation:
 
     async def test_compress_true_without_zstd_uses_gzip_fallback(self) -> None:
         """HPKEMiddleware(compress=True) uses gzip fallback when zstd unavailable."""
-        from typing import Any
         from unittest.mock import patch
 
         from cryptography.hazmat.primitives.asymmetric import x25519
+        from starlette.types import Receive, Scope, Send
 
         from hpke_http.constants import KemId
         from hpke_http.middleware.fastapi import HPKEMiddleware
 
-        async def mock_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        async def mock_app(scope: Scope, receive: Receive, send: Send) -> None:
             pass
 
-        async def mock_psk_resolver(scope: dict[str, Any]) -> tuple[bytes, bytes]:
+        async def mock_psk_resolver(scope: Scope) -> tuple[bytes, bytes]:
             return (b"psk", b"psk_id")
 
         # Generate a valid test keypair
@@ -529,11 +529,10 @@ class TestServerConfigValidation:
 
     async def test_compress_false_without_zstd_works(self) -> None:
         """HPKEMiddleware(compress=False) works even if zstd unavailable."""
-        from typing import Any
         from unittest.mock import patch
 
-        # Generate a valid test keypair
         from cryptography.hazmat.primitives.asymmetric import x25519
+        from starlette.types import Receive, Scope, Send
 
         from hpke_http.constants import KemId
         from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -541,10 +540,10 @@ class TestServerConfigValidation:
         private_key = x25519.X25519PrivateKey.generate()
         sk = private_key.private_bytes_raw()
 
-        async def mock_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        async def mock_app(scope: Scope, receive: Receive, send: Send) -> None:
             pass
 
-        async def mock_psk_resolver(scope: dict[str, Any]) -> tuple[bytes, bytes]:
+        async def mock_psk_resolver(scope: Scope) -> tuple[bytes, bytes]:
             return (b"", b"")
 
         # Mock _check_zstd_available to return False

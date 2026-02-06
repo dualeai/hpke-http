@@ -34,9 +34,9 @@ Reference: RFC-065 §4.3, §5.3
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric import x25519
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from hpke_http._logging import get_logger
 from hpke_http.constants import (
@@ -124,7 +124,7 @@ class _DecryptionState:
 
 
 # Type alias for PSK resolver callback
-PSKResolver = Callable[[dict[str, Any]], Awaitable[tuple[bytes, bytes]]]
+PSKResolver = Callable[[Scope], Awaitable[tuple[bytes, bytes]]]
 """
 Callback to resolve PSK and PSK ID from request scope.
 
@@ -153,7 +153,7 @@ class HPKEMiddleware:
 
     def __init__(
         self,
-        app: Any,
+        app: ASGIApp,
         private_keys: dict[KemId, bytes],
         psk_resolver: PSKResolver,
         discovery_path: str = DISCOVERY_PATH,
@@ -211,9 +211,9 @@ class HPKEMiddleware:
 
     async def __call__(  # noqa: PLR0911 - ASGI entry point with auth + encryption guards
         self,
-        scope: dict[str, Any],
-        receive: Callable[[], Awaitable[dict[str, Any]]],
-        send: Callable[[dict[str, Any]], Awaitable[None]],
+        scope: Scope,
+        receive: Receive,
+        send: Send,
     ) -> None:
         """ASGI interface."""
         if scope["type"] != "http":
@@ -288,7 +288,7 @@ class HPKEMiddleware:
         # Track if response has started so we know if we can send error responses
         response_started = False
 
-        async def tracked_send(message: dict[str, Any]) -> None:
+        async def tracked_send(message: Message) -> None:
             nonlocal response_started
             if message["type"] == "http.response.start":
                 response_started = True
@@ -308,14 +308,14 @@ class HPKEMiddleware:
 
     def _create_encrypting_send(  # noqa: PLR0915
         self,
-        scope: dict[str, Any],
-        send: Callable[[dict[str, Any]], Awaitable[None]],
-    ) -> Callable[[dict[str, Any]], Awaitable[None]]:
+        scope: Scope,
+        send: Send,
+    ) -> Send:
         """Create send wrapper that auto-encrypts responses."""
         # Per-request state (closure)
         state = ResponseEncryptionState()
 
-        async def encrypting_send(message: dict[str, Any]) -> None:
+        async def encrypting_send(message: Message) -> None:
             msg_type = message["type"]
 
             if msg_type == "http.response.start":
@@ -325,7 +325,7 @@ class HPKEMiddleware:
             else:
                 await send(message)
 
-        async def _handle_response_start(message: dict[str, Any]) -> None:
+        async def _handle_response_start(message: Message) -> None:
             """Handle response start - detect response type and set up encryption."""
             headers = message.get("headers", [])
             # Convert ASGI headers (list of byte tuples) to dict for is_sse_response()
@@ -379,7 +379,7 @@ class HPKEMiddleware:
                 # No encryption context, pass through
                 await send(message)
 
-        async def _handle_response_body(message: dict[str, Any]) -> None:
+        async def _handle_response_body(message: Message) -> None:
             """Handle response body - encrypt SSE events or standard response."""
             if state.is_sse:
                 # SSE path - buffer events and encrypt
@@ -391,7 +391,7 @@ class HPKEMiddleware:
                 # No encryption, pass through
                 await send(message)
 
-        async def _handle_sse_body(message: dict[str, Any]) -> None:
+        async def _handle_sse_body(message: Message) -> None:
             """Handle SSE response body - parse events and encrypt."""
             body: bytes = message.get("body", b"")
             more_body = message.get("more_body", False)
@@ -446,7 +446,7 @@ class HPKEMiddleware:
                         }
                     )
 
-        async def _handle_standard_body(message: dict[str, Any]) -> None:
+        async def _handle_standard_body(message: Message) -> None:
             """Handle standard response body - buffer and emit fixed-size chunks."""
             body: bytes = message.get("body", b"")
             more_body = message.get("more_body", False)
@@ -492,9 +492,9 @@ class HPKEMiddleware:
 
     async def _handle_discovery(
         self,
-        _scope: dict[str, Any],
-        _receive: Callable[[], Awaitable[dict[str, Any]]],
-        send: Callable[[dict[str, Any]], Awaitable[None]],
+        _scope: Scope,
+        _receive: Receive,
+        send: Send,
     ) -> None:
         """Handle /.well-known/hpke-keys endpoint."""
         # Build response
@@ -549,7 +549,7 @@ class HPKEMiddleware:
 
     async def _setup_decryption(
         self,
-        scope: dict[str, Any],
+        scope: Scope,
         enc_header: bytes,
         stream_header: bytes,
         encoding_header: bytes | None,
@@ -601,7 +601,7 @@ class HPKEMiddleware:
     async def _read_first_chunk(
         self,
         state: _DecryptionState,
-        receive: Callable[[], Awaitable[dict[str, Any]]],
+        receive: Receive,
     ) -> bytes:
         """
         Read and decrypt first chunk to validate PSK/key before app starts.
@@ -632,7 +632,7 @@ class HPKEMiddleware:
     async def _decrypt_all_compressed(
         self,
         state: _DecryptionState,
-        receive: Callable[[], Awaitable[dict[str, Any]]],
+        receive: Receive,
         first_plaintext: bytes,
     ) -> bytes:
         """
@@ -687,10 +687,10 @@ class HPKEMiddleware:
 
     async def _create_decrypted_receive(
         self,
-        scope: dict[str, Any],
-        receive: Callable[[], Awaitable[dict[str, Any]]],
+        scope: Scope,
+        receive: Receive,
         enc_header: bytes,
-    ) -> Callable[[], Awaitable[dict[str, Any]]]:
+    ) -> Receive:
         """
         Create a receive wrapper that decrypts chunked request body.
 
@@ -742,7 +742,7 @@ class HPKEMiddleware:
             decompressed_body = await self._decrypt_all_compressed(state, receive, first_plaintext)
             body_returned_compressed = False
 
-            async def decrypted_receive_compressed() -> dict[str, Any]:
+            async def decrypted_receive_compressed() -> Message:
                 nonlocal body_returned_compressed
                 if not body_returned_compressed:
                     body_returned_compressed = True
@@ -757,14 +757,14 @@ class HPKEMiddleware:
     def _create_streaming_receive(
         self,
         state: _DecryptionState,
-        receive: Callable[[], Awaitable[dict[str, Any]]],
+        receive: Receive,
         first_plaintext: bytes,
-    ) -> Callable[[], Awaitable[dict[str, Any]]]:
+    ) -> Receive:
         """Create receive function for non-compressed streaming decryption."""
         # Pending chunks from previous feed() calls
         pending_chunks: list[bytes] = []
 
-        async def decrypted_receive() -> dict[str, Any]:
+        async def decrypted_receive() -> Message:
             # After returning more_body=False, wait for disconnect
             if state.body_returned:
                 return await receive()
@@ -810,7 +810,7 @@ class HPKEMiddleware:
 
     async def _send_error(
         self,
-        send: Callable[[dict[str, Any]], Awaitable[None]],
+        send: Send,
         status: int,
         message: str,
         extra_headers: list[tuple[bytes, bytes]] | None = None,
