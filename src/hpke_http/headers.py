@@ -6,10 +6,11 @@ Uses base64url encoding (RFC 4648 §5) for HTTP header safety.
 
 import base64
 
-from hpke_http.constants import HEADER_HPKE_ENC, HEADER_HPKE_STREAM
+from hpke_http.constants import HEADER_HPKE_ENC, HEADER_HPKE_PSK_ID, HEADER_HPKE_STREAM
 
 __all__ = [
     "HEADER_HPKE_ENC",
+    "HEADER_HPKE_PSK_ID",
     "HEADER_HPKE_STREAM",
     "b64url_decode",
     "b64url_encode",

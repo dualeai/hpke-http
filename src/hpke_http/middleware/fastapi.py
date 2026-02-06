@@ -48,9 +48,11 @@ from hpke_http.constants import (
     HEADER_HPKE_CONTENT_TYPE,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
+    HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     KDF_ID,
     SCOPE_HPKE_CONTEXT,
+    SCOPE_HPKE_PSK_ID,
     SSE_MAX_EVENT_SIZE,
     ZSTD_DECOMPRESS_STREAMING_THRESHOLD,
     EncodingName,
@@ -65,7 +67,7 @@ from hpke_http.core import (
     is_sse_response,
 )
 from hpke_http.exceptions import CryptoError, DecryptionError
-from hpke_http.headers import b64url_encode
+from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.streaming import gzip_decompress, zstd_decompress
 
 __all__ = [
@@ -684,6 +686,17 @@ class HPKEMiddleware:
 
         # Get encoding header for compression detection
         encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
+
+        # Parse X-HPKE-PSK-ID header if present (RFC 9180 §5.1)
+        # Store decoded PSK ID in scope for psk_resolver to use for lookup
+        psk_id_header = headers.get(HEADER_HPKE_PSK_ID.lower().encode())
+        if psk_id_header:
+            try:
+                decoded_psk_id = bytes(b64url_decode(psk_id_header.decode("ascii")))
+                scope[SCOPE_HPKE_PSK_ID] = decoded_psk_id
+                _logger.debug("PSK ID from header: %d bytes", len(decoded_psk_id))
+            except Exception as e:
+                raise DecryptionError(f"Invalid {HEADER_HPKE_PSK_ID} header: {e}") from e
 
         # Set up decryption context (resolves PSK, creates RequestDecryptor)
         decryptor = await self._setup_decryption(scope, enc_header, stream_header, encoding_header)
