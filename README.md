@@ -13,7 +13,7 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE (Hybrid Public Key Encry
 - **Transparent** - Drop-in middleware, no application code changes
 - **End-to-end encryption** - Protects data even when TLS terminates at CDN or load balancer
 - **PSK binding** - Each request cryptographically bound to pre-shared key (API key)
-- **Replay protection** - Counter-based nonces (numbers used once) prevent replay attacks
+- **Replay protection** - Counter-based nonces prevent replay attacks
 - **RFC 9180 compliant** - Auditable, interoperable standard
 - **Memory-efficient** - Streams large file uploads with O(chunk_size) memory
 
@@ -54,16 +54,18 @@ app.add_middleware(
     psk_resolver=resolve_psk,
 )
 
-# Standard JSON endpoint - encryption is automatic
 @app.post("/users")
 async def create_user(request: Request):
-    data = await request.json()  # Decrypted automatically
-    return {"id": 123, "name": data["name"]}  # Encrypted automatically
+    data = await request.json()  # Decrypted by middleware
+    return {"id": 123, "name": data["name"]}  # Encrypted by middleware
 
-# SSE streaming endpoint - encryption is automatic
+@app.get("/users/{user_id}")
+async def get_user(request: Request):
+    return {"id": 123, "name": "Alice"}  # Encrypted by middleware
+
 @app.post("/chat")
 async def chat(request: Request):
-    data = await request.json()  # Decrypted automatically
+    data = await request.json()
 
     async def generate():
         yield b"event: progress\ndata: {\"step\": 1}\n\n"
@@ -90,17 +92,20 @@ async with HPKEClientSession(
     # require_encryption=True, # Raise if server responds unencrypted
     # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
 ) as session:
-    # Standard JSON request - encryption is automatic
+    # POST with JSON body
     async with session.post("/users", json={"name": "Alice"}) as resp:
-        user = await resp.json()  # Decrypted automatically
-        print(user)  # {"id": 123, "name": "Alice"}
+        user = await resp.json()
 
-    # SSE streaming request - encryption is automatic
+    # SSE streaming
     async with session.post("/chat", json={"prompt": "Hello"}) as resp:
         async for chunk in session.iter_sse(resp):
             print(chunk)  # b"event: progress\ndata: {...}\n\n"
 
-    # File upload - encryption is automatic, streams with O(chunk_size) memory
+    # GET (bodyless) - response is still encrypted
+    async with session.get("/users/123") as resp:
+        user = await resp.json()
+
+    # File upload - streams with O(chunk_size) memory
     form = aiohttp.FormData()
     form.add_field("file", open("large.pdf", "rb"), filename="large.pdf")
     async with session.post("/upload", data=form) as resp:
@@ -124,17 +129,20 @@ async with HPKEAsyncClient(
     # require_encryption=True, # Raise if server responds unencrypted
     # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
 ) as client:
-    # Standard JSON request - encryption is automatic
+    # POST with JSON body
     resp = await client.post("/users", json={"name": "Alice"})
-    user = resp.json()  # Decrypted automatically
-    print(user)  # {"id": 123, "name": "Alice"}
+    user = resp.json()
 
-    # SSE streaming request - encryption is automatic
+    # SSE streaming
     resp = await client.post("/chat", json={"prompt": "Hello"})
     async for chunk in client.iter_sse(resp):
         print(chunk)  # b"event: progress\ndata: {...}\n\n"
 
-    # File upload - encryption is automatic, streams with O(chunk_size) memory
+    # GET (bodyless) - response is still encrypted
+    resp = await client.get("/users/123")
+    user = resp.json()
+
+    # File upload - streams with O(chunk_size) memory
     resp = await client.post("/upload", files={"file": open("large.pdf", "rb")})
     result = resp.json()
 ```
@@ -183,7 +191,7 @@ The `X-HPKE-PSK-ID` header is sent in plaintext (only base64url-encoded, not enc
 
 ### Mitigation: Derive PSK ID from the Key
 
-Per [RFC 9180 §9.4](https://www.rfc-editor.org/rfc/rfc9180.html#section-9.4), sensitive metadata should be protected. The recommended approach is to **derive `psk_id` deterministically from the PSK itself**:
+**Derive `psk_id` from the PSK itself** ([RFC 9180 §9.4](https://www.rfc-editor.org/rfc/rfc9180.html#section-9.4)):
 
 ```mermaid
 sequenceDiagram
@@ -264,10 +272,6 @@ Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 
 Uses standard base64 (not base64url) - SSE data fields allow +/= characters.
 
-## Auto-Encryption
-
-The middleware automatically encrypts **all responses** when the request was encrypted. See [Response Types](#response-types) for format selection and [HTTP Methods](#http-methods) for when encryption activates.
-
 ## Compression (Optional)
 
 Zstd reduces bandwidth by **40-95%** for JSON/text. Enable with `compress=True` on both client and server. Payloads < 64 bytes skip compression. See [Compression table](#compression) for algorithm priority.
@@ -318,30 +322,17 @@ return {"data": "value"}  # Auto-encrypted as binary chunks
 
 ### HTTP Methods
 
-All methods supported. **Encryption requires a request body** to establish the HPKE context. The `X-HPKE-PSK-ID` header is sent on **all requests** (including bodyless) for client identification.
+HPKE key exchange happens on every request, including bodyless methods like GET and DELETE.
 
-| Method | Typical Use | With Body | Without Body |
-| ------ | ----------- | --------- | ------------ |
-| POST | Create | Encrypted (both directions) | PSK ID only* |
-| PUT | Replace | Encrypted (both directions) | PSK ID only* |
-| PATCH | Update | Encrypted (both directions) | PSK ID only* |
-| DELETE | Remove | Encrypted (both directions) | PSK ID only |
-| GET | Read | Encrypted (both directions) | PSK ID only |
-| HEAD | Metadata | N/A | PSK ID only (no response body) |
-| OPTIONS | Preflight | Encrypted (both directions) | PSK ID only |
-
-*Unusual - these methods typically have a body.
-
-> **Tip:** For read-only endpoints needing E2E encryption, use POST with a body (no body = no encryption context).
-
-### Authentication vs Content Encryption
-
-`X-HPKE-PSK-ID` is sent on every request. `psk_resolver` is called on every request that has one — bodyless or not. The only difference is whether body content is encrypted.
-
-| Request type | Authenticated via `psk_resolver` | Body encrypted |
-|---|---|---|
-| **With body** | Yes — PSK ID validated + HPKE proves key possession | Yes |
-| **Without body** | Yes — PSK ID validated | No body to encrypt |
+| Method | Typical Use | Request Body | Response |
+| ------ | ----------- | ------------ | -------- |
+| POST | Create | Encrypted | Encrypted |
+| PUT | Replace | Encrypted | Encrypted |
+| PATCH | Update | Encrypted | Encrypted |
+| DELETE | Remove | Encrypted (if body) | Encrypted |
+| GET | Read | No body | Encrypted |
+| HEAD | Metadata | No body | Headers only (no body per HTTP spec) |
+| OPTIONS | Preflight | No body | Encrypted |
 
 ### Response Encryption (Server)
 
@@ -375,17 +366,12 @@ Disable gzip/brotli on CDN/LB for HPKE endpoints. Ciphertext is incompressible�
 
 ## Encryption Scope
 
-> Applies when request has a body (see [HTTP Methods](#http-methods) above).
-
 ### What IS Encrypted
 
 | Component | Encrypted | Format |
 | --------- | --------- | ------ |
 | Request body | Yes | Binary chunks |
 | Response body | Yes | Binary chunks or SSE events |
-| JSON payloads | Yes | Inside encrypted body |
-| Binary data | Yes | Inside encrypted body |
-| SSE event content | Yes | Base64 in `data:` field |
 
 ### What is NOT Encrypted
 
@@ -402,11 +388,11 @@ Disable gzip/brotli on CDN/LB for HPKE endpoints. Ciphertext is incompressible�
 
 | Header | Request | Response | Reason |
 | ------ | ------- | -------- | ------ |
-| `Content-Type` | Set to `application/octet-stream` | Preserved | Encrypted body is binary |
-| `Content-Length` | Auto (chunked) | Removed | Size changes after encryption |
-| `X-HPKE-Enc` | Added | - | Ephemeral public key |
-| `X-HPKE-Stream` | Added | Added | Session salt for nonces |
-| `X-HPKE-PSK-ID` | Always | - | Derived PSK identifier for key lookup (see [PSK Authentication](#psk-authentication)) — sent on **all** requests including bodyless |
+| `Content-Type` | Set to `application/octet-stream` (if body) | Preserved | Encrypted body is binary |
+| `Content-Length` | Auto (chunked, if body) | Removed | Size changes after encryption |
+| `X-HPKE-Enc` | Always | - | Ephemeral public key |
+| `X-HPKE-Stream` | Always | Added | Session salt for nonces |
+| `X-HPKE-PSK-ID` | Always | - | Derived PSK identifier (see [PSK Authentication](#psk-authentication)) |
 | `X-HPKE-Encoding` | Added (if compressed) | - | Compression algorithm |
 | `X-HPKE-Content-Type` | Added (if body) | - | Original Content-Type for server parsing |
 

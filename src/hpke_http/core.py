@@ -647,6 +647,36 @@ class BaseHPKEClient(ABC):
 
         return (stream_chunks(), headers, encryptor.context)
 
+    async def _create_bodyless_encryptor(self) -> tuple[dict[str, str], SenderContext]:
+        """Create HPKE encapsulation headers without encrypting a body.
+
+        Used for bodyless requests (GET, DELETE, HEAD, OPTIONS) that still need
+        HPKE key exchange so the server can encrypt the response.
+
+        Returns:
+            Tuple of (headers_dict, sender_context)
+
+        Raises:
+            KeyDiscoveryError: If no X25519 key available
+        """
+        keys = await self._ensure_keys()
+
+        pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
+        if not pk_r:
+            raise KeyDiscoveryError("No X25519 key available from platform")
+
+        encryptor = RequestEncryptor(
+            public_key=pk_r,
+            psk=self.psk,
+            psk_id=self.psk_id,
+        )
+        headers = encryptor.get_headers()
+
+        if self._logger:
+            self._logger.debug("Bodyless encapsulation prepared")
+
+        return (headers, encryptor.context)
+
     def _check_encrypted_response(
         self,
         response_headers: Mapping[str, Any],

@@ -651,8 +651,58 @@ class HPKEAsyncClient(BaseHPKEClient):
             # Clear json/data since we're using encrypted content
             json = None
             data = None
+        elif sender_ctx is None:
+            # Bodyless request (GET, DELETE, HEAD, OPTIONS) — perform HPKE
+            # encapsulation so the server can encrypt the response.
+            crypto_headers, ctx = await self._create_bodyless_encryptor()
+            request_headers.update(crypto_headers)
+            sender_ctx = ctx
+            _logger.debug("Bodyless encapsulation: method=%s url=%s", method, url)
 
-        # Build kwargs for httpx request, filtering out None values
+        # Build and send request
+        response = await self._send_request(
+            method=method,
+            url=url,
+            request_headers=request_headers,
+            encrypted_content=encrypted_content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+        return await self._handle_response(response, sender_ctx, url)
+
+    async def _send_request(
+        self,
+        *,
+        method: str,
+        url: str,
+        request_headers: dict[str, Any],
+        encrypted_content: Any,
+        data: Any,
+        files: Any,
+        json: Any,
+        params: Any,
+        cookies: Any,
+        auth: Any,
+        follow_redirects: bool | None,
+        timeout: Any,
+        extensions: Any,
+    ) -> httpx.Response:
+        """Build and send the HTTP request via httpx.
+
+        Constructs kwargs, builds the request, and sends it in streaming mode.
+        Caller must ensure self._client is initialized.
+        """
+        if not self._client:
+            raise RuntimeError("Client not initialized. Use 'async with' context manager.")
+
         optional_kwargs = {
             "content": encrypted_content,
             "data": data,
@@ -676,8 +726,19 @@ class HPKEAsyncClient(BaseHPKEClient):
         # See: https://www.python-httpx.org/async/#streaming-responses
         # client.request() buffers entire response; stream=True enables true streaming
         request = self._client.build_request(**kwargs)
-        response = await self._client.send(request, stream=True)
+        return await self._client.send(request, stream=True)
 
+    async def _handle_response(
+        self,
+        response: httpx.Response,
+        sender_ctx: SenderContext | None,
+        url: str,
+    ) -> httpx.Response | DecryptedResponse:
+        """Handle response based on encryption state.
+
+        Wraps encrypted non-SSE responses in DecryptedResponse,
+        keeps SSE streams open, and reads non-encrypted responses.
+        """
         # Store context per-response for concurrent request safety (needed for SSE)
         if sender_ctx:
             self._response_contexts[response] = sender_ctx
@@ -702,11 +763,9 @@ class HPKEAsyncClient(BaseHPKEClient):
                 await response.aclose()
                 raise EncryptionRequiredError("Response was not encrypted")
             else:
-                # Unencrypted response: read full body
+                # Unencrypted response (e.g. HEAD with no body, or public endpoint)
+                _logger.debug("Plaintext response from encrypted request: url=%s", url)
                 await response.aread()
-        else:
-            # No encryption context: read full body for non-encrypted request
-            await response.aread()
 
         return response
 
@@ -950,7 +1009,10 @@ class HPKEAsyncClient(BaseHPKEClient):
 
         sender_ctx = self._response_contexts.get(response)
         if not sender_ctx:
-            raise RuntimeError("No encryption context for this response. Was the request encrypted?")
+            raise RuntimeError(
+                "No encryption context for this response. "
+                "Ensure the request was made through this HPKEAsyncClient instance."
+            )
 
         # Use centralized SSEDecryptor - handles header parsing and key derivation
         decryptor = SSEDecryptor(response.headers, sender_ctx)

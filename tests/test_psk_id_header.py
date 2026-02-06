@@ -343,7 +343,12 @@ class TestBodylessRequestPSKIDDeny:
         granian_server: E2EServer,
         test_psk: bytes,
     ) -> None:
-        """Bodyless GET with unknown PSK ID → psk_resolver rejects → 401."""
+        """Bodyless GET with unknown PSK ID → psk_resolver rejects → 400.
+
+        Bodyless requests now perform HPKE encapsulation (X-HPKE-Enc header),
+        so the server middleware attempts PSK resolution and returns 400 on
+        failure (same as encrypted POST with unknown PSK ID).
+        """
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEClientSession(
@@ -352,7 +357,7 @@ class TestBodylessRequestPSKIDDeny:
             psk_id=b"unknown-tenant",
         ) as client:
             resp = await client.get("/whoami")
-            assert resp.status == 401
+            assert resp.status == 400
 
     async def test_unknown_psk_id_encrypted_rejected(
         self,
