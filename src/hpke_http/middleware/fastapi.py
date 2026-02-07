@@ -51,6 +51,8 @@ from hpke_http.constants import (
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     KDF_ID,
+    MAX_DECOMPRESSION_RATIO,
+    MAX_PSK_ID_SIZE,
     SCOPE_HPKE_CONTEXT,
     SCOPE_HPKE_PSK_ID,
     SSE_MAX_EVENT_SIZE,
@@ -75,6 +77,9 @@ __all__ = [
 ]
 
 _logger = get_logger(__name__)
+
+# Known encoding values accepted by the middleware (Fix #5)
+_KNOWN_ENCODINGS: frozenset[bytes | None] = frozenset({None, b"identity", b"gzip", b"zstd"})
 
 
 @dataclass
@@ -121,6 +126,9 @@ class _DecryptionState:
 
     first_chunk_returned: bool = False
     """Whether pre-validated first chunk has been returned."""
+
+    pending_chunks: list[bytes] = field(default_factory=list[bytes])
+    """Extra chunks from first feed() that must not be lost."""
 
 
 # Type alias for PSK resolver callback
@@ -209,7 +217,7 @@ class HPKEMiddleware:
         except ImportError:
             return False
 
-    async def __call__(  # noqa: PLR0911 - ASGI entry point with auth + encryption guards
+    async def __call__(  # noqa: PLR0911, PLR0912, PLR0915 - ASGI entry point with auth + encryption guards
         self,
         scope: Scope,
         receive: Receive,
@@ -236,10 +244,14 @@ class HPKEMiddleware:
         psk_id_header = headers.get(HEADER_HPKE_PSK_ID.lower().encode())
         if psk_id_header:
             try:
-                scope[SCOPE_HPKE_PSK_ID] = bytes(b64url_decode(psk_id_header.decode("ascii")))
+                psk_id_bytes = bytes(b64url_decode(psk_id_header.decode("ascii")))
             except (ValueError, UnicodeDecodeError):
                 await self._send_error(send, 400, f"Invalid {HEADER_HPKE_PSK_ID} header")
                 return
+            if len(psk_id_bytes) > MAX_PSK_ID_SIZE:
+                await self._send_error(send, 400, "PSK ID too large")
+                return
+            scope[SCOPE_HPKE_PSK_ID] = psk_id_bytes
 
         if not enc_header:
             # Not encrypted - reject or pass through based on configuration
@@ -406,8 +418,7 @@ class HPKEMiddleware:
                 # DoS protection: track buffer size
                 state.sse_buffer_size += len(body)
                 if state.sse_buffer_size > self.max_sse_event_size:
-                    # Reset size tracking after overflow handling
-                    state.sse_buffer_size = 0
+                    raise DecryptionError(f"SSE event too large: {state.sse_buffer_size} > {self.max_sse_event_size}")
 
                 # Feed to parser, encrypt complete events
                 for event in parser.feed(body):
@@ -622,8 +633,13 @@ class HPKEMiddleware:
                 state.http_done = True
 
             # Feed data to decryptor, return first chunk when available
-            for plaintext in state.decryptor.feed(body):
-                return plaintext
+            # Collect ALL chunks from feed() to avoid data loss when
+            # ASGI server delivers large initial HTTP message
+            chunks = list(state.decryptor.feed(body))
+            if chunks:
+                first = chunks[0]
+                state.pending_chunks.extend(chunks[1:])
+                return first
 
             # No complete chunk yet
             if state.http_done and not body:
@@ -642,6 +658,9 @@ class HPKEMiddleware:
         client compresses full body before chunking.
         """
         parts: list[bytes] = [first_plaintext] if first_plaintext else []
+        # Prepend any extra chunks captured from the first feed()
+        parts.extend(state.pending_chunks)
+        state.pending_chunks.clear()
 
         # Read and decrypt all remaining chunks using decryptor.feed()
         while not state.http_done:
@@ -673,6 +692,10 @@ class HPKEMiddleware:
                     )
                 case _:
                     raise DecryptionError(f"Unknown encoding: {encoding}")
+            # DoS protection: check decompression ratio (zip-bomb prevention)
+            if len(compressed_body) > 0 and len(decompressed) // len(compressed_body) > MAX_DECOMPRESSION_RATIO:
+                raise DecryptionError("Decompression ratio exceeds safety limit")
+
             _logger.debug(
                 "Request decompressed: encoding=%s compressed=%d decompressed=%d",
                 encoding,
@@ -761,8 +784,9 @@ class HPKEMiddleware:
         first_plaintext: bytes,
     ) -> Receive:
         """Create receive function for non-compressed streaming decryption."""
-        # Pending chunks from previous feed() calls
-        pending_chunks: list[bytes] = []
+        # Initialize with any extra chunks from the first feed() call
+        pending_chunks: list[bytes] = list(state.pending_chunks)
+        state.pending_chunks.clear()
 
         async def decrypted_receive() -> Message:
             # After returning more_body=False, wait for disconnect

@@ -351,3 +351,45 @@ Matches zstd threshold for consistency.
 
 GZIP_STREAMING_CHUNK_SIZE: Final[int] = 4 * 1024 * 1024  # 4MB
 """Chunk size for streaming gzip compression. Matches zstd for consistency."""
+
+# =============================================================================
+# DoS Protection Limits
+# =============================================================================
+
+MAX_CHUNK_WIRE_SIZE: Final[int] = CHUNK_SIZE + SSE_COUNTER_SIZE + CHACHA20_POLY1305_TAG_SIZE + 1 + 64
+"""Maximum wire-format chunk size in bytes.
+
+Derived from: CHUNK_SIZE (64KB data) + counter (4B) + auth tag (16B)
++ encoding ID (1B) + margin (64B). Any length prefix exceeding this
+is rejected immediately to prevent OOM from malicious servers.
+"""
+
+MAX_DECOMPRESSED_CHUNK_SIZE: Final[int] = CHUNK_SIZE * 2
+"""Maximum allowed size after decompression (128KB).
+
+Prevents zip-bomb attacks. Legitimate chunks decompress to at most
+CHUNK_SIZE (64KB). The 2x margin accommodates rounding and edge cases.
+"""
+
+MAX_PSK_ID_SIZE: Final[int] = 128
+"""Maximum decoded PSK ID size in bytes.
+
+Sized to accommodate base64(SHA-512) = 88 bytes with headroom.
+SHA-512 = 64 bytes raw -> base64 = 88 chars = 88 bytes.
+Rejects excessively large PSK IDs to prevent header-based DoS.
+"""
+
+DISCOVERY_CACHE_MAX_ENTRIES: Final[int] = 1000
+"""Maximum number of entries in the key discovery cache.
+
+Prevents unbounded memory growth when clients connect to many hosts.
+Uses LRU (Least Recently Used) eviction: when the cache is full,
+the least recently accessed entry is removed to make room.
+"""
+
+MAX_DECOMPRESSION_RATIO: Final[int] = 1000
+"""Maximum allowed decompression ratio for compressed request bodies.
+
+Rejects payloads where decompressed_size / compressed_size exceeds
+this ratio. Prevents zip-bomb attacks on request body decompression.
+"""

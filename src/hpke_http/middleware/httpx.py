@@ -52,7 +52,13 @@ from httpx._content import encode_multipart_data
 from typing_extensions import Self
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_PSK_ID, HEADER_HPKE_STREAM, KemId
+from hpke_http.constants import (
+    CHUNK_SIZE,
+    HEADER_HPKE_CONTENT_TYPE,
+    HEADER_HPKE_PSK_ID,
+    HEADER_HPKE_STREAM,
+    KemId,
+)
 from hpke_http.core import (
     BaseHPKEClient,
     RequestEncryptor,
@@ -403,7 +409,7 @@ class HPKEAsyncClient(BaseHPKEClient):
             accept_encoding = resp.headers.get("Accept-Encoding", "identity")
             return (data, cache_control, accept_encoding)
 
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, ValueError) as e:
             _logger.debug("Key discovery failed: host=%s error=%s", self.base_url, e)
             raise KeyDiscoveryError(f"Failed to fetch keys: {e}") from e
 
@@ -1012,6 +1018,13 @@ class HPKEAsyncClient(BaseHPKEClient):
             raise RuntimeError(
                 "No encryption context for this response. "
                 "Ensure the request was made through this HPKEAsyncClient instance."
+            )
+
+        # Validate that response is actually an encrypted SSE stream (Fix #12)
+        if HEADER_HPKE_STREAM not in response.headers:
+            raise RuntimeError(
+                "Response is not an encrypted SSE stream (missing X-HPKE-Stream header). "
+                "Use .json() or .text for standard responses."
             )
 
         # Use centralized SSEDecryptor - handles header parsing and key derivation

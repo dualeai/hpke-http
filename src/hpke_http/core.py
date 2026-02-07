@@ -42,6 +42,7 @@ import struct
 import time
 import weakref
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from typing import Any, ClassVar
 from urllib.parse import urljoin, urlparse
@@ -50,10 +51,12 @@ from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     CHUNK_SIZE,
     DISCOVERY_CACHE_MAX_AGE,
+    DISCOVERY_CACHE_MAX_ENTRIES,
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_STREAM,
+    MAX_CHUNK_WIRE_SIZE,
     RAW_LENGTH_PREFIX_SIZE,
     REQUEST_KEY_LABEL,
     RESPONSE_KEY_LABEL,
@@ -202,6 +205,11 @@ class _ChunkStreamParser:
 
         # Parse length using struct (faster than int.from_bytes for hot path)
         chunk_len = _LENGTH_STRUCT.unpack_from(self._buffer, self._read_pos)[0]
+
+        # DoS protection: reject absurdly large length prefixes immediately
+        if chunk_len > MAX_CHUNK_WIRE_SIZE:
+            raise DecryptionError(f"Chunk too large: {chunk_len} > {MAX_CHUNK_WIRE_SIZE}")
+
         total = RAW_LENGTH_PREFIX_SIZE + chunk_len
 
         if available < total:
@@ -384,11 +392,22 @@ def parse_discovery_keys(response: dict[str, Any]) -> dict[KemId, bytes]:
 
     Returns:
         Dict mapping KemId to public key bytes
+
+    Raises:
+        KeyDiscoveryError: If response version is unsupported or key entries are malformed
     """
+    # Validate discovery version (Fix #9)
+    version = response.get("version")
+    if version is not None and version != 1:
+        raise KeyDiscoveryError(f"Unsupported discovery version: {version}")
+
     result: dict[KemId, bytes] = {}
     for key_info in response.get("keys", []):
-        kem_id = KemId(int(key_info["kem_id"], 16))
-        public_key = bytes(_b64url_decode(key_info["public_key"]))
+        try:
+            kem_id = KemId(int(key_info["kem_id"], 16))
+            public_key = bytes(_b64url_decode(key_info["public_key"]))
+        except (KeyError, ValueError, TypeError) as e:
+            raise KeyDiscoveryError(f"Malformed key entry: {e}") from e
         result[kem_id] = public_key
     return result
 
@@ -426,8 +445,8 @@ class BaseHPKEClient(ABC):
     - SSE response stream decryption
     """
 
-    # Class-level key cache: host -> (keys_dict, encodings_set, expires_at)
-    _key_cache: ClassVar[dict[str, tuple[dict[KemId, bytes], set[str], float]]] = {}
+    # Class-level key cache with LRU eviction: host -> (keys_dict, encodings_set, expires_at)
+    _key_cache: ClassVar[OrderedDict[str, tuple[dict[KemId, bytes], set[str], float]]] = OrderedDict()
     _cache_lock: ClassVar[asyncio.Lock | None] = None
 
     def __init__(
@@ -512,15 +531,20 @@ class BaseHPKEClient(ABC):
         lock = self._get_cache_lock()
 
         async with lock:
-            # Check cache
+            # LRU cache lookup (O(1))
             if host in self._key_cache:
                 keys, encodings, expires_at = self._key_cache[host]
                 if time.time() < expires_at:
+                    # Cache hit — move to end (most recently used)
+                    self._key_cache.move_to_end(host)
                     if self._logger:
                         self._logger.debug("Key cache hit: host=%s", host)
                     self._platform_keys = keys
                     self._server_encodings = encodings
                     return self._platform_keys
+                # Expired — don't delete yet. If _fetch_discovery() fails below,
+                # the stale entry stays in the cache (occupies a slot but won't be
+                # served due to TTL check). Deleted on successful re-fetch.
 
             if self._logger:
                 self._logger.debug("Key cache miss: host=%s fetching from %s", host, self.discovery_url)
@@ -536,8 +560,14 @@ class BaseHPKEClient(ABC):
             keys = parse_discovery_keys(data)
             encodings = parse_accept_encoding(accept_encoding)
 
-            # Cache keys and encodings together
+            # Remove stale entry before insert so the new entry goes to the end
+            # (OrderedDict.__setitem__ on existing key does NOT move it to end)
+            self._key_cache.pop(host, None)
+            # Cache keys and encodings together (inserted at end)
             self._key_cache[host] = (keys, encodings, expires_at)
+            # LRU eviction: remove oldest entries if over max
+            while len(self._key_cache) > DISCOVERY_CACHE_MAX_ENTRIES:
+                self._key_cache.popitem(last=False)
             self._platform_keys = keys
             self._server_encodings = encodings
 

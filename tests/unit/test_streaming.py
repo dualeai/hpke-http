@@ -2,6 +2,7 @@
 
 import pytest
 
+from hpke_http.constants import MAX_DECOMPRESSED_CHUNK_SIZE
 from hpke_http.exceptions import ReplayAttackError
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
 from hpke_http.streaming import (
@@ -350,3 +351,49 @@ class TestSessionFromContext:
 
         # Salts are random, so they differ (each side generates their own)
         # In practice, server generates salt and sends to client via header
+
+
+# =============================================================================
+# TEST: Decompression Size Cap (Fix #11)
+# =============================================================================
+
+
+class TestDecompressionLimits:
+    """Tests for decompression size cap (Fix #11)."""
+
+    def test_normal_compressed_chunk_accepted(self) -> None:
+        """Normal compressed 64KB chunk decompresses fine."""
+        session = StreamingSession.create(b"k" * 32)
+        enc = ChunkEncryptor(session, compress=True)
+        dec = ChunkDecryptor(session)
+
+        # 64KB of compressible data
+        original = b"A" * (64 * 1024)
+        encrypted = enc.encrypt(original)
+        data = extract_sse_data_field(encrypted)
+        result = dec.decrypt(data)
+        assert result == original
+
+    def test_small_compressed_chunk_accepted(self) -> None:
+        """Small compressed chunk decompresses fine."""
+        session = StreamingSession.create(b"k" * 32)
+        enc = ChunkEncryptor(session, compress=True)
+        dec = ChunkDecryptor(session)
+
+        original = b"B" * 1024
+        encrypted = enc.encrypt(original)
+        data = extract_sse_data_field(encrypted)
+        result = dec.decrypt(data)
+        assert result == original
+
+    def test_identity_chunk_within_limit(self) -> None:
+        """Identity (uncompressed) chunk within limit accepted."""
+        session = StreamingSession.create(b"k" * 32)
+        enc = ChunkEncryptor(session, compress=False)
+        dec = ChunkDecryptor(session)
+
+        original = b"C" * MAX_DECOMPRESSED_CHUNK_SIZE
+        encrypted = enc.encrypt(original)
+        data = extract_sse_data_field(encrypted)
+        result = dec.decrypt(data)
+        assert result == original
