@@ -290,6 +290,10 @@ class EncodingName(str, Enum):
 # Base encodings always supported (gzip is stdlib)
 _BASE_ENCODINGS: Final[list[EncodingName]] = [EncodingName.IDENTITY, EncodingName.GZIP]
 
+# All known encoding values as bytes, for ASGI header validation.
+# Derived from EncodingName so adding a new encoding only requires updating the enum.
+KNOWN_ENCODING_BYTES: Final[frozenset[bytes]] = frozenset(e.value.encode() for e in EncodingName)
+
 
 def build_accept_encoding(*, zstd_available: bool) -> str:
     """Build Accept-Encoding header value based on available algorithms.

@@ -52,6 +52,7 @@ from hpke_http.constants import (
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     KDF_ID,
+    KNOWN_ENCODING_BYTES,
     MAX_DECOMPRESSION_RATIO,
     MAX_PSK_ID_SIZE,
     SCOPE_HPKE_CONTEXT,
@@ -78,9 +79,6 @@ __all__ = [
 ]
 
 _logger = get_logger(__name__)
-
-# Known encoding values accepted by the middleware (Fix #5)
-_KNOWN_ENCODINGS: frozenset[bytes | None] = frozenset({None, b"identity", b"gzip", b"zstd"})
 
 
 @dataclass
@@ -282,7 +280,7 @@ class HPKEMiddleware:
         # Early rejection for unsupported encoding (RFC 9110 §12.5.3)
         # Check before attempting decryption to fail fast with clear error
         encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
-        if encoding_header == b"zstd" and not self._zstd_available:
+        if encoding_header == EncodingName.ZSTD.value.encode() and not self._zstd_available:
             _logger.debug(
                 "Rejected unsupported encoding: method=%s path=%s encoding=%s",
                 method,
@@ -298,7 +296,7 @@ class HPKEMiddleware:
             return
 
         # Reject unknown encoding values (Fix #5)
-        if encoding_header and encoding_header not in _KNOWN_ENCODINGS:
+        if encoding_header and encoding_header not in KNOWN_ENCODING_BYTES:
             _logger.debug(
                 "Rejected unknown encoding: method=%s path=%s encoding=%s",
                 method,

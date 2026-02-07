@@ -58,6 +58,7 @@ from hpke_http.constants import (
     HEADER_HPKE_ERROR,
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
+    EncodingName,
     KemId,
 )
 from hpke_http.core import (
@@ -407,7 +408,7 @@ class HPKEAsyncClient(BaseHPKEClient):
 
             data = resp.json()
             cache_control = resp.headers.get("Cache-Control", "")
-            accept_encoding = resp.headers.get("Accept-Encoding", "identity")
+            accept_encoding = resp.headers.get("Accept-Encoding", EncodingName.IDENTITY)
             return (data, cache_control, accept_encoding)
 
         except (httpx.HTTPError, ValueError) as e:

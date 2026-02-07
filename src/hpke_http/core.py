@@ -414,17 +414,20 @@ def parse_discovery_keys(response: dict[str, Any]) -> dict[KemId, bytes]:
 
 
 def parse_accept_encoding(header: str) -> set[str]:
-    """Parse Accept-Encoding header into set of encoding names.
+    """Parse Accept-Encoding header into set of known encoding names.
 
     Handles quality values per RFC 9110: 'zstd;q=1.0, gzip;q=0.8' → {'zstd', 'gzip'}
+    Unknown encodings are silently discarded (same principle as server-side
+    validation in HPKEMiddleware).
 
     Args:
         header: Accept-Encoding header value
 
     Returns:
-        Set of encoding names (lowercase, quality values stripped)
+        Set of known encoding names (lowercase, quality values stripped)
     """
-    return {e.strip().split(";")[0].lower() for e in header.split(",")}
+    known = {e.value for e in EncodingName}
+    return {name for e in header.split(",") if (name := e.strip().split(";")[0].lower()) in known}
 
 
 # =============================================================================

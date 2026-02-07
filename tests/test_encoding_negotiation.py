@@ -598,8 +598,8 @@ class TestParseAcceptEncoding:
         assert parse_accept_encoding("  zstd  ,  gzip  ") == {"zstd", "gzip"}
 
     def test_no_whitespace(self) -> None:
-        """Works without any whitespace."""
-        assert parse_accept_encoding("zstd,gzip,br") == {"zstd", "gzip", "br"}
+        """Works without any whitespace, unknown encodings discarded."""
+        assert parse_accept_encoding("zstd,gzip,br") == {"zstd", "gzip"}
 
     # --- Case handling ---
 
@@ -614,27 +614,24 @@ class TestParseAcceptEncoding:
     # --- Edge cases ---
 
     def test_empty_string(self) -> None:
-        """Empty string returns set with empty string (caller handles default)."""
-        # Empty input gives {""}  - the caller should handle this appropriately
+        """Empty string returns empty set (unknown values discarded)."""
         result = parse_accept_encoding("")
-        assert result == {""}
+        assert result == set()
 
     def test_single_comma(self) -> None:
-        """Single comma gives two empty strings."""
+        """Single comma gives empty set (empty strings discarded)."""
         result = parse_accept_encoding(",")
-        assert result == {""}
+        assert result == set()
 
     def test_trailing_comma(self) -> None:
-        """Trailing comma includes empty string."""
+        """Trailing comma: known encoding kept, empty string discarded."""
         result = parse_accept_encoding("zstd,")
-        assert "" in result
-        assert "zstd" in result
+        assert result == {"zstd"}
 
     def test_leading_comma(self) -> None:
-        """Leading comma includes empty string."""
+        """Leading comma: known encoding kept, empty string discarded."""
         result = parse_accept_encoding(",zstd")
-        assert "" in result
-        assert "zstd" in result
+        assert result == {"zstd"}
 
     # --- Weird/malformed cases ---
 
@@ -647,14 +644,14 @@ class TestParseAcceptEncoding:
         assert parse_accept_encoding("zstd;") == {"zstd"}
 
     def test_only_quality_value(self) -> None:
-        """Malformed: just quality value, no encoding name."""
+        """Malformed: just quality value, no encoding name — discarded."""
         result = parse_accept_encoding(";q=1.0")
-        assert result == {""}
+        assert result == set()
 
     def test_spaces_only(self) -> None:
-        """Only whitespace characters."""
+        """Only whitespace characters — discarded."""
         result = parse_accept_encoding("   ")
-        assert result == {""}
+        assert result == set()
 
     def test_duplicate_encodings(self) -> None:
         """Duplicate encodings collapsed to single entry (set behavior)."""
@@ -664,14 +661,14 @@ class TestParseAcceptEncoding:
     # --- Real-world Accept-Encoding values ---
 
     def test_browser_like_header(self) -> None:
-        """Typical browser Accept-Encoding header."""
+        """Typical browser Accept-Encoding: unknown encodings (deflate, br) discarded."""
         result = parse_accept_encoding("gzip, deflate, br, zstd")
-        assert result == {"gzip", "deflate", "br", "zstd"}
+        assert result == {"gzip", "zstd"}
 
     def test_cloudflare_style(self) -> None:
-        """Cloudflare-style with quality values."""
+        """Cloudflare-style with quality values: unknown br discarded."""
         result = parse_accept_encoding("gzip;q=1.0, br;q=0.9, zstd;q=0.8")
-        assert result == {"gzip", "br", "zstd"}
+        assert result == {"gzip", "zstd"}
 
 
 # =============================================================================
