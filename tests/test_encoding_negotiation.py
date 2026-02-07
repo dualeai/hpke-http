@@ -132,7 +132,7 @@ class TestUnsupportedEncodingRejection:
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
-        """X-HPKE-Encoding: ZSTD (uppercase) is ignored, not rejected."""
+        """X-HPKE-Encoding: ZSTD (uppercase) is rejected as unknown (case-sensitive)."""
         encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
             b'{"test": "data"}',
             granian_server_no_zstd.public_key,
@@ -151,8 +151,8 @@ class TestUnsupportedEncodingRejection:
                 },
                 data=encrypted_body,
             ) as resp:
-                # Should succeed because uppercase ZSTD is ignored (case-sensitive)
-                assert resp.status == 200
+                # Should be rejected because uppercase ZSTD is not in known encodings
+                assert resp.status == 415
 
     async def test_zstd_accepted_when_available(
         self,
@@ -200,11 +200,11 @@ class TestEncodingEdgeCases:
         ("encoding", "expected_status"),
         [
             ("zstd", 415),  # Rejected - server lacks zstd
-            ("ZSTD", 200),  # Case-sensitive, ignored
+            ("ZSTD", 415),  # Case-sensitive, rejected as unknown
             ("gzip", 400),  # Valid encoding, but body not compressed → decompression fails
-            ("GZIP", 200),  # Case-sensitive, ignored
-            ("br", 200),  # Unknown, ignored
-            ("deflate", 200),  # Unknown, ignored
+            ("GZIP", 415),  # Case-sensitive, rejected as unknown
+            ("br", 415),  # Unknown, rejected
+            ("deflate", 415),  # Unknown, rejected
         ],
     )
     async def test_encoding_values(

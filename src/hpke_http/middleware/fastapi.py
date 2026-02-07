@@ -297,6 +297,19 @@ class HPKEMiddleware:
             )
             return
 
+        # Reject unknown encoding values (Fix #5)
+        if encoding_header and encoding_header not in _KNOWN_ENCODINGS:
+            _logger.debug(
+                "Rejected unknown encoding: method=%s path=%s encoding=%s",
+                method,
+                path,
+                encoding_header,
+            )
+            await self._send_error(
+                send, 415, f"Unsupported encoding: {encoding_header.decode('ascii', errors='replace')}"
+            )
+            return
+
         # Decrypt request AND wrap send for response encryption
         # Track if response has started so we know if we can send error responses
         response_started = False
