@@ -55,6 +55,7 @@ from hpke_http._logging import get_logger
 from hpke_http.constants import (
     CHUNK_SIZE,
     HEADER_HPKE_CONTENT_TYPE,
+    HEADER_HPKE_ERROR,
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     KemId,
@@ -765,9 +766,12 @@ class HPKEAsyncClient(BaseHPKEClient):
                 # SSE: keep stream open for iter_sse() to consume progressively
                 _logger.debug("SSE streaming response: url=%s", url)
             elif self.require_encryption:
-                # We sent encrypted request but got plaintext response
-                await response.aclose()
-                raise EncryptionRequiredError("Response was not encrypted")
+                # Allow error responses from HPKE middleware through (they can't be encrypted)
+                if HEADER_HPKE_ERROR not in response.headers:
+                    await response.aclose()
+                    raise EncryptionRequiredError("Response was not encrypted")
+                _logger.debug("HPKE error response (plaintext): url=%s", url)
+                await response.aread()
             else:
                 # Unencrypted response (e.g. HEAD with no body, or public endpoint)
                 _logger.debug("Plaintext response from encrypted request: url=%s", url)

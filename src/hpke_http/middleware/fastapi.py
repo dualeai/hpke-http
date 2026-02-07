@@ -48,6 +48,7 @@ from hpke_http.constants import (
     HEADER_HPKE_CONTENT_TYPE,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
+    HEADER_HPKE_ERROR,
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
     KDF_ID,
@@ -851,6 +852,7 @@ class HPKEMiddleware:
         headers: list[tuple[bytes, bytes]] = [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),
+            (HEADER_HPKE_ERROR.lower().encode(), b"true"),
         ]
         if extra_headers:
             headers.extend(extra_headers)

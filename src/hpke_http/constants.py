@@ -169,6 +169,14 @@ recipient so the server knows which PSK to use. The middleware stores the decode
 value in scope["hpke_psk_id"] for use by the psk_resolver callback.
 """
 
+HEADER_HPKE_ERROR: Final[str] = "X-HPKE-Error"
+"""Header indicating an error response from HPKE middleware.
+
+Set to "true" on all error responses (400, 401, 415, 426) from the middleware.
+Clients with require_encryption=True use this to distinguish middleware errors
+(which can't be encrypted) from plaintext pass-through responses.
+"""
+
 RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"
 """Export label for deriving response encryption key from HPKE context."""
 

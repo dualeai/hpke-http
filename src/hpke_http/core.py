@@ -55,6 +55,7 @@ from hpke_http.constants import (
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
+    HEADER_HPKE_ERROR,
     HEADER_HPKE_STREAM,
     MAX_CHUNK_WIRE_SIZE,
     RAW_LENGTH_PREFIX_SIZE,
@@ -732,7 +733,9 @@ class BaseHPKEClient(ABC):
             if "text/event-stream" not in str(content_type):
                 return True
         elif self.require_encryption:
-            raise EncryptionRequiredError("Response was not encrypted")
+            # Allow error responses from HPKE middleware through (they can't be encrypted)
+            if HEADER_HPKE_ERROR.lower() not in {str(k).lower() for k in response_headers}:
+                raise EncryptionRequiredError("Response was not encrypted")
 
         return False
 
