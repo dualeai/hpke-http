@@ -36,6 +36,7 @@ from hpke_http.constants import (
     GZIP_COMPRESSION_LEVEL,
     GZIP_STREAMING_CHUNK_SIZE,
     GZIP_STREAMING_THRESHOLD,
+    MAX_DECOMPRESSED_CHUNK_SIZE,
     RAW_LENGTH_PREFIX_SIZE,
     SSE_COUNTER_SIZE,
     SSE_MAX_COUNTER,
@@ -935,6 +936,11 @@ class ChunkDecryptor:
                 plaintext = encoded_payload
             case _:
                 raise DecryptionError(f"Unknown encoding: 0x{encoding_id:02x}")
+
+        # DoS protection: cap decompressed chunk size (zip-bomb prevention)
+        # Only applies to compressed data — identity encoding is already bounded by CHUNK_SIZE
+        if encoding_id != SSEEncodingId.IDENTITY and len(plaintext) > MAX_DECOMPRESSED_CHUNK_SIZE:
+            raise DecryptionError(f"Decompressed chunk too large: {len(plaintext)} > {MAX_DECOMPRESSED_CHUNK_SIZE}")
 
         # Increment expected counter
         self.expected_counter += 1

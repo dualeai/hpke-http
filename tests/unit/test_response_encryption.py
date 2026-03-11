@@ -15,7 +15,16 @@ from hpke_http.streaming import (
     RawFormat,
     SSEFormat,
     StreamingSession,
+    import_zstd,
 )
+
+_zstd_available = True
+try:
+    import_zstd()
+except ImportError:
+    _zstd_available = False
+
+_requires_zstd = pytest.mark.skipif(not _zstd_available, reason="zstd not available")
 
 
 class TestRawFormat:
@@ -311,12 +320,12 @@ class TestResponseEncryptionPayloads:
         assert decrypted == original
 
 
+@_requires_zstd
 class TestResponseWithCompression:
     """Test response encryption with Zstd compression."""
 
     def test_compressed_chunk_roundtrip(self) -> None:
         """Compressed chunk should roundtrip correctly."""
-        pytest.importorskip("backports.zstd")
 
         key = b"0" * 32
         session = StreamingSession.create(key)
@@ -334,7 +343,6 @@ class TestResponseWithCompression:
 
     def test_small_chunk_not_compressed(self) -> None:
         """Small chunks should not be compressed (identity encoding)."""
-        pytest.importorskip("backports.zstd")
 
         key = b"0" * 32
         session = StreamingSession.create(key)
@@ -616,9 +624,9 @@ class TestPayloadEdgeCases:
 
         assert decrypted == b"x"
 
+    @_requires_zstd
     def test_payload_at_compression_threshold(self) -> None:
         """Payload exactly at ZSTD_MIN_SIZE triggers compression."""
-        pytest.importorskip("backports.zstd")
         from hpke_http.constants import ZSTD_MIN_SIZE
 
         key = b"0" * 32
@@ -633,9 +641,9 @@ class TestPayloadEdgeCases:
 
         assert decrypted == payload
 
+    @_requires_zstd
     def test_payload_just_under_compression_threshold(self) -> None:
         """Payload just under ZSTD_MIN_SIZE doesn't compress."""
-        pytest.importorskip("backports.zstd")
         from hpke_http.constants import ZSTD_MIN_SIZE
 
         key = b"0" * 32

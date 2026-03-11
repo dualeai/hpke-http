@@ -7,13 +7,24 @@ Uses fixtures from conftest.py:
 - wrong_psk: different PSK for failure tests
 """
 
+import base64
 import secrets
+import struct
+import time
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import x25519
 
-from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_ENC, HEADER_HPKE_STREAM
+from hpke_http.constants import (
+    CHUNK_SIZE,
+    DISCOVERY_CACHE_MAX_ENTRIES,
+    HEADER_HPKE_ENC,
+    HEADER_HPKE_STREAM,
+    MAX_CHUNK_WIRE_SIZE,
+    KemId,
+)
 from hpke_http.core import (
+    BaseHPKEClient,
     RequestDecryptor,
     RequestEncryptor,
     ResponseDecryptor,
@@ -24,8 +35,9 @@ from hpke_http.core import (
     SSELineParser,
     _ChunkStreamParser,  # pyright: ignore[reportPrivateUsage]
     is_sse_response,
+    parse_discovery_keys,
 )
-from hpke_http.exceptions import DecryptionError, InvalidPSKError
+from hpke_http.exceptions import DecryptionError, InvalidPSKError, KeyDiscoveryError
 from hpke_http.hpke import RecipientContext, SenderContext
 
 # =============================================================================
@@ -1097,7 +1109,7 @@ class TestReplayAttackProtection:
 
         # Encrypt 3 events
         event0 = sse_enc.encrypt(b"event0")
-        _event1 = sse_enc.encrypt(b"event1")  # Intentionally skipped
+        sse_enc.encrypt(b"event1")  # Intentionally skipped
         event2 = sse_enc.encrypt(b"event2")
 
         # Extract data fields
@@ -1300,3 +1312,318 @@ class TestCrossSessionAttacks:
         resp_dec = ResponseDecryptor(resp_headers, req_enc2.context)
         with pytest.raises(DecryptionError):
             resp_dec.decrypt_all(encrypted_resp)
+
+
+# =============================================================================
+# TEST: _ChunkStreamParser Max Chunk Size Cap (Fix #1)
+# =============================================================================
+
+
+class TestChunkStreamParserLimits:
+    """Tests for chunk length cap in _ChunkStreamParser (Fix #1)."""
+
+    def test_valid_chunk_accepted(
+        self, client_keypair: tuple[bytes, bytes], test_psk: bytes, test_psk_id: bytes
+    ) -> None:
+        """Normal 64KB chunk parses successfully."""
+        _, pk = client_keypair
+        encryptor = RequestEncryptor(pk, test_psk, test_psk_id)
+        encrypted = encryptor.encrypt_all(b"x" * CHUNK_SIZE)
+        parser = _ChunkStreamParser()
+        chunks = list(parser.feed(encrypted))
+        assert len(chunks) >= 1
+
+    def test_multi_chunk_body_works(
+        self, client_keypair: tuple[bytes, bytes], test_psk: bytes, test_psk_id: bytes
+    ) -> None:
+        """Multi-chunk body (>64KB) still works."""
+        _, pk = client_keypair
+        encryptor = RequestEncryptor(pk, test_psk, test_psk_id)
+        encrypted = encryptor.encrypt_all(b"x" * (CHUNK_SIZE + 100))
+        parser = _ChunkStreamParser()
+        chunks = list(parser.feed(encrypted))
+        assert len(chunks) >= 2
+
+    def test_max_length_rejected(self) -> None:
+        """Length prefix of 0xFFFFFFFF (4GB) raises DecryptionError immediately."""
+        parser = _ChunkStreamParser()
+        # Craft raw bytes with absurd length prefix
+        bad_data = struct.pack(">I", 0xFFFFFFFF) + b"\x00" * 100
+        with pytest.raises(DecryptionError, match="Chunk too large"):
+            list(parser.feed(bad_data))
+
+    def test_1mb_length_rejected(self) -> None:
+        """Length prefix of 1MB raises DecryptionError."""
+        parser = _ChunkStreamParser()
+        bad_data = struct.pack(">I", 1_000_000) + b"\x00" * 100
+        with pytest.raises(DecryptionError, match="Chunk too large"):
+            list(parser.feed(bad_data))
+
+    def test_at_limit_plus_one_rejected(self) -> None:
+        """Length prefix at MAX_CHUNK_WIRE_SIZE + 1 is rejected."""
+        parser = _ChunkStreamParser()
+        bad_data = struct.pack(">I", MAX_CHUNK_WIRE_SIZE + 1) + b"\x00" * 100
+        with pytest.raises(DecryptionError, match="Chunk too large"):
+            list(parser.feed(bad_data))
+
+    def test_at_limit_accepted(self) -> None:
+        """Length prefix exactly at MAX_CHUNK_WIRE_SIZE is accepted (waits for data)."""
+        parser = _ChunkStreamParser()
+        # Feed length prefix = MAX_CHUNK_WIRE_SIZE, but not enough data.
+        # Parser should NOT raise, just buffer (waiting for more data)
+        data = struct.pack(">I", MAX_CHUNK_WIRE_SIZE) + b"\x00" * 10
+        chunks = list(parser.feed(data))
+        assert chunks == []  # Not enough data to complete chunk
+
+    def test_zero_length_chunk(self) -> None:
+        """Length prefix of 0 yields empty-payload chunk."""
+        parser = _ChunkStreamParser()
+        data = struct.pack(">I", 0)
+        chunks = list(parser.feed(data))
+        assert len(chunks) == 1
+        assert chunks[0] == struct.pack(">I", 0)  # Just the length prefix
+
+
+# =============================================================================
+# TEST: parse_discovery_keys Validation (Fix #6, #9)
+# =============================================================================
+
+
+class TestParseDiscoveryKeysValidation:
+    """Tests for parse_discovery_keys validation (Fix #6, #9)."""
+
+    def test_valid_response(self) -> None:
+        """Valid discovery response parses correctly."""
+        # Create a valid public key (32 bytes for X25519)
+        pk_b64 = base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode()
+        response: dict[str, object] = {
+            "version": 1,
+            "keys": [{"kem_id": "0x0020", "public_key": pk_b64}],
+        }
+        result = parse_discovery_keys(response)  # type: ignore[arg-type]
+        assert KemId.DHKEM_X25519_HKDF_SHA256 in result
+
+    def test_empty_keys_list(self) -> None:
+        """Empty keys list returns empty dict."""
+        result = parse_discovery_keys({"version": 1, "keys": []})
+        assert result == {}
+
+    def test_missing_keys_field(self) -> None:
+        """Missing keys field returns empty dict."""
+        result = parse_discovery_keys({"version": 1})
+        assert result == {}
+
+    def test_missing_kem_id_raises(self) -> None:
+        """Missing kem_id raises KeyDiscoveryError."""
+        pk_b64 = base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode()
+        response: dict[str, object] = {"keys": [{"public_key": pk_b64}]}
+        with pytest.raises(KeyDiscoveryError, match="Malformed key entry"):
+            parse_discovery_keys(response)  # type: ignore[arg-type]
+
+    def test_missing_public_key_raises(self) -> None:
+        """Missing public_key raises KeyDiscoveryError."""
+        response: dict[str, object] = {"keys": [{"kem_id": "0x0020"}]}
+        with pytest.raises(KeyDiscoveryError, match="Malformed key entry"):
+            parse_discovery_keys(response)  # type: ignore[arg-type]
+
+    def test_invalid_kem_id_hex_raises(self) -> None:
+        """Invalid kem_id hex raises KeyDiscoveryError."""
+        pk_b64 = base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode()
+        response: dict[str, object] = {"keys": [{"kem_id": "not-hex", "public_key": pk_b64}]}
+        with pytest.raises(KeyDiscoveryError, match="Malformed key entry"):
+            parse_discovery_keys(response)  # type: ignore[arg-type]
+
+    def test_kem_id_as_integer_raises(self) -> None:
+        """kem_id as integer (not string) raises KeyDiscoveryError."""
+        pk_b64 = base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode()
+        response: dict[str, object] = {"keys": [{"kem_id": 32, "public_key": pk_b64}]}
+        with pytest.raises(KeyDiscoveryError, match="Malformed key entry"):
+            parse_discovery_keys(response)  # type: ignore[arg-type]
+
+    def test_extra_fields_ignored(self) -> None:
+        """Extra unknown fields in key entry are ignored."""
+        pk_b64 = base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode()
+        response: dict[str, object] = {"keys": [{"kem_id": "0x0020", "public_key": pk_b64, "foo": "bar"}]}
+        result = parse_discovery_keys(response)  # type: ignore[arg-type]
+        assert KemId.DHKEM_X25519_HKDF_SHA256 in result
+
+    # Fix #9: Version validation
+
+    def test_version_1_accepted(self) -> None:
+        """version: 1 is accepted."""
+        result = parse_discovery_keys({"version": 1, "keys": []})
+        assert result == {}
+
+    def test_no_version_accepted(self) -> None:
+        """Missing version field is accepted (backwards compat)."""
+        result = parse_discovery_keys({"keys": []})
+        assert result == {}
+
+    def test_version_2_rejected(self) -> None:
+        """version: 2 raises KeyDiscoveryError."""
+        with pytest.raises(KeyDiscoveryError, match="Unsupported discovery version"):
+            parse_discovery_keys({"version": 2, "keys": []})
+
+    def test_version_0_rejected(self) -> None:
+        """version: 0 raises KeyDiscoveryError."""
+        with pytest.raises(KeyDiscoveryError, match="Unsupported discovery version"):
+            parse_discovery_keys({"version": 0, "keys": []})
+
+    def test_version_negative_rejected(self) -> None:
+        """version: -1 raises KeyDiscoveryError."""
+        with pytest.raises(KeyDiscoveryError, match="Unsupported discovery version"):
+            parse_discovery_keys({"version": -1, "keys": []})
+
+    def test_version_string_rejected(self) -> None:
+        """version: '1' (string) is not == 1 (int), rejected."""
+        with pytest.raises(KeyDiscoveryError, match="Unsupported discovery version"):
+            parse_discovery_keys({"version": "1", "keys": []})
+
+
+# =============================================================================
+# TEST: _key_cache Eviction (Fix #4)
+# =============================================================================
+
+
+class _MockHPKEClient(BaseHPKEClient):
+    """Mock client for testing cache behavior."""
+
+    def __init__(
+        self,
+        base_url: str = "http://test.example.com",
+        psk: bytes = b"x" * 32,
+        psk_id: bytes = b"test",
+    ) -> None:
+        import weakref
+
+        super().__init__(base_url=base_url, psk=psk, psk_id=psk_id)
+        self._response_contexts = weakref.WeakKeyDictionary()  # type: ignore[assignment]
+
+    async def _fetch_discovery(self) -> tuple[dict[str, object], str, str]:
+        return (
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "kem_id": "0x0020",
+                        "public_key": base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode(),
+                    }
+                ],
+            },
+            "max-age=60",
+            "identity",
+        )
+
+
+class TestKeyCacheEviction:
+    """Tests for _key_cache eviction (Fix #4)."""
+
+    @pytest.fixture(autouse=True)
+    def clean_cache(self) -> None:  # type: ignore[misc]
+        """Clear class-level cache before each test."""
+        BaseHPKEClient._key_cache.clear()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        BaseHPKEClient._cache_lock = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        yield  # type: ignore[misc]
+        BaseHPKEClient._key_cache.clear()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        BaseHPKEClient._cache_lock = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def test_expired_entry_triggers_refetch(self) -> None:
+        """Expired entry for queried host triggers re-fetch from discovery."""
+        # Pre-populate cache with expired entry for the host the mock client queries
+        BaseHPKEClient._key_cache["test.example.com"] = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            {KemId.DHKEM_X25519_HKDF_SHA256: b"\x01" * 32},
+            set(),
+            time.time() - 100,  # Expired 100 seconds ago
+        )
+        assert "test.example.com" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        client = _MockHPKEClient()
+        keys = await client._ensure_keys()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        # Entry should be refreshed (re-fetched from discovery, not stale)
+        assert "test.example.com" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert keys == {KemId.DHKEM_X25519_HKDF_SHA256: b"\x01" * 32}
+
+    async def test_valid_entries_preserved(self) -> None:
+        """Valid (non-expired) entries are NOT evicted."""
+        BaseHPKEClient._key_cache["valid-host:443"] = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            {KemId.DHKEM_X25519_HKDF_SHA256: b"\x02" * 32},
+            set(),
+            time.time() + 3600,  # Expires in 1 hour
+        )
+
+        client = _MockHPKEClient()
+        await client._ensure_keys()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        # Valid entry should still be there
+        assert "valid-host:443" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def test_lru_eviction_when_full(self) -> None:
+        """When cache exceeds DISCOVERY_CACHE_MAX_ENTRIES, oldest entries are evicted."""
+        # Fill cache to exactly DISCOVERY_CACHE_MAX_ENTRIES
+        for i in range(DISCOVERY_CACHE_MAX_ENTRIES):
+            BaseHPKEClient._key_cache[f"host-{i}:443"] = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                {KemId.DHKEM_X25519_HKDF_SHA256: b"\x01" * 32},
+                set(),
+                time.time() + 3600,
+            )
+
+        client = _MockHPKEClient()
+        await client._ensure_keys()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        # Cache should be at max — new entry added, oldest evicted
+        assert len(BaseHPKEClient._key_cache) == DISCOVERY_CACHE_MAX_ENTRIES  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        # New entry present
+        assert "test.example.com" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        # Oldest entry (host-0) evicted via LRU
+        assert "host-0:443" not in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        # Second-oldest still present (only 1 evicted to make room)
+        assert "host-1:443" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def test_lru_access_refreshes_ordering(self) -> None:
+        """Accessing a cache entry promotes it, so it survives eviction over older entries."""
+        # Fill cache to max with valid entries: host-0 (oldest) through host-999 (newest)
+        for i in range(DISCOVERY_CACHE_MAX_ENTRIES):
+            BaseHPKEClient._key_cache[f"host-{i}:443"] = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                {KemId.DHKEM_X25519_HKDF_SHA256: b"\x01" * 32},
+                set(),
+                time.time() + 3600,
+            )
+
+        # Access host-0 (the oldest) — this promotes it to MRU via move_to_end
+        client_0 = _MockHPKEClient(base_url="http://host-0:443")
+        await client_0._ensure_keys()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        # Now insert a new entry — should evict host-1 (now the LRU), NOT host-0
+        client_new = _MockHPKEClient()
+        await client_new._ensure_keys()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        # host-0 survived (it was promoted by access)
+        assert "host-0:443" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        # host-1 was evicted (it became the oldest after host-0 was promoted)
+        assert "host-1:443" not in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        # New entry present
+        assert "test.example.com" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def test_fetch_failure_preserves_expired_entry(self) -> None:
+        """If _fetch_discovery() fails, the expired entry stays in cache (not permanently lost)."""
+        from hpke_http.exceptions import KeyDiscoveryError
+
+        # Pre-populate cache with expired entry
+        BaseHPKEClient._key_cache["fail.example.com"] = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            {KemId.DHKEM_X25519_HKDF_SHA256: b"\x99" * 32},
+            set(),
+            time.time() - 100,  # Expired
+        )
+
+        # Create a client whose _fetch_discovery() raises
+        class _FailingClient(_MockHPKEClient):
+            async def _fetch_discovery(self) -> tuple[dict[str, object], str, str]:
+                raise KeyDiscoveryError("Server unreachable")
+
+        client = _FailingClient(base_url="http://fail.example.com")
+        with pytest.raises(KeyDiscoveryError):
+            await client._ensure_keys()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        # Expired entry is still in cache (not permanently lost)
+        assert "fail.example.com" in BaseHPKEClient._key_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]

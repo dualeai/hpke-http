@@ -55,7 +55,15 @@ from typing_extensions import Self
 from yarl import URL
 
 from hpke_http._logging import get_logger
-from hpke_http.constants import CHUNK_SIZE, HEADER_HPKE_CONTENT_TYPE, HEADER_HPKE_PSK_ID, HEADER_HPKE_STREAM, KemId
+from hpke_http.constants import (
+    CHUNK_SIZE,
+    HEADER_HPKE_CONTENT_TYPE,
+    HEADER_HPKE_ERROR,
+    HEADER_HPKE_PSK_ID,
+    HEADER_HPKE_STREAM,
+    EncodingName,
+    KemId,
+)
 from hpke_http.core import (
     BaseHPKEClient,
     RequestEncryptor,
@@ -469,10 +477,10 @@ class HPKEClientSession(BaseHPKEClient):
 
                 data = await resp.json()
                 cache_control = resp.headers.get("Cache-Control", "")
-                accept_encoding = resp.headers.get("Accept-Encoding", "identity")
+                accept_encoding = resp.headers.get("Accept-Encoding", EncodingName.IDENTITY)
                 return (data, cache_control, accept_encoding)
 
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, ValueError) as e:
             _logger.debug("Key discovery failed: host=%s error=%s", self.base_url, e)
             raise KeyDiscoveryError(f"Failed to fetch keys: {e}") from e
 
@@ -688,8 +696,10 @@ class HPKEClientSession(BaseHPKEClient):
                         release_encrypted=self._release_encrypted,
                     )
             elif self.require_encryption:
-                # We sent encrypted request but got plaintext response
-                raise EncryptionRequiredError("Response was not encrypted")
+                # Allow error responses from HPKE middleware through (they can't be encrypted)
+                if HEADER_HPKE_ERROR not in response.headers:
+                    raise EncryptionRequiredError("Response was not encrypted")
+                _logger.debug("HPKE error response (plaintext): url=%s", url)
             else:
                 # Unencrypted response (e.g. HEAD with no body, or public endpoint)
                 _logger.debug("Plaintext response from encrypted request: url=%s", url)
@@ -787,6 +797,13 @@ class HPKEClientSession(BaseHPKEClient):
                 "Ensure the request was made through this HPKEClientSession instance."
             )
 
+        # Validate that response is actually an encrypted SSE stream (Fix #12)
+        if HEADER_HPKE_STREAM not in response.headers:
+            raise RuntimeError(
+                "Response is not an encrypted SSE stream (missing X-HPKE-Stream header). "
+                "Use .json() or .text for standard responses."
+            )
+
         # Use centralized SSEDecryptor - handles header parsing and key derivation
         decryptor = SSEDecryptor(response.headers, sender_ctx)
         _logger.debug("SSE decryption started: url=%s", response.url)
@@ -809,5 +826,6 @@ class HPKEClientSession(BaseHPKEClient):
                     else:
                         current_event_lines.append(line)
         finally:
-            # Clean up response context
+            # Clean up response context and release connection back to pool
             self._response_contexts.pop(response, None)
+            response.release()
