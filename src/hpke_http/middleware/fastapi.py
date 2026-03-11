@@ -424,8 +424,6 @@ class HPKEMiddleware:
             if encryptor is None or parser is None:
                 raise CryptoError("SSE encryption state corrupted")
 
-            sent_any = False
-
             if body:
                 # DoS protection: track buffer size
                 state.sse_buffer_size += len(body)
@@ -442,7 +440,6 @@ class HPKEMiddleware:
                             "more_body": True,
                         }
                     )
-                    sent_any = True
                     # Reset size tracking after each event
                     state.sse_buffer_size = 0
 
@@ -459,8 +456,8 @@ class HPKEMiddleware:
                             "more_body": False,
                         }
                     )
-                elif not sent_any:
-                    # Send empty final body if nothing was sent
+                else:
+                    # Always forward stream termination
                     await send(
                         {
                             "type": "http.response.body",
