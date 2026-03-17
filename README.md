@@ -35,17 +35,18 @@ Standard JSON requests, SSE (Server-Sent Events) streaming, and file uploads are
 ```python
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+from starlette.exceptions import HTTPException
 from hpke_http.middleware.fastapi import HPKEMiddleware
 from hpke_http.constants import KemId
 
 app = FastAPI()
 
 async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
-    # Get derived PSK ID from X-HPKE-PSK-ID header (already decoded)
     psk_id = scope.get("hpke_psk_id")
-    # Look up API key by its derived ID (see "PSK Authentication" section)
-    record = await db.lookup_by_derived_id(psk_id)  # Returns {psk, tenant_id}
-    scope["tenant_id"] = record["tenant_id"]  # For authorization
+    record = await db.lookup_by_derived_id(psk_id)
+    if record is None:
+        raise HTTPException(401, "Unknown API key")  # Forwarded to client
+    scope["tenant_id"] = record["tenant_id"]
     return (record["psk"], psk_id)
 
 app.add_middleware(
@@ -229,6 +230,7 @@ async with HPKEClientSession(
 
 ```python
 import hashlib
+from starlette.exceptions import HTTPException
 
 # Key creation: store derived_id → {psk, tenant_id}
 derived_id = hashlib.sha256(api_key).digest()
@@ -238,9 +240,56 @@ db.store(derived_id, {"psk": api_key, "tenant_id": tenant_id})
 async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
     derived_id = scope.get("hpke_psk_id")
     record = await db.lookup(derived_id)
+    if record is None:
+        raise HTTPException(401, "Unknown API key")
     scope["tenant_id"] = record["tenant_id"]
     return (record["psk"], derived_id)
 ```
+
+### Error Handling
+
+The `psk_resolver` controls error responses by raising exceptions:
+
+| Exception | Status | Behavior |
+|-----------|--------|----------|
+| `HTTPException(status, detail)` | User-defined | Forwarded to client with status code, detail, and headers |
+| Any other exception | 401 | Generic "PSK authentication failed" |
+
+```python
+from starlette.exceptions import HTTPException
+
+async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
+    psk_id = scope.get("hpke_psk_id")
+
+    # Token revoked — tell the client exactly what happened
+    record = await db.lookup(psk_id)
+    if record is None:
+        raise HTTPException(401, "Unknown API key")
+    if record["revoked"]:
+        raise HTTPException(401, "API key revoked")
+
+    # Authorization check — different status code
+    if not record["scopes"].issuperset(required_scopes):
+        raise HTTPException(403, "Insufficient permissions")
+
+    # Backend unavailable — signal transient failure
+    if not await auth_service.healthy():
+        raise HTTPException(503, "Auth service unavailable")
+
+    return (record["psk"], psk_id)
+```
+
+Standard HTTP headers are forwarded too:
+
+```python
+raise HTTPException(
+    401,
+    "Bearer token required",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+```
+
+This works identically for both encrypted and unencrypted requests.
 
 ## Wire Format
 

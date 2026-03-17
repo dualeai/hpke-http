@@ -274,8 +274,8 @@ class TestAuthenticationFailures:
             psk_id=wrong_psk_id,
         ) as bad_client:
             resp = await bad_client.post("/echo", json={"test": 1})
-            # Server should reject with decryption failure
-            assert resp.status == 400
+            # wrong_psk_id not in server's PSK store → psk_resolver raises → 401
+            assert resp.status == 401
 
 
 class TestSSEEncryption:

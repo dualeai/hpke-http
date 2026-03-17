@@ -36,6 +36,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives.asymmetric import x25519
+from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from hpke_http._logging import get_logger
@@ -136,10 +137,15 @@ PSKResolver = Callable[[Scope], Awaitable[tuple[bytes, bytes]]]
 Callback to resolve PSK and PSK ID from request scope.
 
 Args:
-    scope: ASGI scope dict
+    scope: ASGI scope dict (includes ``hpke_psk_id`` from X-HPKE-PSK-ID header)
 
 Returns:
     Tuple of (psk, psk_id) - typically (api_key, tenant_id)
+
+Raises:
+    HTTPException: Forwarded to client with status code, detail, and headers.
+        Use this for specific error responses (401, 403, 503, etc.).
+    Exception: Any other exception returns 401 "PSK authentication failed".
 """
 
 
@@ -175,7 +181,9 @@ class HPKEMiddleware:
         Args:
             app: ASGI application
             private_keys: Private keys by KEM ID (e.g., {KemId.DHKEM_X25519_HKDF_SHA256: sk})
-            psk_resolver: Async callback to get (psk, psk_id) from request scope
+            psk_resolver: Async callback to get (psk, psk_id) from request scope.
+                Raise HTTPException for specific error responses (401, 403, etc.).
+                Any other exception returns 401 "PSK authentication failed".
             discovery_path: Path for key discovery endpoint
             max_sse_event_size: Maximum SSE event buffer size in bytes (default 64MB).
                 This is a DoS protection for malformed events without proper \\n\\n boundaries.
@@ -266,6 +274,9 @@ class HPKEMiddleware:
                 return
             try:
                 await self.psk_resolver(scope)
+            except HTTPException as e:
+                await self._send_http_exception(send, e, method, path)
+                return
             except Exception:  # noqa: BLE001 - psk_resolver is user callback
                 _logger.debug("PSK resolution failed: method=%s path=%s", method, path)
                 await self._send_error(send, 401, "PSK authentication failed")
@@ -308,7 +319,6 @@ class HPKEMiddleware:
             )
             return
 
-        # Decrypt request AND wrap send for response encryption
         # Track if response has started so we know if we can send error responses
         response_started = False
 
@@ -318,8 +328,25 @@ class HPKEMiddleware:
                 response_started = True
             await send(message)
 
+        # Set up decryption (PSK resolution + crypto context)
+        # Separated from app execution so psk_resolver errors don't catch app exceptions
         try:
             decrypted_receive = await self._create_decrypted_receive(scope, receive, enc_header)
+        except HTTPException as e:
+            await self._send_http_exception(send, e, method, path)
+            return
+        except CryptoError as e:
+            # Real crypto failure (missing headers, bad format, etc.)
+            _logger.debug("Decryption setup failed: method=%s path=%s error_type=%s", method, path, type(e).__name__)
+            await self._send_error(send, 400, "Request decryption failed")
+            return
+        except Exception:  # noqa: BLE001 - psk_resolver is user callback
+            _logger.debug("PSK resolution failed: method=%s path=%s", method, path)
+            await self._send_error(send, 401, "PSK authentication failed")
+            return
+
+        # Process request with encryption
+        try:
             encrypting_send = self._create_encrypting_send(scope, tracked_send)
             await self.app(scope, decrypted_receive, encrypting_send)
         except CryptoError as e:
@@ -577,14 +604,17 @@ class HPKEMiddleware:
         """
         Set up HPKE decryption context and return request decryptor.
 
-        Resolves PSK asynchronously, creates RequestDecryptor with headers,
+        Resolves PSK via psk_resolver, creates RequestDecryptor with headers,
         and stores context in scope for response encryption.
+
+        Exceptions from psk_resolver propagate to the caller, which
+        distinguishes HTTPException (forwarded), CryptoError (400),
+        and generic Exception (401).
         """
         # Get PSK from resolver (async)
-        try:
-            psk, psk_id = await self.psk_resolver(scope)
-        except Exception as e:
-            raise DecryptionError(f"PSK resolution failed: {e}") from e
+        # Let psk_resolver exceptions propagate — caller distinguishes
+        # auth failures (non-CryptoError → 401) from crypto errors (→ 400)
+        psk, psk_id = await self.psk_resolver(scope)
 
         # Get private key for the KEM (default X25519)
         kem_id = KemId.DHKEM_X25519_HKDF_SHA256
@@ -624,10 +654,11 @@ class HPKEMiddleware:
         receive: Receive,
     ) -> bytes:
         """
-        Read and decrypt first chunk to validate PSK/key before app starts.
+        Read and decrypt first chunk to validate key before app starts.
 
-        This ensures decryption errors return 400 (Bad Request) instead of
-        500 (Server Error). Returns the decrypted first chunk.
+        AEAD verification on the first chunk catches wrong-key errors early,
+        returning 400 via the caller's CryptoError handler. Returns the
+        decrypted first chunk (empty bytes for empty bodies).
         """
         while True:
             # Need more data from HTTP layer
@@ -840,6 +871,18 @@ class HPKEMiddleware:
                 pending_chunks.extend(state.decryptor.feed(body))
 
         return decrypted_receive
+
+    async def _send_http_exception(
+        self,
+        send: Send,
+        exc: HTTPException,
+        method: str,
+        path: str,
+    ) -> None:
+        """Forward an HTTPException from psk_resolver as an error response."""
+        _logger.debug("PSK resolver HTTP error: method=%s path=%s status=%d", method, path, exc.status_code)
+        extra_headers = [(k.encode(), v.encode()) for k, v in exc.headers.items()] if exc.headers else None
+        await self._send_error(send, exc.status_code, str(exc.detail), extra_headers=extra_headers)
 
     async def _send_error(
         self,

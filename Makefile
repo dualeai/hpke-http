@@ -41,6 +41,10 @@ version-pypi:
 install:
 	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
+	# Code search using seek (trigram index via zoekt, sub-second queries)
+	# Usage: seek "pattern" (on PATH via direnv)
+	# See: https://github.com/dualeai/seek
+	@curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
 
 install-deps:
 	uv sync --extra dev --extra fastapi --extra aiohttp --extra httpx --extra zstd
