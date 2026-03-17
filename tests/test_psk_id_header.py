@@ -5,13 +5,14 @@ Tests that the PSK ID is correctly:
 - Parsed by server middleware and stored in scope["hpke_psk_id"]
 - Available to psk_resolver for PSK lookup
 - Sent on bodyless requests (GET, DELETE, HEAD) for auth
-- Rejected when missing, unknown, or malformed
+- Rejected when missing, unknown, or malformed (401 for auth, 400 for format)
+- HTTPException from psk_resolver forwarded with user's status code
 """
 
 import aiohttp
 import pytest
 
-from hpke_http.constants import HEADER_HPKE_PSK_ID
+from hpke_http.constants import HEADER_HPKE_ERROR, HEADER_HPKE_PSK_ID
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.middleware.aiohttp import HPKEClientSession
 from hpke_http.middleware.httpx import HPKEAsyncClient
@@ -111,11 +112,10 @@ class TestPSKIDHeaderE2E:
         psk_id: bytes,
         description: str,
     ) -> None:
-        """Edge case PSK ID values work correctly.
+        """Edge case PSK ID values are sent correctly but rejected by psk_resolver.
 
-        Note: These tests use different PSK IDs than the server expects,
-        so they will fail at the crypto level (PSK ID is part of HPKE context).
-        We're testing that the header is sent correctly.
+        These PSK IDs are not in the server's PSK store, so psk_resolver
+        raises ValueError → middleware returns 401.
         """
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
@@ -124,11 +124,9 @@ class TestPSKIDHeaderE2E:
             psk=test_psk,
             psk_id=psk_id,  # Different from server's test_psk_id
         ) as client:
-            # This should fail with 400 because PSK ID doesn't match server
-            # The important thing is that the header was sent (not a header format error)
+            # psk_resolver raises ValueError for unknown PSK ID → 401
             resp = await client.post("/echo", json={"test": "edge_case"})
-            # Decryption will fail because psk_id is part of HPKE info parameter
-            assert resp.status == 400, f"Expected 400 for mismatched PSK ID ({description})"
+            assert resp.status == 401, f"Expected 401 for unknown PSK ID ({description})"
 
 
 class TestPSKIDMismatch:
@@ -142,8 +140,7 @@ class TestPSKIDMismatch:
     ) -> None:
         """Request with different PSK ID than server expects is rejected.
 
-        PSK ID is used in HPKE's info parameter, so mismatched IDs will
-        derive different keys and decryption will fail.
+        PSK ID is not in the server's PSK store, so psk_resolver raises ValueError → 401.
         """
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
@@ -153,8 +150,7 @@ class TestPSKIDMismatch:
             psk_id=wrong_psk_id,  # Different from server's test_psk_id
         ) as client:
             resp = await client.post("/echo", json={"test": "wrong_id"})
-            # Server should return 400 (decryption failed)
-            assert resp.status == 400
+            assert resp.status == 401
 
     async def test_psk_id_case_sensitive(
         self,
@@ -164,7 +160,7 @@ class TestPSKIDMismatch:
     ) -> None:
         """PSK ID comparison is case-sensitive.
 
-        'Tenant-123' != 'tenant-123' because it affects key derivation.
+        'Tenant-123' != 'tenant-123' — different PSK ID is not in store → 401.
         """
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
@@ -180,8 +176,7 @@ class TestPSKIDMismatch:
             psk_id=wrong_case_id,
         ) as client:
             resp = await client.post("/echo", json={"test": "case_sensitive"})
-            # Should fail because PSK ID doesn't match
-            assert resp.status == 400
+            assert resp.status == 401
 
 
 class TestBackwardsCompatibility:
@@ -343,12 +338,7 @@ class TestBodylessRequestPSKIDDeny:
         granian_server: E2EServer,
         test_psk: bytes,
     ) -> None:
-        """Bodyless GET with unknown PSK ID → psk_resolver rejects → 400.
-
-        Bodyless requests now perform HPKE encapsulation (X-HPKE-Enc header),
-        so the server middleware attempts PSK resolution and returns 400 on
-        failure (same as encrypted POST with unknown PSK ID).
-        """
+        """Bodyless GET with unknown PSK ID → psk_resolver rejects → 401."""
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEClientSession(
@@ -357,14 +347,14 @@ class TestBodylessRequestPSKIDDeny:
             psk_id=b"unknown-tenant",
         ) as client:
             resp = await client.get("/whoami")
-            assert resp.status == 400
+            assert resp.status == 401
 
     async def test_unknown_psk_id_encrypted_rejected(
         self,
         granian_server: E2EServer,
         test_psk: bytes,
     ) -> None:
-        """Encrypted POST with unknown PSK ID → psk_resolver rejects → 400."""
+        """Encrypted POST with unknown PSK ID → psk_resolver rejects → 401."""
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEClientSession(
@@ -373,7 +363,7 @@ class TestBodylessRequestPSKIDDeny:
             psk_id=b"unknown-tenant",
         ) as client:
             resp = await client.post("/echo", json={"test": "deny"})
-            assert resp.status == 400
+            assert resp.status == 401
 
     async def test_malformed_base64_psk_id_returns_400(
         self,
@@ -406,7 +396,7 @@ class TestBodylessRequestPSKIDDeny:
         test_psk: bytes,
         wrong_psk_id: bytes,
     ) -> None:
-        """httpx encrypted POST with wrong PSK ID → psk_resolver rejects → 400."""
+        """httpx encrypted POST with wrong PSK ID → psk_resolver rejects → 401."""
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEAsyncClient(
@@ -415,4 +405,108 @@ class TestBodylessRequestPSKIDDeny:
             psk_id=wrong_psk_id,
         ) as client:
             resp = await client.post("/echo", json={"test": "deny"})
-            assert resp.status_code == 400
+            assert resp.status_code == 401
+
+
+class TestPSKResolverHTTPExceptionForwarding:
+    """E2E tests for HTTPException forwarding from psk_resolver.
+
+    The e2e_server has magic PSK IDs that trigger specific HTTPExceptions:
+    - b"raise-http-401" → HTTPException(401, "Custom auth failed")
+    - b"raise-http-403" → HTTPException(403, "Forbidden by policy")
+    - b"raise-http-503" → HTTPException(503, "Service unavailable")
+    """
+
+    async def test_403_forwarded_encrypted(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+    ) -> None:
+        """Encrypted POST with magic PSK ID → psk_resolver raises HTTPException(403) → 403."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=b"raise-http-403",
+        ) as client:
+            resp = await client.post("/echo", json={"test": "http-exception"})
+            assert resp.status == 403
+
+    async def test_503_forwarded_encrypted(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+    ) -> None:
+        """Encrypted POST with magic PSK ID → HTTPException(503) → 503."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=b"raise-http-503",
+        ) as client:
+            resp = await client.post("/echo", json={"test": "http-exception"})
+            assert resp.status == 503
+
+    async def test_403_forwarded_unencrypted(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """Raw GET with magic PSK ID → psk_resolver raises HTTPException(403) → 403."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{granian_server.host}:{granian_server.port}/whoami",
+                headers={HEADER_HPKE_PSK_ID: b64url_encode(b"raise-http-403")},
+            ) as resp:
+                assert resp.status == 403
+                body = await resp.json()
+                assert body["error"] == "Forbidden by policy"
+
+    async def test_http_exception_has_hpke_error_header(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """Forwarded HTTPException responses include X-HPKE-Error header."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{granian_server.host}:{granian_server.port}/whoami",
+                headers={HEADER_HPKE_PSK_ID: b64url_encode(b"raise-http-403")},
+            ) as resp:
+                assert resp.status == 403
+                assert resp.headers.get(HEADER_HPKE_ERROR) == "true"
+
+    async def test_401_forwarded_with_custom_detail(
+        self,
+        granian_server: E2EServer,
+    ) -> None:
+        """HTTPException(401) forwarded with custom detail, not generic message.
+
+        Distinguishes forwarded HTTPException(401, "Custom auth failed") from
+        the generic fallback 401 "PSK authentication failed".
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{granian_server.host}:{granian_server.port}/whoami",
+                headers={HEADER_HPKE_PSK_ID: b64url_encode(b"raise-http-401")},
+            ) as resp:
+                assert resp.status == 401
+                body = await resp.json()
+                assert body["error"] == "Custom auth failed"
+
+    async def test_happy_path_regression(
+        self,
+        granian_server: E2EServer,
+        test_psk: bytes,
+        test_psk_id: bytes,
+    ) -> None:
+        """Valid credentials still work (regression check)."""
+        base_url = f"http://{granian_server.host}:{granian_server.port}"
+
+        async with HPKEClientSession(
+            base_url=base_url,
+            psk=test_psk,
+            psk_id=test_psk_id,
+        ) as client:
+            resp = await client.post("/echo", json={"regression": True})
+            assert resp.status == 200

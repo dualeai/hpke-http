@@ -25,6 +25,7 @@ if os.environ.get("HPKE_DISABLE_ZSTD") == "true":
 
 from starlette.applications import Starlette
 from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Mount, Route
@@ -287,9 +288,16 @@ def _create_app() -> Starlette:
     }
 
     # PSK resolver callback - strict scope-based lookup, no fallback
+    # Magic PSK IDs trigger specific HTTPExceptions for E2E testing
     async def psk_resolver(scope: Scope) -> tuple[bytes, bytes]:
         """Look up PSK by client ID from scope."""
         client_psk_id = scope.get("hpke_psk_id")
+        if client_psk_id == b"raise-http-401":
+            raise HTTPException(401, "Custom auth failed")
+        if client_psk_id == b"raise-http-403":
+            raise HTTPException(403, "Forbidden by policy")
+        if client_psk_id == b"raise-http-503":
+            raise HTTPException(503, "Service unavailable")
         if client_psk_id and client_psk_id in psk_store:
             return (psk_store[client_psk_id], client_psk_id)
         raise ValueError(f"Unknown PSK ID: {client_psk_id!r}")
