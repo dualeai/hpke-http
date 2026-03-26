@@ -36,5 +36,5 @@ jobs:
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v4
         with:
-          mode: simulation
+          mode: simulation,memory
           run: uv run pytest tests/benchmarks/ --codspeed -v --no-cov -p no:xdist -o "addopts="
