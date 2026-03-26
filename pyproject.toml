@@ -59,6 +59,7 @@ dev = [
     "twine~=6.1",                # Package verification before PyPI upload
     "typing_extensions~=4.12",   # assert_type for API contract tests (Python 3.10)
     "vulture~=2.14",
+    "pytest-codspeed~=4.3",
 ]
 # For downstream services using testing fixtures
 testing = [
@@ -119,6 +120,7 @@ markers = [
     "fuzz: Property-based fuzz tests using Hypothesis",
     "requires_root: Tests requiring root/sudo for tcpdump network capture",
     "slow: Resource-intensive tests requiring large CI runners (1GB+ payloads)",
+    "benchmark: CodSpeed performance benchmarks (run separately via codspeed.yml)",
 ]
 
 # Subprocess coverage for granian E2E tests (pytest-cov 7.x)
@@ -135,7 +137,7 @@ sigterm = true
 typeCheckingMode = "strict"
 venv = ".venv"
 venvPath = "."
-exclude = [".venv", "vulture_whitelist.py", "tests/bench*.py", "tests/benchmark*.py"]
+exclude = [".venv", "vulture_whitelist.py", "tests/benchmarks/"]
 
 [tool.ruff]
 line-length = 120
@@ -181,3 +183,4 @@ exclude = [".venv/"]  # Exclude deps
 paths = ["src", "tests", "vulture_whitelist.py"]  # Include whitelist
 min_confidence = 80  # Ignore crap detections
 sort_by_size = true  # Most impactful issues first
+

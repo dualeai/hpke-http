@@ -103,24 +103,24 @@ test-static:
 
 # All tests together for accurate coverage measurement
 test-func:
-	uv run pytest tests/ -v -n auto
+	uv run pytest tests/ -v -n auto --ignore=tests/benchmarks
 
 # CI-friendly tests (no root required, no slow tests, parallel execution)
 test-func-ci:
-	uv run pytest tests/ -v -n auto -m "not requires_root and not slow"
+	uv run pytest tests/ -v -n auto -m "not requires_root and not slow" --ignore=tests/benchmarks
 
 # Slow tests only (large payloads 1GB+, requires large CI runners)
 test-func-slow:
-	uv run pytest tests/ -v -n auto -m "slow" --no-cov
+	uv run pytest tests/ -v -n auto -m "slow" --no-cov --ignore=tests/benchmarks
 
 # Root-required tests only (tcpdump network capture, must run serial)
 # Usage: sudo make test-func-root
 test-func-root:
-	uv run pytest tests/ -v -n 0 -m "requires_root" --no-cov
+	uv run pytest tests/ -v -n 0 -m "requires_root" --no-cov --ignore=tests/benchmarks
 
 # Property-based fuzz tests (slower, more thorough)
 test-fuzz:
-	uv run pytest tests/ -v -m "fuzz" --hypothesis-show-statistics
+	uv run pytest tests/ -v -m "fuzz" --hypothesis-show-statistics --ignore=tests/benchmarks
 
 lint:
 	uv run ruff format .

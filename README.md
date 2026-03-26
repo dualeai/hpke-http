@@ -3,6 +3,7 @@
 End-to-end encryption for HTTP APIs using RFC 9180 HPKE (Hybrid Public Key Encryption). Drop-in middleware for FastAPI, aiohttp, and httpx.
 
 [![CI](https://github.com/dualeai/hpke-http/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/hpke-http/actions/workflows/test.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/hpke-http?utm_source=badge)
 [![PyPI](https://img.shields.io/pypi/v/hpke-http)](https://pypi.org/project/hpke-http/)
 [![Downloads](https://img.shields.io/pypi/dm/hpke-http)](https://pypi.org/project/hpke-http/)
 [![Python](https://img.shields.io/pypi/pyversions/hpke-http)](https://pypi.org/project/hpke-http/)
