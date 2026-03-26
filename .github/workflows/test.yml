@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
+        os: [blacksmith-2vcpu-ubuntu-2404-arm, macos-26]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
         test-step: [standard, root, slow]
 
