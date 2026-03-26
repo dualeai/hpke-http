@@ -181,3 +181,8 @@ exclude = [".venv/"]  # Exclude deps
 paths = ["src", "tests", "vulture_whitelist.py"]  # Include whitelist
 min_confidence = 80  # Ignore crap detections
 sort_by_size = true  # Most impactful issues first
+
+[dependency-groups]
+dev = [
+    "pytest-codspeed>=4.3.0",
+]
