@@ -40,3 +40,17 @@ Pitfalls:
 Install (if missing): `curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh` + `brew install universal-ctags`
 
 When spawning sub-agents, pass: "Use `seek 'pattern'` for code search. All filters in ONE quoted string. Never use grep/rg."
+
+## GitHub Actions pinning
+
+All GitHub Actions must be pinned to immutable commit SHAs, not version tags. Add an inline comment with the version for readability.
+
+```yaml
+# Good
+- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+# Bad — mutable tag, vulnerable to supply-chain attacks
+- uses: actions/checkout@v6.0.2
+```
+
+When upgrading an action, look up the commit SHA for the new tag (`gh api repos/OWNER/REPO/git/ref/tags/TAG --jq '.object.sha'`) and dereference annotated tags if needed.
