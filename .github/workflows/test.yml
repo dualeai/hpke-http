@@ -17,6 +17,9 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
         test-step: [standard, root, slow]
 
+    env:
+      JUNIT_XML: junit-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.test-step }}.xml
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -41,11 +44,23 @@ jobs:
       - name: Run tests
         if: matrix.test-step == 'standard'
         run: make test-func-ci
+        env:
+          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
 
       - name: Run root-required tests (tcpdump network capture)
         if: matrix.test-step == 'root'
-        run: sudo env "PATH=$PATH" make test-func-root
+        run: sudo env "PATH=$PATH" "PYTEST_ADDOPTS=--junit-xml=${{ env.JUNIT_XML }}" make test-func-root
 
       - name: Run slow tests (large payloads)
         if: matrix.test-step == 'slow'
         run: make test-func-slow
+        env:
+          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ env.JUNIT_XML }}
+          path: ${{ env.JUNIT_XML }}
+          if-no-files-found: ignore
