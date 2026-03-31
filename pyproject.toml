@@ -94,6 +94,14 @@ Issues = "https://github.com/dualeai/hpke-http/issues"
 requires = ["setuptools>=78.1.1"]  # Pinned for CVE-2025-47273
 build-backend = "setuptools.build_meta"
 
+[tool.uv]
+# Supply-chain protection: only resolve packages published ≥7 days ago.
+# Mitigates typosquatting and malicious-release attacks by allowing time
+# for the community and index moderators to flag bad packages.
+# Resolved to an absolute timestamp at `uv lock` time (re-run `uv lock
+# --upgrade` to advance the window).
+exclude-newer = "7 days"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["hpke_http*"]
