@@ -44,12 +44,12 @@ from hpke_http.constants import KemId
 app = FastAPI()
 
 async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
-    psk_id = scope.get("hpke_psk_id")
-    record = await db.lookup_by_derived_id(psk_id)
+    api_key_fingerprint = scope.get("hpke_psk_id")
+    record = await db.lookup_by_fingerprint(api_key_fingerprint)
     if record is None:
         raise HTTPException(401, "Unknown API key")  # Forwarded to client
     scope["tenant_id"] = record["tenant_id"]
-    return (record["psk"], psk_id)
+    return (record["psk"], api_key_fingerprint)
 
 app.add_middleware(
     HPKEMiddleware,
@@ -84,16 +84,17 @@ import hashlib
 import aiohttp
 from hpke_http.middleware.aiohttp import HPKEClientSession
 
-# Derive PSK ID from API key (see "PSK Authentication" section)
-psk_id = hashlib.sha256(api_key).digest()
+# PSK ID identifies *which* API key is in use; derive it from the key
+# itself so observers cannot link traffic by tenant (see "PSK Authentication").
+api_key_fingerprint = hashlib.sha256(api_key).digest()
 
 async with HPKEClientSession(
     base_url="https://api.example.com",
-    psk=api_key,        # >= 32 bytes
-    psk_id=psk_id,      # Derived from key, not tenant ID
-    # compress=True,           # Compression (zstd preferred, gzip fallback)
-    # require_encryption=True, # Raise if server responds unencrypted
-    # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
+    psk=api_key,                    # >= 32 bytes
+    psk_id=api_key_fingerprint,     # opaque key identifier
+    # compress=True,                # Compression (zstd preferred, gzip fallback)
+    # require_encryption=True,      # Raise if server responds unencrypted
+    # release_encrypted=True,       # Free encrypted bytes after decryption (saves memory)
 ) as session:
     # POST with JSON body
     async with session.post("/users", json={"name": "Alice"}) as resp:
@@ -121,16 +122,17 @@ async with HPKEClientSession(
 import hashlib
 from hpke_http.middleware.httpx import HPKEAsyncClient
 
-# Derive PSK ID from API key (see "PSK Authentication" section)
-psk_id = hashlib.sha256(api_key).digest()
+# PSK ID identifies *which* API key is in use; derive it from the key
+# itself so observers cannot link traffic by tenant (see "PSK Authentication").
+api_key_fingerprint = hashlib.sha256(api_key).digest()
 
 async with HPKEAsyncClient(
     base_url="https://api.example.com",
-    psk=api_key,        # >= 32 bytes
-    psk_id=psk_id,      # Derived from key, not tenant ID
-    # compress=True,           # Compression (zstd preferred, gzip fallback)
-    # require_encryption=True, # Raise if server responds unencrypted
-    # release_encrypted=True,  # Free encrypted bytes after decryption (saves memory)
+    psk=api_key,                    # >= 32 bytes
+    psk_id=api_key_fingerprint,     # opaque key identifier
+    # compress=True,                # Compression (zstd preferred, gzip fallback)
+    # require_encryption=True,      # Raise if server responds unencrypted
+    # release_encrypted=True,       # Free encrypted bytes after decryption (saves memory)
 ) as client:
     # POST with JSON body
     resp = await client.post("/users", json={"name": "Alice"})
@@ -233,12 +235,15 @@ Server with X-Wing key registered → client uses X-Wing. Server with only
 X25519 → client uses X25519. No client-side flag.
 
 ```python
+import hashlib
 from hpke_http.middleware.httpx import HPKEAsyncClient
+
+api_key_fingerprint = hashlib.sha256(api_key).digest()
 
 client = HPKEAsyncClient(
     base_url="https://api.example.com",
     psk=api_key,
-    psk_id=tenant_id,
+    psk_id=api_key_fingerprint,
 )
 ```
 
@@ -250,6 +255,7 @@ from hpke_http.constants import KemId
 client = HPKEAsyncClient(
     base_url="https://api.example.com",
     psk=api_key,
+    psk_id=api_key_fingerprint,
     kem_priority=[KemId.DHKEM_X25519_HKDF_SHA256],  # never use X-Wing
 )
 ```
@@ -403,13 +409,12 @@ sequenceDiagram
 import hashlib
 
 api_key = b"sk_live_7f3a9c..."  # Your API key (>= 32 bytes)
-# Derive PSK ID from the key itself
-psk_id = hashlib.sha256(api_key).digest()
+api_key_fingerprint = hashlib.sha256(api_key).digest()
 
 async with HPKEClientSession(
     base_url="https://api.example.com",
     psk=api_key,
-    psk_id=psk_id,
+    psk_id=api_key_fingerprint,
 ) as client:
     await client.post("/api", json=data)
 ```
@@ -420,18 +425,18 @@ async with HPKEClientSession(
 import hashlib
 from starlette.exceptions import HTTPException
 
-# Key creation: store derived_id → {psk, tenant_id}
-derived_id = hashlib.sha256(api_key).digest()
-db.store(derived_id, {"psk": api_key, "tenant_id": tenant_id})
+# Key creation: store fingerprint → {psk, tenant_id}
+api_key_fingerprint = hashlib.sha256(api_key).digest()
+db.store(api_key_fingerprint, {"psk": api_key, "tenant_id": tenant_id})
 
-# psk_resolver: lookup by derived_id from header
+# psk_resolver: lookup by fingerprint from header
 async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
-    derived_id = scope.get("hpke_psk_id")
-    record = await db.lookup(derived_id)
+    api_key_fingerprint = scope.get("hpke_psk_id")
+    record = await db.lookup(api_key_fingerprint)
     if record is None:
         raise HTTPException(401, "Unknown API key")
     scope["tenant_id"] = record["tenant_id"]
-    return (record["psk"], derived_id)
+    return (record["psk"], api_key_fingerprint)
 ```
 
 ### Error Handling
@@ -447,10 +452,10 @@ The `psk_resolver` controls error responses by raising exceptions:
 from starlette.exceptions import HTTPException
 
 async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
-    psk_id = scope.get("hpke_psk_id")
+    api_key_fingerprint = scope.get("hpke_psk_id")
 
     # Token revoked — tell the client exactly what happened
-    record = await db.lookup(psk_id)
+    record = await db.lookup(api_key_fingerprint)
     if record is None:
         raise HTTPException(401, "Unknown API key")
     if record["revoked"]:
@@ -464,7 +469,7 @@ async def resolve_psk(scope: dict) -> tuple[bytes, bytes]:
     if not await auth_service.healthy():
         raise HTTPException(503, "Auth service unavailable")
 
-    return (record["psk"], psk_id)
+    return (record["psk"], api_key_fingerprint)
 ```
 
 Standard HTTP headers are forwarded too:
@@ -522,8 +527,8 @@ HPKEClientSession(psk=b"short", psk_id=...)     # InvalidPSKError
 HPKEClientSession(psk=secrets.token_bytes(32), psk_id=...)  # >= 32 bytes
 
 # PSK ID must be derived from the key (see "PSK Authentication" section)
-psk_id = hashlib.sha256(api_key).digest()
-HPKEClientSession(psk=api_key, psk_id=psk_id)   # Correct
+api_key_fingerprint = hashlib.sha256(api_key).digest()
+HPKEClientSession(psk=api_key, psk_id=api_key_fingerprint)   # Correct
 
 # SSE missing content-type (won't use SSE format)
 return StreamingResponse(gen())                                  # Binary format (wrong for SSE)
