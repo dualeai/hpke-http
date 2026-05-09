@@ -512,8 +512,8 @@ class TestServerConfigValidation:
         private_key = x25519.X25519PrivateKey.generate()
         sk = private_key.private_bytes_raw()
 
-        # Mock _check_zstd_available to return False
-        with patch.object(HPKEMiddleware, "_check_zstd_available", return_value=False):
+        # Mock _check_zstd_available to return False (now imported from core in middleware)
+        with patch("hpke_http.middleware.fastapi._check_zstd_available", return_value=False):
             # Should NOT raise - gzip is used as fallback
             middleware = HPKEMiddleware(
                 app=mock_app,
@@ -544,8 +544,8 @@ class TestServerConfigValidation:
         async def mock_psk_resolver(scope: Scope) -> tuple[bytes, bytes]:
             return (b"", b"")
 
-        # Mock _check_zstd_available to return False
-        with patch.object(HPKEMiddleware, "_check_zstd_available", return_value=False):
+        # Mock _check_zstd_available to return False (now imported from core in middleware)
+        with patch("hpke_http.middleware.fastapi._check_zstd_available", return_value=False):
             # Should not raise
             middleware = HPKEMiddleware(
                 app=mock_app,

@@ -17,7 +17,8 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE (Hybrid Public Key Encry
 - **Replay protection** - Counter-based nonces prevent replay attacks
 - **RFC 9180 compliant** - Auditable, interoperable standard
 - **Post-quantum** - X-Wing hybrid KEM (X25519 + ML-KEM-768) for harvest-now-decrypt-later defense; clients auto-upgrade when server registers an X-Wing key (see [Post-Quantum (X-Wing)](#post-quantum-x-wing))
-- **Memory-efficient** - Streams large file uploads with O(chunk_size) memory
+- **Memory-bounded** - Streams large bodies with **~65 KB peak RAM per stream** (1× chunk_size; reusable per-session scratch via `cryptography.encrypt_into`). Server overhead for 1 000 concurrent streams ≈ 130 MB.
+- **Low CPU overhead** - ChaCha20-Poly1305 throughput **1.25 GB/s** at 64 KB chunks (≈0.80 ns/byte); +5.6% framing overhead vs raw cipher. HPKE setup ≈ 500 µs/request (X25519). See [Performance](#performance) for absolute numbers.
 
 ## Installation
 
@@ -486,6 +487,10 @@ This works identically for both encrypted and unencrypted requests.
 
 ## Wire Format
 
+> Wire format **v2** (encoding_id authenticated via AEAD AAD).
+> Wire-format incompatible with prior releases (where encoding_id was inside
+> encrypted plaintext). Both endpoints must run a matching wire-format version.
+
 ### Request/Response (Chunked Binary)
 
 See [Header Modifications](#header-modifications) for when headers are added.
@@ -497,19 +502,25 @@ Headers:
   X-HPKE-Stream: <base64url(4B session salt)>
   X-HPKE-PSK-ID: <base64url(derived key ID, 32B recommended)>
 
-Body (repeating chunks):
-┌───────────┬────────────┬─────────────────────────────────┐
-│ Length(4B)│ Counter(4B)│ Ciphertext (N + 16B tag)        │
-│ big-endian│ big-endian │ encrypted: encoding_id || data  │
-└───────────┴────────────┴─────────────────────────────────┘
-Overhead: 24B/chunk (4B length + 4B counter + 16B tag)
+Body (repeating chunks, wire format v2):
+┌───────────┬────────────┬───────────┬───────────────────────┐
+│ Length(4B)│ Counter(4B)│ EncID(1B) │ Ciphertext (N + 16B)  │
+│ big-endian│ big-endian │ encoding  │ AEAD(plaintext, AAD)  │
+└───────────┴────────────┴───────────┴───────────────────────┘
+encoding_id authenticated via AAD (not encrypted).
+Overhead: 25B/chunk (4B length + 4B counter + 1B encoding_id + 16B tag)
 ```
+
+Tampering with the encoding_id byte on the wire (e.g., flipping ZSTD `0x01` →
+IDENTITY `0x00` to skip decompression) fails AEAD authentication on receiver
+— same downgrade-attack resistance as v1's encrypted encoding_id, lower CPU
+cost (no plaintext-prefix copy on encrypt path).
 
 ### SSE Event
 
 ```text
 event: enc
-data: <base64(counter_be32 || ciphertext)>
+data: <base64(counter_be32 || encoding_id_byte || ciphertext+tag)>
 Decrypted: raw SSE chunk (e.g., "event: progress\ndata: {...}\n\n")
 ```
 
@@ -544,13 +555,81 @@ return {"data": "value"}  # Auto-encrypted as binary chunks
 | -------- | ----- | ---------- |
 | HPKE messages/context | 2^96-1 | All |
 | Chunks/session | 2^32-1 | All |
+| Max body per session | 256 TiB (2^32 × 64 KB) | All |
 | PSK minimum | 32 bytes | All |
 | PSK ID minimum | 1 byte | All |
 | Chunk size | 64KB | All |
-| Binary chunk overhead | 24B (length + counter + tag) | Requests & standard responses |
+| Binary chunk overhead | 25B (length + counter + encoding_id + tag) | Requests & standard responses |
+| Decompressed chunk cap | 128 KB (2× chunk_size) | Zip-bomb prevention |
 | SSE event buffer | 64MB (configurable) | SSE only |
 
 > **Note:** SSE is text-only (UTF-8). Binary data must be base64-encoded (+33% overhead).
+
+## Performance
+
+Absolute numbers measured on Python 3.14 + cryptography 48.0 (Apple Silicon; numbers will vary on other hardware but order-of-magnitude is stable).
+
+### Per-request CPU + latency (no network)
+
+| Body size | Encrypt | Decrypt | E2E (loopback) |
+| --------- | ------- | ------- | -------------- |
+| 1 KB JSON | 504 µs | 504 µs | **~1.0 ms** |
+| 64 KB chunk | 551 µs | 553 µs | **~1.1 ms** |
+| 1 MB | 1.3 ms | 1.3 ms | **~2.6 ms** |
+| 100 MB | 80 ms | 83 ms | **~163 ms** |
+| 1 GB | 800 ms | 830 ms | **~1.6 s** |
+
+Breakdown:
+- **HPKE setup (one-time per request)**: ~500 µs (X25519 KEM encap + 5 HKDF calls). Dominates for bodies < 625 KB; below that, you're paying for handshake more than for AEAD.
+- **Per-chunk AEAD**: ~50 µs encrypt, ~52 µs decrypt at 64 KB → **1.25 GB/s sustained** (single-core).
+- **Per-byte cost**: 0.80 ns/B amortized over body.
+
+X-Wing (post-quantum) replaces only the KEM step; per-chunk AEAD cost is identical.
+
+### Memory per stream (RAM cost)
+
+| Side | Peak per stream | Steady-state allocs |
+| ---- | --------------- | ------------------- |
+| Encryptor | **~65 KB** (1× chunk_size, reusable scratch) | ~0.13 alloc/call |
+| Decryptor | **~65 KB** (1× chunk_size, fresh bytearray per chunk) | ~1 alloc/call |
+| Parser buffer | ≤ 256 KB (compaction at 128 KB) | rebind per feed |
+
+Server overhead for N concurrent streams (worst case both directions):
+
+| N concurrent streams | Server RAM overhead |
+| -------------------- | ------------------- |
+| 10 | ~1.3 MB |
+| 100 | ~13 MB |
+| 1 000 | ~130 MB |
+| 10 000 | ~1.3 GB |
+
+Body-size independent: streaming guarantees O(chunk_size) per stream, NOT O(body). Verified for bodies up to 1 GB in `tests/benchmarks/test_bench_memory.py`.
+
+### Wire bandwidth overhead
+
+Per-chunk: fixed **25 B** (4 length + 4 counter + 1 encoding_id + 16 AEAD tag). Per-request: HTTP headers fixed **~166 B (X25519)** or **~1.6 KB (X-Wing)**.
+
+| Body | Chunks | Chunk overhead | Body overhead % |
+| ---- | ------ | -------------- | --------------- |
+| 36 B (small JSON) | 1 | 25 B | +69% |
+| 1 KB | 1 | 25 B | +2.4% |
+| 64 KB | 1 | 25 B | +0.04% |
+| 1 MB | 16 | 400 B | +0.04% |
+| 100 MB | 1 600 | 40 KB | +0.04% |
+| 1 GB | 16 384 | 400 KB | +0.04% |
+
+For X-Wing, add ~1.6 KB per request for the post-quantum encapsulated key in headers (one-time, not per chunk).
+
+### When to enable `compress=True`
+
+Effective only on text/JSON workloads >1 KB. Random/binary data expands by ~9 B (negligible) but pays compression CPU cost. ZSTD (or gzip fallback) auto-applied to chunks ≥ 64 B. Highly compressible JSON: 60-99% bandwidth saving. Auto-skipped below `ZSTD_MIN_SIZE=64 B`.
+
+### Reproduce
+
+```sh
+make test-flamegraph              # py-spy → speedscope flamegraph
+uv run pytest tests/benchmarks/   # CodSpeed CPU + memory regression suite
+```
 
 ## HTTP Compatibility
 
@@ -672,6 +751,24 @@ from hpke_http.hpke import seal_psk, open_psk
 # psk/psk_id: pre-shared key and identifier, aad: additional authenticated data
 enc, ct = seal_psk(pk_r, b"info", psk, psk_id, b"aad", b"plaintext")
 pt = open_psk(enc, sk_r, b"info", psk, psk_id, b"aad", ct)
+```
+
+### Power-user: write encrypted chunks into your own buffer
+
+`ChunkEncryptor.encrypt_into(plaintext, dest, offset=-1) -> int` writes the
+wire-formatted chunk directly into a caller-owned `bytearray` (msgspec.Encoder
+`encode_into` pattern). Skips the internal scratch entirely; useful for
+mmap-backed targets or pre-sized scratch pools in tight loops. RawFormat only
+(SSEFormat raises `TypeError` — base64 expansion not in-place compatible).
+
+```python
+from hpke_http.streaming import ChunkEncryptor, RawFormat, StreamingSession
+
+session = StreamingSession.create(b"\x00" * 32)
+enc = ChunkEncryptor(session, format=RawFormat())
+dest = bytearray(64 * 1024 + 100)        # pre-sized scratch
+n = enc.encrypt_into(b"chunk data", dest, offset=0)
+# dest[:n] = wire chunk; dest[n:] = unused
 ```
 
 ## Security

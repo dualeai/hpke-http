@@ -10,6 +10,7 @@ Tests that the PSK ID is correctly:
 """
 
 import aiohttp
+import httpx
 import pytest
 
 from hpke_http.constants import HEADER_HPKE_ERROR, HEADER_HPKE_PSK_ID, KemId
@@ -423,7 +424,15 @@ class TestBodylessRequestPSKIDDeny:
         test_psk: bytes,
         wrong_psk_id: bytes,
     ) -> None:
-        """httpx encrypted POST with wrong PSK ID → psk_resolver rejects → 401."""
+        """httpx encrypted POST with wrong PSK ID → psk_resolver rejects.
+
+        Server emits 401 and closes the connection while the client is still
+        streaming the chunked-encoded encrypted body. Per RFC 1122 §4.2.2.13,
+        a TCP close() with pending receive data sends RST; httpx surfaces
+        that as ReadError or RemoteProtocolError instead of the 401.
+        Both outcomes are valid evidence the request was rejected — the
+        cryptographic guarantee (server refused to process body) holds either way.
+        """
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
         async with HPKEAsyncClient(
@@ -432,7 +441,11 @@ class TestBodylessRequestPSKIDDeny:
             kem_priority=[kem],
             psk_id=wrong_psk_id,
         ) as client:
-            resp = await client.post("/echo", json={"test": "deny"})
+            try:
+                resp = await client.post("/echo", json={"test": "deny"})
+            except (httpx.ReadError, httpx.RemoteProtocolError):
+                # Server closed connection mid-stream after sending 401 → TCP RST
+                return
             assert resp.status_code == 401
 
 

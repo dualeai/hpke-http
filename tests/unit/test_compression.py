@@ -125,29 +125,23 @@ class TestSSECompression:
         assert ratio < 0.6, f"Compression ratio {ratio:.2%} is worse than expected"
 
     def test_unknown_encoding_raises_error(self) -> None:
-        """Unknown encoding ID raises DecryptionError."""
+        """Unknown encoding ID (wire format v2: encoding_id outside ciphertext) raises DecryptionError."""
         import base64
 
-        session = make_sse_session()
-        encryptor = ChunkEncryptor(session, compress=False)
-
-        # Encrypt with IDENTITY encoding (not used - we manually craft invalid payload below)
-        _ = encryptor.encrypt(b"test data here")
-
-        # Manually corrupt the encoding ID in the decrypted payload
-        # This is a bit tricky - we need to create a payload with invalid encoding
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-        # Create a new session for tampering
         tamper_session = make_sse_session()
         cipher = ChaCha20Poly1305(tamper_session.session_key)
         nonce = tamper_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
-        # Create payload with invalid encoding ID (0xFF)
-        invalid_data = bytes([0xFF]) + b"some data"
-        ciphertext = cipher.encrypt(nonce, invalid_data, associated_data=None)
-        payload = (1).to_bytes(4, "big") + ciphertext
-        # SSEFormat uses standard base64 (not base64url) for ~1.7x faster encoding
+        # Wire v2: encoding_id authenticated via AAD; sender uses 0xFF as both AAD and wire byte.
+        # AEAD decrypt succeeds; decryptor's encoding_id range check rejects with "Unknown encoding".
+        bad_eid = 0xFF
+        plaintext = b"some data"
+        ciphertext = cipher.encrypt(nonce, plaintext, bytes((bad_eid,)))
+
+        # SSE pre-base64 layout: counter(4) || encoding_id(1) || ct+tag
+        payload = (1).to_bytes(4, "big") + bytes((bad_eid,)) + ciphertext
         encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(tamper_session)
@@ -325,7 +319,7 @@ class TestCompressionErrors:
     """Error handling tests for corrupted/invalid compressed data."""
 
     def test_corrupted_zstd_data_raises_error(self) -> None:
-        """Corrupted zstd data raises DecryptionError."""
+        """Corrupted zstd plaintext (wire format v2: encoding_id outside ciphertext) raises DecryptionError."""
         import base64
 
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -336,11 +330,13 @@ class TestCompressionErrors:
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
-        # ZSTD encoding but garbage data
-        invalid_zstd = bytes([SSEEncodingId.ZSTD]) + b"not valid zstd"
-        ciphertext = cipher.encrypt(nonce, invalid_zstd, associated_data=None)
-        payload = (1).to_bytes(4, "big") + ciphertext
-        # SSEFormat uses standard base64 (not base64url)
+        # Wire v2: encoding_id ZSTD authenticated via AAD; plaintext is garbage that fails zstd decompress.
+        eid = SSEEncodingId.ZSTD
+        invalid_plaintext = b"not valid zstd"
+        ciphertext = cipher.encrypt(nonce, invalid_plaintext, bytes((eid,)))
+
+        # Pre-base64 layout: counter(4) || encoding_id(1) || ct+tag
+        payload = (1).to_bytes(4, "big") + bytes((eid,)) + ciphertext
         encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(session)
@@ -360,14 +356,13 @@ class TestCompressionErrors:
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
-        # Create valid zstd then truncate - library returns empty bytes
+        # Wire v2: encoding_id ZSTD outside ciphertext (AAD). Plaintext is truncated zstd frame.
+        eid = SSEEncodingId.ZSTD
         valid_compressed = zstd.compress(b"x" * 1000, level=ZSTD_COMPRESSION_LEVEL)
         truncated = valid_compressed[: len(valid_compressed) // 2]
+        ciphertext = cipher.encrypt(nonce, truncated, bytes((eid,)))
 
-        truncated_payload = bytes([SSEEncodingId.ZSTD]) + truncated
-        ciphertext = cipher.encrypt(nonce, truncated_payload, associated_data=None)
-        payload = (1).to_bytes(4, "big") + ciphertext
-        # SSEFormat uses standard base64 (not base64url)
+        payload = (1).to_bytes(4, "big") + bytes((eid,)) + ciphertext
         encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(session)
@@ -376,7 +371,7 @@ class TestCompressionErrors:
         assert result == b""
 
     def test_empty_zstd_payload_returns_empty(self) -> None:
-        """ZSTD encoding with empty data returns empty bytes (library behavior)."""
+        """ZSTD encoding with empty plaintext returns empty bytes (wire format v2)."""
         import base64
 
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -387,40 +382,19 @@ class TestCompressionErrors:
         cipher = ChaCha20Poly1305(session.session_key)
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
-        # ZSTD encoding ID but no data - library returns empty
-        empty_zstd = bytes([SSEEncodingId.ZSTD])
-        ciphertext = cipher.encrypt(nonce, empty_zstd, associated_data=None)
-        payload = (1).to_bytes(4, "big") + ciphertext
-        # SSEFormat uses standard base64 (not base64url)
+        # Wire v2: encoding_id outside ciphertext (in AAD). Empty plaintext = tag-only ciphertext.
+        # On decrypt, library decompresses empty bytes → empty.
+        eid = SSEEncodingId.ZSTD
+        ciphertext = cipher.encrypt(nonce, b"", bytes((eid,)))
+        payload = (1).to_bytes(4, "big") + bytes((eid,)) + ciphertext
         encoded = base64.b64encode(payload).decode("ascii")
 
         decryptor = ChunkDecryptor(session)
-        # backports.zstd returns empty bytes for empty input
         result = decryptor.decrypt(encoded)
         assert result == b""
 
-    def test_missing_encoding_id_raises_error(self) -> None:
-        """Empty decrypted payload (no encoding ID) raises DecryptionError."""
-        import base64
-
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
-        session = make_sse_session()
-        cipher = ChaCha20Poly1305(session.session_key)
-        nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
-
-        # Completely empty payload
-        ciphertext = cipher.encrypt(nonce, b"", associated_data=None)
-        payload = (1).to_bytes(4, "big") + ciphertext
-        # SSEFormat uses standard base64 (not base64url)
-        encoded = base64.b64encode(payload).decode("ascii")
-
-        decryptor = ChunkDecryptor(session)
-        with pytest.raises(DecryptionError, match="too short"):
-            decryptor.decrypt(encoded)
-
     def test_reserved_encoding_ids_raise_error(self) -> None:
-        """Reserved encoding IDs (0x03-0xFF) raise DecryptionError."""
+        """Reserved encoding IDs (0x03-0xFF) raise DecryptionError (wire format v2)."""
         import base64
 
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -432,10 +406,9 @@ class TestCompressionErrors:
             test_cipher = ChaCha20Poly1305(test_session.session_key)
             nonce = test_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
 
-            invalid_data = bytes([encoding_id]) + b"data"
-            ciphertext = test_cipher.encrypt(nonce, invalid_data, associated_data=None)
-            payload = (1).to_bytes(4, "big") + ciphertext
-            # SSEFormat uses standard base64 (not base64url)
+            # Wire v2: bad encoding_id outside ciphertext, used as AAD.
+            ciphertext = test_cipher.encrypt(nonce, b"data", bytes((encoding_id,)))
+            payload = (1).to_bytes(4, "big") + bytes((encoding_id,)) + ciphertext
             encoded = base64.b64encode(payload).decode("ascii")
 
             decryptor = ChunkDecryptor(test_session)

@@ -90,7 +90,6 @@ from hpke_http.streaming import (
     create_session_from_context,
     gzip_compress,
     gzip_decompress,
-    import_zstd,
     zstd_compress,
     zstd_decompress,
 )
@@ -116,9 +115,16 @@ _logger = logging.getLogger(__name__)
 
 
 def _check_zstd_available() -> bool:
-    """Check if zstd is available."""
+    """Check if zstd is available.
+
+    Uses late-binding lookup (``hpke_http.streaming.import_zstd``) instead of the
+    module-level imported name so test fixtures monkey-patching the streaming
+    module take effect (e.g., ``HPKE_DISABLE_ZSTD=true`` in e2e_server.py).
+    """
+    from hpke_http import streaming  # noqa: PLC0415
+
     try:
-        import_zstd()
+        streaming.import_zstd()
         return True
     except ImportError:
         return False
@@ -158,6 +164,24 @@ def _get_header(headers: Mapping[str, Any], name: str) -> str | None:
     return None
 
 
+def _require_stream_header(headers: Mapping[str, Any]) -> bytes:
+    """Parse and base64url-decode X-HPKE-Stream header. Raise if missing.
+
+    Shared by ResponseDecryptor / SSEDecryptor / RequestDecryptor for the
+    session-salt extraction at HPKE context setup.
+
+    Returns:
+        Decoded session salt (or session params for SSE).
+
+    Raises:
+        DecryptionError: If header missing.
+    """
+    stream_header = _get_header(headers, HEADER_HPKE_STREAM)
+    if not stream_header:
+        raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
+    return _b64url_decode(stream_header)
+
+
 # =============================================================================
 # STREAMING PARSERS
 # =============================================================================
@@ -171,10 +195,14 @@ class _ChunkStreamParser:
 
     Wire format per chunk: [length(4B BE)] [payload(N bytes)]
 
-    Performance optimizations:
-    - Tracks read position instead of O(n) deletion per chunk
-    - Compacts buffer only when read position exceeds threshold
-    - Uses struct for faster length parsing
+    Performance:
+    - Yields ``memoryview`` slices into the internal buffer (zero-copy).
+      Caller MUST consume the chunk before the next ``feed()`` call;
+      compaction may rebind the buffer, but outstanding memoryviews remain
+      valid via Python ref counting (the old buffer is kept alive by any
+      reference to a memoryview into it).
+    - Compacts only when read position exceeds threshold, via rebind
+      (not in-place mutation) to preserve outstanding memoryview lifetimes.
     """
 
     __slots__ = ("_buffer", "_read_pos")
@@ -187,30 +215,41 @@ class _ChunkStreamParser:
         self._buffer = bytearray()
         self._read_pos = 0
 
-    def feed(self, data: bytes) -> Iterator[bytes]:
+    def feed(self, data: bytes | bytearray | memoryview) -> Iterator[memoryview]:
         """Feed data, yield complete chunks as they're found.
+
+        Yielded memoryviews remain valid even across subsequent feed() calls:
+        each feed() rebinds ``self._buffer`` to a new bytearray, so the old
+        buffer (with outstanding memoryview exports) stays alive via Python
+        ref counting until the consumer drops its references.
 
         Args:
             data: Raw bytes from network/stream
 
         Yields:
-            Complete chunks (including length prefix) ready for decryption
+            memoryview slices into the internal buffer (zero-copy).
         """
-        # Compact buffer if read position exceeds threshold
-        # This amortizes O(n) compaction over many chunks
-        if self._read_pos > self._COMPACT_THRESHOLD:
-            del self._buffer[: self._read_pos]
-            self._read_pos = 0
+        # Rebind buffer each call rather than in-place extend. This
+        # accommodates outstanding memoryview exports from previous feed()
+        # calls (in-place extend would fail with BufferError when exports
+        # exist). Cost: O(leftover) copy per call; leftover is bounded by
+        # chunk size and typically near-zero in steady state.
+        leftover = len(self._buffer) - self._read_pos
+        new_buf = bytearray(leftover + len(data))
+        if leftover:
+            new_buf[:leftover] = memoryview(self._buffer)[self._read_pos :]
+        new_buf[leftover:] = data
+        self._buffer = new_buf
+        self._read_pos = 0
 
-        self._buffer.extend(data)
         while True:
             chunk = self._try_extract_chunk()
             if chunk is None:
                 break
             yield chunk
 
-    def _try_extract_chunk(self) -> bytes | None:
-        """Extract one complete chunk if available."""
+    def _try_extract_chunk(self) -> memoryview | None:
+        """Extract one complete chunk as a read-only memoryview if available."""
         available = len(self._buffer) - self._read_pos
         if available < RAW_LENGTH_PREFIX_SIZE:
             return None
@@ -227,10 +266,12 @@ class _ChunkStreamParser:
         if available < total:
             return None
 
-        # Extract chunk (copy is required for safety - caller may hold reference)
+        # Zero-copy: yield read-only memoryview into shared buffer. Lifetime preserved
+        # via rebind-on-compact (see feed()). Read-only prevents caller from mutating
+        # the parser's internal buffer through the yielded view.
         chunk_start = self._read_pos
         chunk_end = chunk_start + total
-        chunk = bytes(self._buffer[chunk_start:chunk_end])
+        chunk = memoryview(self._buffer)[chunk_start:chunk_end].toreadonly()
 
         # Advance read position (O(1) instead of O(n) deletion)
         self._read_pos = chunk_end
@@ -741,7 +782,7 @@ class BaseHPKEClient(ABC):
         self,
         body: bytes,
         keys: dict[KemId, bytes],
-    ) -> tuple[Iterator[bytes], dict[str, str], SenderContext]:
+    ) -> tuple[Iterator[bytes | bytearray], dict[str, str], SenderContext]:
         """Encrypt request body using RequestEncryptor with streaming.
 
         Returns a sync iterator. Subclasses may wrap in async iterator if needed.
@@ -780,7 +821,7 @@ class BaseHPKEClient(ABC):
 
         # Create iterator for streaming upload
         # Memory: O(chunk_size) instead of O(body_size)
-        def stream_chunks() -> Iterator[bytes]:
+        def stream_chunks() -> Iterator[bytes | bytearray]:
             yield first_chunk  # Return the primed first chunk
             yield from chunk_iter  # Then yield remaining chunks
 
@@ -932,7 +973,7 @@ class RequestEncryptor:
             headers[HEADER_HPKE_ENCODING] = self._encoding
         return headers
 
-    def encrypt(self, chunk: bytes) -> bytes:
+    def encrypt(self, chunk: bytes | bytearray | memoryview) -> bytes | bytearray:
         """
         Encrypt a single chunk.
 
@@ -941,14 +982,14 @@ class RequestEncryptor:
         as whole-body compression provides better ratios.
 
         Args:
-            chunk: Raw chunk bytes
+            chunk: Raw chunk (bytes, bytearray, or memoryview)
 
         Returns:
-            Encrypted chunk in wire format (length || counter || ciphertext)
+            Encrypted chunk in wire format (length || counter || encoding_id || ct+tag)
         """
         return self._encryptor.encrypt(chunk)
 
-    def encrypt_iter(self, body: bytes) -> Iterator[bytes]:
+    def encrypt_iter(self, body: bytes | bytearray | memoryview) -> Iterator[bytes | bytearray]:
         """
         Yield encrypted chunks for streaming upload.
 
@@ -962,7 +1003,7 @@ class RequestEncryptor:
             body: Complete request body
 
         Yields:
-            Encrypted chunks in wire format (length || counter || ciphertext)
+            Encrypted chunks in wire format v2 (length || counter || encoding_id || ct+tag)
 
         Example:
             # With aiohttp async generator
@@ -1011,7 +1052,7 @@ class RequestEncryptor:
         """
         return b"".join(self.encrypt_iter(body))
 
-    def feed(self, chunk: bytes) -> Iterator[bytes]:
+    def feed(self, chunk: bytes | bytearray | memoryview) -> Iterator[bytes | bytearray]:
         """
         Feed input chunk, yield encrypted chunks when buffer reaches CHUNK_SIZE.
 
@@ -1024,7 +1065,7 @@ class RequestEncryptor:
         uploads, use encrypt_iter() with the complete body instead.
 
         Args:
-            chunk: Raw bytes to buffer
+            chunk: Raw bytes/bytearray/memoryview to buffer
 
         Yields:
             Encrypted chunks when buffer reaches CHUNK_SIZE
@@ -1043,7 +1084,7 @@ class RequestEncryptor:
             self._has_output = True
             yield self._encryptor.encrypt(out_chunk)
 
-    def finalize(self) -> Iterator[bytes]:
+    def finalize(self) -> Iterator[bytes | bytearray]:
         """
         Flush remaining buffer as final encrypted chunk.
 
@@ -1104,12 +1145,7 @@ class ResponseDecryptor:
         Raises:
             DecryptionError: If X-HPKE-Stream header is missing
         """
-        # Parse session salt from header
-        stream_header = _get_header(headers, HEADER_HPKE_STREAM)
-        if not stream_header:
-            raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
-
-        session_salt = _b64url_decode(stream_header)
+        session_salt = _require_stream_header(headers)
 
         # Derive response key and create session
         response_key = context.export(RESPONSE_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
@@ -1119,7 +1155,7 @@ class ResponseDecryptor:
         self._decryptor = ChunkDecryptor(session, format=RawFormat())
         self._parser = _ChunkStreamParser()
 
-    def decrypt(self, chunk: bytes) -> bytes:
+    def decrypt(self, chunk: bytes | bytearray | memoryview) -> bytes | bytearray:
         """
         Decrypt a single pre-parsed chunk.
 
@@ -1130,11 +1166,11 @@ class ResponseDecryptor:
             chunk: Complete encrypted chunk in wire format
 
         Returns:
-            Decrypted plaintext
+            Decrypted plaintext (bytes for compressed, bytearray for identity)
         """
         return self._decryptor.decrypt(chunk)
 
-    def feed(self, data: bytes) -> Iterator[bytes]:
+    def feed(self, data: bytes | bytearray | memoryview) -> Iterator[bytes | bytearray]:
         """
         Feed raw data, yield decrypted chunks as boundaries are found.
 
@@ -1155,7 +1191,9 @@ class ResponseDecryptor:
         for chunk in self._parser.feed(data):
             yield self._decryptor.decrypt(chunk)
 
-    def decrypt_iter(self, body: bytes, *, feed_size: int = CHUNK_SIZE) -> Iterator[bytes]:
+    def decrypt_iter(
+        self, body: bytes | bytearray | memoryview, *, feed_size: int = CHUNK_SIZE
+    ) -> Iterator[bytes | bytearray]:
         """
         Yield decrypted chunks for streaming response.
 
@@ -1220,12 +1258,7 @@ class SSEDecryptor:
         Raises:
             DecryptionError: If X-HPKE-Stream header is missing
         """
-        # Parse session params from header
-        stream_header = _get_header(headers, HEADER_HPKE_STREAM)
-        if not stream_header:
-            raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
-
-        session_params = _b64url_decode(stream_header)
+        session_params = _require_stream_header(headers)
 
         # Derive SSE session key and create session
         session_key = context.export(SSE_SESSION_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
@@ -1234,7 +1267,7 @@ class SSEDecryptor:
         # Create chunk decryptor with SSE format
         self._decryptor = ChunkDecryptor(session, format=SSEFormat())
 
-    def decrypt(self, data: str | bytes) -> bytes:
+    def decrypt(self, data: str | bytes | bytearray | memoryview) -> bytes | bytearray:
         """
         Decrypt SSE data field.
 
@@ -1318,11 +1351,7 @@ class RequestDecryptor:
         # Reject before allocating crypto state (defends against malicious sizes).
         kem.validate_enc(enc)
 
-        # Parse session salt from header
-        stream_header = _get_header(headers, HEADER_HPKE_STREAM)
-        if not stream_header:
-            raise DecryptionError(f"Missing {HEADER_HPKE_STREAM} header")
-        session_salt = _b64url_decode(stream_header)
+        session_salt = _require_stream_header(headers)
 
         # Check for whole-body compression via header. Requests use whole-body compression
         # (compress → chunk → encrypt) so chunk encoding IDs are always 0x00 (IDENTITY).
@@ -1360,7 +1389,7 @@ class RequestDecryptor:
         """Get the compression encoding used ("zstd", "gzip", or None)."""
         return self._encoding
 
-    def decrypt(self, chunk: bytes) -> bytes:
+    def decrypt(self, chunk: bytes | bytearray | memoryview) -> bytes | bytearray:
         """
         Decrypt a single pre-parsed chunk.
 
@@ -1378,7 +1407,7 @@ class RequestDecryptor:
         """
         return self._decryptor.decrypt(chunk)
 
-    def feed(self, data: bytes) -> Iterator[bytes]:
+    def feed(self, data: bytes | bytearray | memoryview) -> Iterator[bytes | bytearray]:
         """
         Feed raw data, yield decrypted chunks as boundaries are found.
 
@@ -1408,7 +1437,9 @@ class RequestDecryptor:
         for chunk in self._parser.feed(data):
             yield self._decryptor.decrypt(chunk)
 
-    def decrypt_iter(self, body: bytes, *, feed_size: int = CHUNK_SIZE) -> Iterator[bytes]:
+    def decrypt_iter(
+        self, body: bytes | bytearray | memoryview, *, feed_size: int = CHUNK_SIZE
+    ) -> Iterator[bytes | bytearray]:
         """
         Yield decrypted chunks for streaming request.
 
@@ -1508,21 +1539,21 @@ class ResponseEncryptor:
             HEADER_HPKE_STREAM: _b64url_encode(self._session.session_salt),
         }
 
-    def encrypt(self, chunk: bytes) -> bytes:
+    def encrypt(self, chunk: bytes | bytearray | memoryview) -> bytes | bytearray:
         """
         Encrypt a single chunk.
 
         For streaming mode, call this repeatedly for each chunk.
 
         Args:
-            chunk: Raw chunk bytes
+            chunk: Raw chunk bytes/bytearray/memoryview
 
         Returns:
             Encrypted chunk in wire format
         """
         return self._encryptor.encrypt(chunk)
 
-    def encrypt_iter(self, body: bytes) -> Iterator[bytes]:
+    def encrypt_iter(self, body: bytes | bytearray | memoryview) -> Iterator[bytes | bytearray]:
         """
         Yield encrypted chunks for streaming response.
 
@@ -1548,7 +1579,7 @@ class ResponseEncryptor:
         for offset in range(0, body_len, CHUNK_SIZE):
             yield self._encryptor.encrypt(body_view[offset : offset + CHUNK_SIZE])
 
-    def encrypt_all(self, body: bytes) -> bytes:
+    def encrypt_all(self, body: bytes | bytearray | memoryview) -> bytes:
         """
         Encrypt entire response body at once.
 
@@ -1608,7 +1639,7 @@ class SSEEncryptor:
             "Content-Type": "text/event-stream",
         }
 
-    def encrypt(self, event: bytes) -> bytes:
+    def encrypt(self, event: bytes | bytearray | memoryview) -> bytes | bytearray:
         """
         Encrypt SSE event.
 

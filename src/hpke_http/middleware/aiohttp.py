@@ -205,10 +205,10 @@ class DecryptedResponse:
         """
         self._response = response
         self._sender_ctx = sender_ctx
-        self._decrypted: bytes | None = None
+        self._decrypted: bytes | bytearray | None = None
         self._release_encrypted = release_encrypted
 
-    async def _ensure_decrypted(self) -> bytes:
+    async def _ensure_decrypted(self) -> bytes | bytearray:
         """Decrypt response body and release connection.
 
         Uses ResponseDecryptor for header parsing, chunk boundary detection,
@@ -249,7 +249,7 @@ class DecryptedResponse:
             # Safe: body cached in _body, release() is idempotent.
             await self._response.release()
 
-    async def read(self) -> bytes:
+    async def read(self) -> bytes | bytearray:
         """Read and decrypt the response body."""
         return await self._ensure_decrypted()
 
@@ -491,7 +491,7 @@ class HPKEClientSession(BaseHPKEClient):
     async def _encrypt_request(
         self,
         body: bytes,
-    ) -> tuple[AsyncIterator[bytes], dict[str, str], SenderContext]:
+    ) -> tuple[AsyncIterator[bytes | bytearray], dict[str, str], SenderContext]:
         """
         Encrypt request body using base class encryption with async wrapper.
 
@@ -507,7 +507,7 @@ class HPKEClientSession(BaseHPKEClient):
         sync_iter, headers, ctx = self._encrypt_request_sync(body, keys)
 
         # Wrap sync iterator in async generator for aiohttp
-        async def async_stream() -> AsyncIterator[bytes]:
+        async def async_stream() -> AsyncIterator[bytes | bytearray]:
             for chunk in sync_iter:
                 yield chunk
 
@@ -521,7 +521,7 @@ class HPKEClientSession(BaseHPKEClient):
     async def _encrypt_stream_async(
         self,
         chunks: AsyncIterator[bytes],
-    ) -> tuple[AsyncIterator[bytes], dict[str, str], SenderContext]:
+    ) -> tuple[AsyncIterator[bytes | bytearray], dict[str, str], SenderContext]:
         """
         Encrypt async stream using feed/finalize API for memory efficiency.
 
@@ -544,7 +544,7 @@ class HPKEClientSession(BaseHPKEClient):
         # encoding ID byte is always 0x00 (IDENTITY).
         encryptor = self._make_encryptor(keys, compress=False)
 
-        async def encrypt_gen() -> AsyncIterator[bytes]:
+        async def encrypt_gen() -> AsyncIterator[bytes | bytearray]:
             async for chunk in chunks:
                 for encrypted in encryptor.feed(chunk):
                     yield encrypted
@@ -753,7 +753,7 @@ class HPKEClientSession(BaseHPKEClient):
     async def iter_sse(
         self,
         response: aiohttp.ClientResponse | DecryptedResponse,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncIterator[bytes | bytearray]:
         """
         Iterate over encrypted SSE stream, yielding decrypted chunks.
 

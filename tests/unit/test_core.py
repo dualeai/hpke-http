@@ -192,7 +192,7 @@ class TestRequestDecryptor:
         part1, part2 = encrypted[:mid], encrypted[mid:]
 
         decryptor = RequestDecryptor(headers, sk, test_psk, test_psk_id)
-        results: list[bytes] = []
+        results: list[bytes | bytearray] = []
         results.extend(decryptor.feed(part1))
         results.extend(decryptor.feed(part2))
 
@@ -404,7 +404,7 @@ class TestResponseDecryptor:
         part1, part2 = encrypted[:mid], encrypted[mid:]
 
         resp_dec = ResponseDecryptor(resp_enc.get_headers(), req_enc.context)
-        results: list[bytes] = []
+        results: list[bytes | bytearray] = []
         results.extend(resp_dec.feed(part1))
         results.extend(resp_dec.feed(part2))
 
@@ -1113,7 +1113,7 @@ class TestReplayAttackProtection:
         event2 = sse_enc.encrypt(b"event2")
 
         # Extract data fields
-        def get_data(event: bytes) -> str:
+        def get_data(event: bytes | bytearray) -> str:
             for line in event.decode("ascii").split("\n"):
                 if line.startswith("data: "):
                     return line[6:]

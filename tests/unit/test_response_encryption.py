@@ -1,6 +1,7 @@
 """Unit tests for standard response encryption (RawFormat)."""
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
@@ -28,69 +29,80 @@ except ImportError:
 _requires_zstd = pytest.mark.skipif(not _zstd_available, reason="zstd not available")
 
 
+def _make_cipher_and_nonce() -> tuple["ChaCha20Poly1305", bytes]:
+    """Helper: build cipher + 12-byte nonce for direct Format tests."""
+    key = b"0" * 32
+    cipher = ChaCha20Poly1305(key)
+    nonce = b"\x00" * 12
+    return cipher, nonce
+
+
 class TestRawFormat:
-    """Test RawFormat binary encoding."""
+    """Test RawFormat binary encoding (wire format v2)."""
 
-    def test_encode_decode_roundtrip(self) -> None:
-        """Test RawFormat encode/decode is reversible."""
+    def test_encrypt_chunk_decode_roundtrip(self) -> None:
+        """Test RawFormat encrypt_chunk + decode is reversible."""
+
         fmt = RawFormat()
+        cipher, nonce = _make_cipher_and_nonce()
         counter = 42
-        ciphertext = b"encrypted_data_here_with_16_byte_tag!"
+        encoding_id = 0x00
+        plaintext = b"encrypted_data_here"
 
-        encoded = fmt.encode(counter, ciphertext)
-        decoded_counter, decoded_ciphertext = fmt.decode(encoded)
+        encoded = fmt.encrypt_chunk(counter, encoding_id, plaintext, cipher, nonce)
+        decoded_counter, decoded_eid, decoded_ct = fmt.decode(encoded)
 
+        # Verify wire structure
         assert decoded_counter == counter
-        assert decoded_ciphertext == ciphertext
+        assert decoded_eid == encoding_id
+        # Decrypt to recover plaintext
+        pt_buf = bytearray(len(decoded_ct) - 16)
+        cipher.decrypt_into(nonce, decoded_ct, bytes((encoding_id,)), pt_buf)
+        assert bytes(pt_buf) == plaintext
 
-    def test_encode_format(self) -> None:
-        """Test RawFormat binary structure: length(4B) || counter(4B BE) || ciphertext."""
+    def test_encrypt_chunk_format(self) -> None:
+        """Test RawFormat wire structure: length(4) || counter(4) || encoding_id(1) || ct+tag."""
         fmt = RawFormat()
+        cipher, nonce = _make_cipher_and_nonce()
         counter = 1
-        ciphertext = b"test"
+        encoding_id = 0x00
+        plaintext = b"test"  # 4 bytes; ciphertext = 4 + 16 (tag) = 20
 
-        encoded = fmt.encode(counter, ciphertext)
+        encoded = fmt.encrypt_chunk(counter, encoding_id, plaintext, cipher, nonce)
 
-        # First 4 bytes are length (counter + ciphertext = 4 + 4 = 8)
-        assert encoded[:4] == b"\x00\x00\x00\x08"
-        # Next 4 bytes are big-endian counter
+        # Length prefix: counter(4) + encoding_id(1) + ct+tag(20) = 25
+        assert encoded[:4] == b"\x00\x00\x00\x19"
+        # Counter (big-endian)
         assert encoded[4:8] == b"\x00\x00\x00\x01"
-        # Rest is ciphertext
-        assert encoded[8:] == b"test"
-
-    def test_decode_from_bytes(self) -> None:
-        """Test RawFormat decoding from bytes with length prefix."""
-        fmt = RawFormat()
-        # length=11 (counter=4 + ciphertext=7), counter=256 (0x100), ciphertext="payload"
-        data = b"\x00\x00\x00\x0b" + b"\x00\x00\x01\x00" + b"payload"
-
-        counter, ciphertext = fmt.decode(data)
-
-        assert counter == 256
-        assert ciphertext == b"payload"
+        # Encoding ID
+        assert encoded[8] == encoding_id
+        # Total wire size: 4 + 4 + 1 + 4 + 16 = 29 bytes
+        assert len(encoded) == 29
 
     def test_counter_boundary_max(self) -> None:
-        """Test encoding max counter value."""
+        """Test encoding max counter value (2**32 - 1)."""
         fmt = RawFormat()
-        counter = 2**32 - 1  # Max 4-byte counter
-        ciphertext = b"x"
+        cipher, nonce = _make_cipher_and_nonce()
+        counter = 2**32 - 1
+        plaintext = b"x"
 
-        encoded = fmt.encode(counter, ciphertext)
-        decoded_counter, _ = fmt.decode(encoded)
+        encoded = fmt.encrypt_chunk(counter, 0x00, plaintext, cipher, nonce)
+        decoded_counter, _eid, _ct = fmt.decode(encoded)
 
         assert decoded_counter == counter
 
     def test_length_prefix_value(self) -> None:
-        """Test that length prefix correctly encodes chunk size."""
+        """Test that length prefix correctly encodes chunk size for v2 layout."""
         fmt = RawFormat()
+        cipher, nonce = _make_cipher_and_nonce()
         counter = 1
-        ciphertext = b"x" * 100  # 100-byte ciphertext
+        plaintext = b"x" * 100  # 100-byte plaintext; ct+tag = 116
 
-        encoded = fmt.encode(counter, ciphertext)
+        encoded = fmt.encrypt_chunk(counter, 0x00, plaintext, cipher, nonce)
 
-        # Length should be counter(4) + ciphertext(100) = 104
+        # Length = counter(4) + encoding_id(1) + ct+tag(116) = 121
         length = int.from_bytes(encoded[:4], "big")
-        assert length == 104
+        assert length == 121
         assert len(encoded) == 4 + length  # length prefix + chunk
 
 
@@ -100,21 +112,22 @@ class TestSSEFormatComparison:
     def test_sse_format_is_text_based(self) -> None:
         """SSEFormat produces text (event: enc\\ndata: ...)."""
         fmt = SSEFormat()
-        encoded = fmt.encode(1, b"test")
+        cipher, nonce = _make_cipher_and_nonce()
+        encoded = fmt.encrypt_chunk(1, 0x00, b"test", cipher, nonce)
 
-        # SSE format is ASCII text
         assert encoded.startswith(b"event: enc\ndata: ")
         assert encoded.endswith(b"\n\n")
 
     def test_raw_format_is_binary(self) -> None:
-        """RawFormat produces raw binary with length prefix."""
+        """RawFormat produces raw binary with length prefix + encoding_id."""
         fmt = RawFormat()
-        encoded = fmt.encode(1, b"test")
+        cipher, nonce = _make_cipher_and_nonce()
+        encoded = fmt.encrypt_chunk(1, 0x00, b"test", cipher, nonce)
 
-        # Raw format is length + counter + ciphertext
-        assert len(encoded) == 4 + 4 + 4  # length(4) + counter(4) + ciphertext(4)
-        # length=8 (counter + ciphertext), counter=1, ciphertext="test"
-        assert encoded == b"\x00\x00\x00\x08\x00\x00\x00\x01test"
+        # length(4) + counter(4) + encoding_id(1) + ct+tag(20) = 29
+        assert len(encoded) == 29
+        # length=25 (counter 4 + encoding_id 1 + ct+tag 20), counter=1, encoding_id=0x00
+        assert encoded[:9] == b"\x00\x00\x00\x19\x00\x00\x00\x01\x00"
 
 
 class TestChunkEncryptorWithRawFormat:
@@ -462,53 +475,56 @@ class TestMultiChunkResponse:
 
 
 class TestRawFormatEdgeCases:
-    """Edge case tests for RawFormat."""
+    """Edge case tests for RawFormat (wire format v2: counter || encoding_id || ct+tag)."""
 
     def test_decode_string_input(self) -> None:
         """RawFormat.decode accepts string input via latin-1 encoding."""
         fmt = RawFormat()
-        # Create binary data with length prefix + counter + ciphertext
-        # length=14 (counter=4 + ciphertext=10), counter=1, ciphertext="ciphertext"
-        binary_data = b"\x00\x00\x00\x0e" + b"\x00\x00\x00\x01" + b"ciphertext"
-        # Encode as latin-1 string (covers full 0-255 byte range)
+        # length=15 (counter=4 + encoding_id=1 + ciphertext=10), counter=1, eid=0x00, ct="ciphertext"
+        binary_data = b"\x00\x00\x00\x0f" + b"\x00\x00\x00\x01" + b"\x00" + b"ciphertext"
         string_data = binary_data.decode("latin-1")
 
-        counter, ciphertext = fmt.decode(string_data)
+        counter, encoding_id, ciphertext = fmt.decode(string_data)
 
         assert counter == 1
-        assert ciphertext == b"ciphertext"
+        assert encoding_id == 0x00
+        assert bytes(ciphertext) == b"ciphertext"
 
     def test_decode_counter_zero(self) -> None:
         """Counter=0 decodes correctly (edge case)."""
         fmt = RawFormat()
-        # length=11 (counter=4 + ciphertext=7), counter=0, ciphertext="payload"
-        data = b"\x00\x00\x00\x0b" + b"\x00\x00\x00\x00" + b"payload"
+        # length=12 (counter=4 + encoding_id=1 + ciphertext=7), counter=0, eid=0x00, ct="payload"
+        data = b"\x00\x00\x00\x0c" + b"\x00\x00\x00\x00" + b"\x00" + b"payload"
 
-        counter, ciphertext = fmt.decode(data)
+        counter, encoding_id, ciphertext = fmt.decode(data)
 
         assert counter == 0
-        assert ciphertext == b"payload"
+        assert encoding_id == 0x00
+        assert bytes(ciphertext) == b"payload"
 
     def test_decode_minimum_data_counter_only(self) -> None:
-        """Decode with length + counter, no ciphertext."""
+        """Decode with length + counter + encoding_id, no ciphertext."""
         fmt = RawFormat()
-        # length=4 (just counter), counter=5
-        data = b"\x00\x00\x00\x04" + b"\x00\x00\x00\x05"
+        # length=5 (counter + encoding_id), counter=5, eid=0x01
+        data = b"\x00\x00\x00\x05" + b"\x00\x00\x00\x05" + b"\x01"
 
-        counter, ciphertext = fmt.decode(data)
+        counter, encoding_id, ciphertext = fmt.decode(data)
 
         assert counter == 5
-        assert ciphertext == b""
+        assert encoding_id == 0x01
+        assert bytes(ciphertext) == b""
 
-    def test_encode_counter_zero(self) -> None:
-        """Encoding counter=0 works (even though encryptor starts at 1)."""
+    def test_encrypt_chunk_counter_zero(self) -> None:
+        """encrypt_chunk with counter=0 produces valid wire (encryptor starts at 1, but format itself accepts 0)."""
         fmt = RawFormat()
-        encoded = fmt.encode(0, b"test")
+        cipher, nonce = _make_cipher_and_nonce()
 
-        # length=8 (counter=4 + ciphertext=4), counter=0, ciphertext="test"
-        assert encoded[:4] == b"\x00\x00\x00\x08"  # length
-        assert encoded[4:8] == b"\x00\x00\x00\x00"  # counter
-        assert encoded[8:] == b"test"  # ciphertext
+        encoded = fmt.encrypt_chunk(0, 0x00, b"test", cipher, nonce)
+
+        # length = counter(4) + encoding_id(1) + ct+tag(20) = 25 = 0x19
+        assert encoded[:4] == b"\x00\x00\x00\x19"
+        assert encoded[4:8] == b"\x00\x00\x00\x00"
+        assert encoded[8] == 0x00
 
 
 class TestSessionEdgeCases:
@@ -666,51 +682,53 @@ class TestAdversarialInputs:
     """Tests for adversarial/weird inputs."""
 
     def test_unknown_encoding_id_raises(self) -> None:
-        """Unknown encoding ID (not 0x00 or 0x01) raises DecryptionError."""
+        """Unknown encoding_id (not 0x00/0x01/0x02) raises DecryptionError (wire v2)."""
+        import struct
+
         key = b"0" * 32
         session = StreamingSession.create(key)
-
-        # Create a fake "encrypted" message with unknown encoding ID
-        # We need to craft a valid ciphertext with wrong encoding ID
         session2 = StreamingSession(session_key=key, session_salt=session.session_salt)
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+        # Wire v2: encoding_id is OUTSIDE ciphertext (in AAD).
+        # Craft wire with unknown encoding_id (0x99). Sender uses 0x99 as AAD too,
+        # so AEAD authenticates successfully, then decryptor's encoding_id range
+        # check rejects it with "Unknown encoding".
         cipher = ChaCha20Poly1305(key)
-        # Craft payload with unknown encoding ID (0x99)
-        bad_payload = bytes([0x99]) + b"data"
+        bad_eid = 0x99
+        plaintext = b"data"
         nonce = session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
-        ciphertext = cipher.encrypt(nonce, bad_payload, None)
+        # Encrypt plaintext with AAD = bad encoding_id byte
+        ciphertext = cipher.encrypt(nonce, plaintext, bytes((bad_eid,)))
 
-        # Build raw format message
-        fmt = RawFormat()
-        bad_message = fmt.encode(1, ciphertext)
+        # Build wire v2: length(4) || counter(4) || encoding_id(1) || ct+tag
+        chunk_len = 4 + 1 + len(ciphertext)
+        bad_message = struct.pack(">II", chunk_len, 1) + bytes((bad_eid,)) + ciphertext
 
-        # Decryption should fail on unknown encoding
         decryptor = ChunkDecryptor(session2, format=RawFormat())
         with pytest.raises(DecryptionError, match="Unknown encoding"):
             decryptor.decrypt(bad_message)
 
     def test_raw_format_decode_very_short(self) -> None:
-        """RawFormat.decode with very short input handles edge case."""
+        """RawFormat.decode with minimal input (just counter + encoding_id) handles edge case."""
         fmt = RawFormat()
 
-        # Minimum valid input: 8 bytes (length + counter)
-        # length=4 (just counter), counter=5
-        data = b"\x00\x00\x00\x04\x00\x00\x00\x05"
-        counter, ciphertext = fmt.decode(data)
+        # length=5 (counter + encoding_id), counter=5, eid=0x00
+        data = b"\x00\x00\x00\x05\x00\x00\x00\x05\x00"
+        counter, encoding_id, ciphertext = fmt.decode(data)
 
         assert counter == 5
-        assert ciphertext == b""
+        assert encoding_id == 0x00
+        assert bytes(ciphertext) == b""
 
     def test_raw_format_decode_empty_raises(self) -> None:
-        """RawFormat.decode with empty input returns empty results."""
+        """RawFormat.decode with empty input raises IndexError (encoding_id byte missing)."""
         fmt = RawFormat()
 
-        # Empty bytes - skips first 4 (length), reads counter from bytes 4-8
-        # With empty input, this produces zeros
-        counter, ciphertext = fmt.decode(b"")
-        assert counter == 0
-        assert ciphertext == b""
+        # Empty wire has no length prefix, no counter, no encoding_id.
+        # Decoder attempts to read encoding_id at offset 8 → IndexError.
+        # Real callers parse via _ChunkStreamParser which validates length first.
+        with pytest.raises(IndexError):
+            fmt.decode(b"")
 
     def test_all_zeros_ciphertext_fails_auth(self) -> None:
         """All-zeros ciphertext fails authentication."""
@@ -799,38 +817,44 @@ class TestThreadSafety:
 
 
 class TestSSEFormatEdgeCases:
-    """Edge case tests for SSEFormat."""
+    """Edge case tests for SSEFormat (wire format v2)."""
 
     def test_sse_format_decode_string_input(self) -> None:
-        """SSEFormat.decode accepts string input (base64url data)."""
-        from hpke_http.streaming import SSEFormat
-
+        """SSEFormat.decode accepts string input (base64 data)."""
         fmt = SSEFormat()
-        # First encode something
-        encoded = fmt.encode(1, b"ciphertext")
+        cipher, nonce = _make_cipher_and_nonce()
+        # Encrypt some plaintext
+        encoded = fmt.encrypt_chunk(1, 0x00, b"plaintext", cipher, nonce)
 
-        # Extract just the base64url data field
+        # Extract just the base64 data field
         data_line = encoded.decode("ascii").split("\n")[1]
         data_str = data_line.replace("data: ", "")
 
-        # Decode from string
-        counter, ciphertext = fmt.decode(data_str)
+        # Decode from string: returns (counter, encoding_id, ciphertext_mv)
+        counter, encoding_id, ciphertext = fmt.decode(data_str)
 
         assert counter == 1
-        assert ciphertext == b"ciphertext"
+        assert encoding_id == 0x00
+        # Decrypt to recover plaintext
+        pt_buf = bytearray(len(ciphertext) - 16)
+        cipher.decrypt_into(nonce, ciphertext, bytes((encoding_id,)), pt_buf)
+        assert bytes(pt_buf) == b"plaintext"
 
     def test_sse_format_decode_bytes_input(self) -> None:
         """SSEFormat.decode accepts bytes input."""
-        from hpke_http.streaming import SSEFormat
-
         fmt = SSEFormat()
-        encoded = fmt.encode(1, b"test")
+        cipher, nonce = _make_cipher_and_nonce()
+        encoded = fmt.encrypt_chunk(1, 0x00, b"test", cipher, nonce)
 
-        # Extract just the base64url data
+        # Extract just the base64 data
         data_line = encoded.decode("ascii").split("\n")[1]
         data_bytes = data_line.replace("data: ", "").encode("ascii")
 
-        counter, ciphertext = fmt.decode(data_bytes)
+        counter, encoding_id, ciphertext = fmt.decode(data_bytes)
 
         assert counter == 1
-        assert ciphertext == b"test"
+        assert encoding_id == 0x00
+        # Decrypt to recover plaintext
+        pt_buf = bytearray(len(ciphertext) - 16)
+        cipher.decrypt_into(nonce, ciphertext, bytes((encoding_id,)), pt_buf)
+        assert bytes(pt_buf) == b"test"

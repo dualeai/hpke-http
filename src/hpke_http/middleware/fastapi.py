@@ -70,6 +70,7 @@ from hpke_http.core import (
     ResponseEncryptor,
     SSEEncryptor,
     SSEEventParser,
+    _check_zstd_available,  # pyright: ignore[reportPrivateUsage]
     _parse_suite_header,  # pyright: ignore[reportPrivateUsage]
     is_sse_response,
 )
@@ -127,7 +128,7 @@ class _DecryptionState:
     first_chunk_returned: bool = False
     """Whether pre-validated first chunk has been returned."""
 
-    pending_chunks: list[bytes] = field(default_factory=list[bytes])
+    pending_chunks: list[bytes | bytearray] = field(default_factory=list[bytes | bytearray])
     """Extra chunks from first feed() that must not be lost."""
 
 
@@ -156,8 +157,9 @@ class HPKEMiddleware:
     Features:
     - Decrypts request bodies encrypted with HPKE PSK mode
     - Auto-encrypts ALL responses when request was encrypted:
-      - SSE responses: Uses SSEFormat (base64url in SSE events)
-      - Standard responses: Uses RawFormat (binary length || counter || ciphertext)
+      - SSE responses: Uses SSEFormat (base64 in SSE events)
+      - Standard responses: Uses RawFormat (wire format v2:
+        length || counter || encoding_id || ct+tag)
     - Auto-registers /.well-known/hpke-keys discovery endpoint
 
     Response encryption is fully transparent - just use normal responses
@@ -207,7 +209,7 @@ class HPKEMiddleware:
 
         # Check zstd availability for compression support
         # If zstd unavailable, gzip (stdlib) is used as fallback
-        self._zstd_available = self._check_zstd_available()
+        self._zstd_available = _check_zstd_available()
 
         # Derive public keys for the discovery endpoint via the KEM registry.
         # Adding a new KEM = drop in primitives/<name>_kem.py + register; this
@@ -223,17 +225,6 @@ class HPKEMiddleware:
                 )
                 continue
             self._public_keys[kem_id] = kem.derive_public_key(sk)
-
-    @staticmethod
-    def _check_zstd_available() -> bool:
-        """Check if zstd decompression is available."""
-        try:
-            from hpke_http.streaming import import_zstd
-
-            import_zstd()
-            return True
-        except ImportError:
-            return False
 
     async def __call__(  # noqa: PLR0911, PLR0912, PLR0915 - ASGI entry point with auth + encryption guards
         self,
@@ -684,7 +675,7 @@ class HPKEMiddleware:
         self,
         state: _DecryptionState,
         receive: Receive,
-    ) -> bytes:
+    ) -> bytes | bytearray:
         """
         Read and decrypt first chunk to validate key before app starts.
 
@@ -721,7 +712,7 @@ class HPKEMiddleware:
         self,
         state: _DecryptionState,
         receive: Receive,
-        first_plaintext: bytes,
+        first_plaintext: bytes | bytearray,
     ) -> bytes:
         """
         Read and decrypt all chunks for compressed request, then decompress.
@@ -729,7 +720,7 @@ class HPKEMiddleware:
         Returns the full decompressed body. Must buffer all data because
         client compresses full body before chunking.
         """
-        parts: list[bytes] = [first_plaintext] if first_plaintext else []
+        parts: list[bytes | bytearray] = [first_plaintext] if first_plaintext else []
         # Prepend any extra chunks captured from the first feed()
         parts.extend(state.pending_chunks)
         state.pending_chunks.clear()
@@ -856,11 +847,11 @@ class HPKEMiddleware:
         self,
         state: _DecryptionState,
         receive: Receive,
-        first_plaintext: bytes,
+        first_plaintext: bytes | bytearray,
     ) -> Receive:
         """Create receive function for non-compressed streaming decryption."""
         # Initialize with any extra chunks from the first feed() call
-        pending_chunks: list[bytes] = list(state.pending_chunks)
+        pending_chunks: list[bytes | bytearray] = list(state.pending_chunks)
         state.pending_chunks.clear()
 
         async def decrypted_receive() -> Message:

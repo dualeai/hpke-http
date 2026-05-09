@@ -10,7 +10,6 @@ Higher layers (``hpke.py``, ``core.py``, middleware) dispatch by ``KemId`` via
 shipped KEM module.
 """
 
-from hpke_http.primitives.aead import aead_open, aead_seal
 from hpke_http.primitives.kdf import labeled_expand, labeled_extract
 from hpke_http.primitives.kem import decap, encap, generate_keypair
 from hpke_http.primitives.kem_base import KEM, get_kem, register_kem, registered_kem_ids
@@ -25,8 +24,6 @@ __all__ = [
     "KEM",
     "X25519KEM",
     "XWingKEM",
-    "aead_open",
-    "aead_seal",
     "decap",
     "encap",
     "generate_keypair",

@@ -32,7 +32,7 @@ from hpke_http.hpke import (
     setup_recipient_psk,
     setup_sender_psk,
 )
-from hpke_http.primitives.aead import aead_open, aead_seal, compute_nonce
+from hpke_http.primitives.aead import compute_nonce
 from hpke_http.primitives.kdf import labeled_expand, labeled_extract
 from hpke_http.primitives.kem import generate_keypair
 from hpke_http.streaming import (
@@ -165,21 +165,6 @@ def test_bench_labeled_expand(benchmark: Any) -> None:
     """Benchmark HKDF-SHA256 LabeledExpand (called in key schedule)."""
     prk = secrets.token_bytes(32)
     benchmark(labeled_expand, prk, b"test_label", b"context_info", 32)
-
-
-def test_bench_aead_seal(benchmark: Any) -> None:
-    """Benchmark raw ChaCha20-Poly1305 seal (includes cipher instantiation)."""
-    key = secrets.token_bytes(32)
-    nonce = secrets.token_bytes(12)
-    benchmark(aead_seal, key, nonce, b"aad", b'{"status": "ok"}')
-
-
-def test_bench_aead_open(benchmark: Any) -> None:
-    """Benchmark raw ChaCha20-Poly1305 open (includes cipher instantiation)."""
-    key = secrets.token_bytes(32)
-    nonce = secrets.token_bytes(12)
-    ct = aead_seal(key, nonce, b"aad", b'{"status": "ok"}')
-    benchmark(aead_open, key, nonce, b"aad", ct)
 
 
 # ---------------------------------------------------------------------------
@@ -493,35 +478,51 @@ def test_bench_chunk_stream_parser(benchmark: Any, streaming_session: StreamingS
 # ---------------------------------------------------------------------------
 
 
-def test_bench_sse_format_encode(benchmark: Any) -> None:
-    """Benchmark SSEFormat.encode (counter + ciphertext → base64 SSE event)."""
+def test_bench_sse_format_encrypt_chunk(benchmark: Any, streaming_session: StreamingSession) -> None:
+    """Benchmark SSEFormat.encrypt_chunk (combined-buffer encrypt + base64 SSE wrap)."""
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
     fmt = SSEFormat()
-    ciphertext = secrets.token_bytes(64 * 1024 + 16)  # 64KB + tag
-    benchmark(fmt.encode, 1, ciphertext)
+    cipher = ChaCha20Poly1305(streaming_session.session_key)
+    plaintext = secrets.token_bytes(64 * 1024)
+    nonce = streaming_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
+    benchmark(fmt.encrypt_chunk, 1, 0x00, plaintext, cipher, nonce)
 
 
-def test_bench_raw_format_encode(benchmark: Any) -> None:
-    """Benchmark RawFormat.encode (counter + ciphertext → binary wire)."""
+def test_bench_raw_format_encrypt_chunk(benchmark: Any, streaming_session: StreamingSession) -> None:
+    """Benchmark RawFormat.encrypt_chunk (combined-buffer encrypt + binary wire)."""
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
     fmt = RawFormat()
-    ciphertext = secrets.token_bytes(64 * 1024 + 16)
-    benchmark(fmt.encode, 1, ciphertext)
+    cipher = ChaCha20Poly1305(streaming_session.session_key)
+    plaintext = secrets.token_bytes(64 * 1024)
+    nonce = streaming_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
+    benchmark(fmt.encrypt_chunk, 1, 0x00, plaintext, cipher, nonce)
 
 
-def test_bench_sse_format_decode(benchmark: Any) -> None:
-    """Benchmark SSEFormat.decode (base64 → counter + ciphertext)."""
+def test_bench_sse_format_decode(benchmark: Any, streaming_session: StreamingSession) -> None:
+    """Benchmark SSEFormat.decode (base64 → counter + encoding_id + ciphertext)."""
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
     fmt = SSEFormat()
-    ciphertext = secrets.token_bytes(64 * 1024 + 16)
-    encoded = fmt.encode(1, ciphertext)
+    cipher = ChaCha20Poly1305(streaming_session.session_key)
+    plaintext = secrets.token_bytes(64 * 1024)
+    nonce = streaming_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
+    encoded = fmt.encrypt_chunk(1, 0x00, plaintext, cipher, nonce)
     # Extract the base64 data field
     data = encoded.split(b"data: ", 1)[1].split(b"\n", 1)[0]
     benchmark(fmt.decode, data)
 
 
-def test_bench_raw_format_decode(benchmark: Any) -> None:
-    """Benchmark RawFormat.decode (binary wire → counter + ciphertext)."""
+def test_bench_raw_format_decode(benchmark: Any, streaming_session: StreamingSession) -> None:
+    """Benchmark RawFormat.decode (binary wire → counter + encoding_id + ciphertext)."""
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
     fmt = RawFormat()
-    ciphertext = secrets.token_bytes(64 * 1024 + 16)
-    encoded = fmt.encode(1, ciphertext)
+    cipher = ChaCha20Poly1305(streaming_session.session_key)
+    plaintext = secrets.token_bytes(64 * 1024)
+    nonce = streaming_session.session_salt + b"\x00\x00\x00\x00" + (1).to_bytes(4, "little")
+    encoded = fmt.encrypt_chunk(1, 0x00, plaintext, cipher, nonce)
     benchmark(fmt.decode, encoded)
 
 
