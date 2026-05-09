@@ -14,6 +14,7 @@ References:
 - RFC 9180 §5.1.2 (PSK mode)
 """
 
+import functools
 from enum import Enum, IntEnum
 from typing import Final
 
@@ -35,18 +36,54 @@ class KemId(IntEnum):
     DHKEM_X25519_HKDF_SHA256 = 0x0020
     """DHKEM(X25519, HKDF-SHA256) - RFC 9180 recommended."""
 
-    # Future: X-Wing (X25519 + ML-KEM-768) - draft-connolly-cfrg-xwing-kem
-    # X_WING = 0x647A
+    XWING = 0x647A
+    """X-Wing hybrid KEM (X25519 + ML-KEM-768) — draft-connolly-cfrg-xwing-kem-10.
+
+    IANA early-allocation, references draft-06; subject to change before RFC
+    publication. See XWING_DRAFT_REVISION below.
+    """
 
 
 # Default KEM for this implementation
 KEM_ID: Final[int] = KemId.DHKEM_X25519_HKDF_SHA256
+
+# Client-side preference order when picking a suite from a discovery doc.
+# Higher entries win over lower. Selection is strict: ``_select_suite``
+# raises ``KeyDiscoveryError`` if no entry matches the server-advertised
+# keys. Adding a new KEM = add its KemId at the desired position.
+#
+# Post-quantum hybrids first: ``hpke-http`` defaults to PQ when the server
+# advertises a PQ-capable KEM, falling back to classical X25519 otherwise.
+# Clients that need to force a specific suite override via the
+# ``kem_priority`` constructor kwarg on ``BaseHPKEClient``.
+DEFAULT_KEM_PRIORITY: Final[tuple[KemId, ...]] = (
+    KemId.XWING,
+    KemId.DHKEM_X25519_HKDF_SHA256,
+)
 
 # X25519 key sizes
 X25519_PUBLIC_KEY_SIZE: Final[int] = 32
 X25519_PRIVATE_KEY_SIZE: Final[int] = 32
 X25519_SHARED_SECRET_SIZE: Final[int] = 32
 X25519_ENC_SIZE: Final[int] = 32  # Encapsulated key size
+
+# X-Wing key sizes (draft-connolly-cfrg-xwing-kem-10 §4)
+XWING_PUBLIC_KEY_SIZE: Final[int] = 1216  # pk_M (1184) || pk_X (32)
+XWING_PRIVATE_KEY_SEED_SIZE: Final[int] = 32  # 32-byte seed; expanded to internal keys
+XWING_ENC_SIZE: Final[int] = 1120  # ct_M (1088) || ct_X (32)
+XWING_SHARED_SECRET_SIZE: Final[int] = 32  # SHA3-256 output
+
+# X-Wing combiner label (draft-10 §5.2): hex 5c2e2f2f5e5c, 6 bytes.
+XWING_LABEL: Final[bytes] = bytes.fromhex("5c2e2f2f5e5c")
+
+# Pinned draft revision for KAT fixtures + cross-impl interop debugging.
+# Bump together with combiner formula / wire-format changes.
+XWING_DRAFT_REVISION: Final[str] = "draft-connolly-cfrg-xwing-kem-10"
+
+# ML-KEM-768 sub-component sizes (FIPS 203). X-Wing splits its pk and enc
+# at these boundaries.
+MLKEM768_PUBLIC_KEY_SIZE: Final[int] = 1184
+MLKEM768_CIPHERTEXT_SIZE: Final[int] = 1088
 
 # =============================================================================
 # KDF Identifiers (RFC 9180 §7.2)
@@ -119,11 +156,16 @@ PSK_MIN_SIZE: Final[int] = 32
 # =============================================================================
 
 
+@functools.lru_cache(maxsize=8)
 def build_suite_id(kem_id: int = KEM_ID, kdf_id: int = KDF_ID, aead_id: int = AEAD_ID) -> bytes:
     """
     Build the suite_id for HPKE operations.
 
     suite_id = "HPKE" || I2OSP(kem_id, 2) || I2OSP(kdf_id, 2) || I2OSP(aead_id, 2)
+
+    Cached: with a fixed (kdf_id, aead_id) and a small set of registered KEMs,
+    cache hit rate is effectively 100% in production. Avoids ~300 ns of
+    allocation+concat overhead per HPKE setup call.
 
     Args:
         kem_id: KEM algorithm identifier
@@ -175,6 +217,31 @@ HEADER_HPKE_ERROR: Final[str] = "X-HPKE-Error"
 Set to "true" on all error responses (400, 401, 415, 426) from the middleware.
 Clients with require_encryption=True use this to distinguish middleware errors
 (which can't be encrypted) from plaintext pass-through responses.
+"""
+
+HEADER_HPKE_SUITE: Final[str] = "X-HPKE-Suite"
+"""Header announcing the KEM the client used for encapsulation.
+
+Value format (strict): ``kem=0x{kem_id:04x}``, lowercase hex, no whitespace,
+no extra params. Absent = legacy DHKEM(X25519, HKDF-SHA256), preserving wire
+byte-equivalence for X25519-only deployments.
+
+The server uses this header to look up the matching private key in
+``HPKEMiddleware.private_keys`` and to dispatch decap to the right KEM.
+Forward-compat: future revisions may add ``kdf=`` / ``aead=`` params; the
+current parser rejects extras strictly so clients cannot accidentally rely on
+unimplemented negotiation.
+"""
+
+MAX_HPKE_SUITE_HEADER_SIZE: Final[int] = 64
+"""Cap on ``X-HPKE-Suite`` value length to fail loud on malicious oversize."""
+
+MAX_HPKE_ENC_HEADER_SIZE: Final[int] = 4096
+"""Cap on ``X-HPKE-Enc`` (base64url) value length.
+
+Sized to fit any KEM with raw ``Nenc`` up to ~3 KB while leaving headroom
+under typical HTTP proxy header caps (8 KB nginx default). X-Wing's 1120-byte
+``enc`` is 1494 base64url chars, well below this cap.
 """
 
 RESPONSE_KEY_LABEL: Final[bytes] = b"response-key"

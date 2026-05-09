@@ -243,27 +243,54 @@ async def upload(request: Request) -> JSONResponse:
     return JSONResponse({"parts": parts})
 
 
+# Prefix for per-KEM private-key env vars. Encoded as
+# ``TEST_HPKE_KEY_<hex_kem_id>``; the test fixture writes one entry per
+# registered KEM, the server reads them all back and registers what it knows.
+_HPKE_KEY_ENV_PREFIX = "TEST_HPKE_KEY_"
+
+
 def _create_app() -> Starlette:
     """Create ASGI app with public routes + HPKE-protected routes.
 
     Reads configuration from environment variables:
-    - TEST_HPKE_PRIVATE_KEY: Hex-encoded X25519 private key
-    - TEST_PSK: Hex-encoded pre-shared key
-    - TEST_PSK_ID: Hex-encoded PSK ID
-    - TEST_COMPRESS: Enable Zstd compression for SSE responses ("true"/"false")
+    - ``TEST_HPKE_KEY_<hex_kem_id>``: Hex-encoded private key for the KEM
+      identified by the 4-hex-digit IANA HPKE id. One env var per KEM the
+      test fixture configured. At least one matching a registered KEM is
+      required (typically X25519 = ``TEST_HPKE_KEY_0020``).
+    - ``TEST_PSK``: Hex-encoded pre-shared key.
+    - ``TEST_PSK_ID``: Hex-encoded PSK ID.
+    - ``TEST_COMPRESS``: Enable Zstd compression for SSE responses
+      ("true"/"false").
+
+    Adding a new KEM does not require changes here — the loop below picks up
+    any ``TEST_HPKE_KEY_<hex>`` whose hex value matches a registered ``KemId``.
     """
     # Read config from environment
-    private_key_hex = os.environ.get("TEST_HPKE_PRIVATE_KEY", "")
     psk_hex = os.environ.get("TEST_PSK", "")
     psk_id_hex = os.environ.get("TEST_PSK_ID", "")
     compress_enabled = os.environ.get("TEST_COMPRESS", "").lower() == "true"
 
-    if not private_key_hex:
-        raise ValueError("TEST_HPKE_PRIVATE_KEY environment variable required")
-
-    private_key = bytes.fromhex(private_key_hex)
     psk = bytes.fromhex(psk_hex) if psk_hex else b""
     psk_id = bytes.fromhex(psk_id_hex) if psk_id_hex else b""
+
+    # Registry-driven private-key loading: parse every TEST_HPKE_KEY_<hex>
+    # env var into a (KemId → bytes) dict. Unknown hex values are skipped
+    # (forward-compat with future KEMs the test runtime registers but the
+    # server runtime doesn't).
+    private_keys: dict[KemId, bytes] = {}
+    for env_name, env_value in os.environ.items():
+        if not env_name.startswith(_HPKE_KEY_ENV_PREFIX):
+            continue
+        try:
+            kem_id = KemId(int(env_name[len(_HPKE_KEY_ENV_PREFIX) :], 16))
+        except ValueError:
+            continue
+        private_keys[kem_id] = bytes.fromhex(env_value)
+    if not private_keys:
+        raise ValueError(
+            f"At least one {_HPKE_KEY_ENV_PREFIX}<hex_kem_id> env var must be set "
+            "with a registered KEM id (e.g. TEST_HPKE_KEY_0020 for X25519)."
+        )
 
     # Protected routes (behind HPKE middleware with PSK auth)
     protected_routes = [
@@ -302,10 +329,13 @@ def _create_app() -> Starlette:
             return (psk_store[client_psk_id], client_psk_id)
         raise ValueError(f"Unknown PSK ID: {client_psk_id!r}")
 
-    # HPKE middleware wraps only the protected app
+    # HPKE middleware wraps only the protected app. ``private_keys`` was
+    # built from the env block above and contains every KEM the test
+    # fixture configured. Server advertises all of them on its discovery
+    # doc; clients pick which to use via their own ``kem_priority``.
     hpke_app = HPKEMiddleware(
         app=protected_app,
-        private_keys={KemId.DHKEM_X25519_HKDF_SHA256: private_key},
+        private_keys=private_keys,
         psk_resolver=psk_resolver,
         compress=compress_enabled,
     )
@@ -319,7 +349,6 @@ def _create_app() -> Starlette:
     )
 
 
-# Module-level app instance for granian
-# Only create app if env vars are set (granian will set them, pytest won't)
-_private_key_hex = os.environ.get("TEST_HPKE_PRIVATE_KEY", "")
-app = _create_app() if _private_key_hex else None
+# Module-level app instance for granian. Only create app if env vars are set
+# (granian sets them via the test fixture; pytest module-import does not).
+app = _create_app() if any(k.startswith(_HPKE_KEY_ENV_PREFIX) for k in os.environ) else None

@@ -2,7 +2,7 @@
 
 import pytest
 
-from hpke_http.constants import MAX_DECOMPRESSED_CHUNK_SIZE
+from hpke_http.constants import MAX_DECOMPRESSED_CHUNK_SIZE, KemId
 from hpke_http.exceptions import ReplayAttackError
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
 from hpke_http.streaming import (
@@ -332,15 +332,16 @@ class TestSessionFromContext:
 
     def test_session_from_hpke_context(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Test that sender and recipient derive same session key."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
 
-        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id)
-        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id)
+        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id, kem_id=kem)
+        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id, kem_id=kem)
 
         # Create sessions from both contexts
         sender_session = create_session_from_context(sender_ctx)

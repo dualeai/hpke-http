@@ -43,21 +43,24 @@ import time
 import weakref
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, ClassVar
 from urllib.parse import urljoin, urlparse
 
 from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     CHUNK_SIZE,
+    DEFAULT_KEM_PRIORITY,
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_CACHE_MAX_ENTRIES,
     DISCOVERY_PATH,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
-    HEADER_HPKE_ERROR,
     HEADER_HPKE_STREAM,
+    HEADER_HPKE_SUITE,
     MAX_CHUNK_WIRE_SIZE,
+    MAX_HPKE_ENC_HEADER_SIZE,
+    MAX_HPKE_SUITE_HEADER_SIZE,
     RAW_LENGTH_PREFIX_SIZE,
     REQUEST_KEY_LABEL,
     RESPONSE_KEY_LABEL,
@@ -66,13 +69,18 @@ from hpke_http.constants import (
     EncodingName,
     KemId,
 )
-from hpke_http.exceptions import DecryptionError, EncryptionRequiredError, KeyDiscoveryError
+from hpke_http.exceptions import (
+    DecryptionError,
+    KeyDiscoveryError,
+    UnsupportedKEMError,
+)
 from hpke_http.hpke import (
     RecipientContext,
     SenderContext,
     setup_recipient_psk,
     setup_sender_psk,
 )
+from hpke_http.primitives.kem_base import get_kem
 from hpke_http.streaming import (
     ChunkDecryptor,
     ChunkEncryptor,
@@ -102,6 +110,9 @@ __all__ = [
     "parse_cache_max_age",
     "parse_discovery_keys",
 ]
+
+
+_logger = logging.getLogger(__name__)
 
 
 def _check_zstd_available() -> bool:
@@ -388,6 +399,11 @@ def parse_cache_max_age(cache_control: str, default: int = DISCOVERY_CACHE_MAX_A
 def parse_discovery_keys(response: dict[str, Any]) -> dict[KemId, bytes]:
     """Parse keys from discovery endpoint response.
 
+    Forward-compatible: entries with unknown ``kem_id`` are warn-and-skipped
+    (a future server may advertise a KEM this client does not implement). The
+    function raises only if the doc is structurally invalid or zero entries
+    parse successfully.
+
     Args:
         response: JSON response from /.well-known/hpke-keys
 
@@ -395,7 +411,8 @@ def parse_discovery_keys(response: dict[str, Any]) -> dict[KemId, bytes]:
         Dict mapping KemId to public key bytes
 
     Raises:
-        KeyDiscoveryError: If response version is unsupported or key entries are malformed
+        KeyDiscoveryError: If response version is unsupported, the keys field
+            is missing, or no entry parses successfully.
     """
     # Validate discovery version (Fix #9)
     version = response.get("version")
@@ -404,13 +421,107 @@ def parse_discovery_keys(response: dict[str, Any]) -> dict[KemId, bytes]:
 
     result: dict[KemId, bytes] = {}
     for key_info in response.get("keys", []):
+        # Parse + validate the entry. Malformed entries (missing fields, bad
+        # hex, undecodable base64) raise — these indicate a broken server.
         try:
-            kem_id = KemId(int(key_info["kem_id"], 16))
+            raw_kem_id = int(key_info["kem_id"], 16)
             public_key = bytes(_b64url_decode(key_info["public_key"]))
         except (KeyError, ValueError, TypeError) as e:
             raise KeyDiscoveryError(f"Malformed key entry: {e}") from e
+
+        # Unknown-but-well-formed kem_id is forward-compat: a future server
+        # may advertise a KEM this client doesn't know. Warn-and-skip.
+        try:
+            kem_id = KemId(raw_kem_id)
+        except ValueError:
+            _logger.warning(
+                "Discovery doc: skipping entry with kem_id=0x%04x (unknown to this client)",
+                raw_kem_id,
+            )
+            continue
         result[kem_id] = public_key
     return result
+
+
+# ---------------------------------------------------------------------------
+# Suite header parsing + client suite selection
+# ---------------------------------------------------------------------------
+
+
+# Strict: ``kem=0x{kem_id:04x}``. Lowercase, no whitespace, no extras.
+# Future params (``kdf=``, ``aead=``) are NOT accepted by this regex; bumping
+# the wire format requires bumping the regex.
+_SUITE_HEADER_RE = re.compile(r"^kem=0x([0-9a-f]{4})$")
+
+
+def _parse_suite_header(value: str) -> KemId:
+    """Parse the ``X-HPKE-Suite`` header value into a KemId.
+
+    Strict parser: rejects whitespace, mixed case, extra params, or unknown
+    KemId values. Server returns 400 on parse failure.
+
+    Args:
+        value: raw header value (already length-capped by caller)
+
+    Returns:
+        Parsed KemId.
+
+    Raises:
+        DecryptionError: malformed header (HTTP 400 territory).
+        UnsupportedKEMError: known-shape header but kem_id is not registered
+            on this server (HTTP 415 territory).
+    """
+    if len(value) > MAX_HPKE_SUITE_HEADER_SIZE:
+        raise DecryptionError(f"{HEADER_HPKE_SUITE} value too long")
+    m = _SUITE_HEADER_RE.match(value)
+    if not m:
+        raise DecryptionError(f"Malformed {HEADER_HPKE_SUITE} header")
+    raw = int(m.group(1), 16)
+    try:
+        return KemId(raw)
+    except ValueError as e:
+        # Known-shape but unknown id: client speaks a KEM this server doesn't
+        # know. Distinguished from "malformed" so caller can map to 415.
+        raise UnsupportedKEMError(f"Unknown kem_id=0x{raw:04x}") from e
+
+
+def _select_suite(
+    keys: dict[KemId, bytes],
+    *,
+    priority: Sequence[KemId] = DEFAULT_KEM_PRIORITY,
+) -> tuple[KemId, bytes]:
+    """Pick a (kem_id, public_key) pair from a discovery-doc result.
+
+    Walks ``priority`` left-to-right; first KEM the server advertises wins.
+    Default priority (``DEFAULT_KEM_PRIORITY``) is post-quantum-first:
+    X-Wing > X25519. Server with both keys → client picks X-Wing
+    automatically. Server with only X25519 → client picks X25519. Server
+    with only X-Wing → client picks X-Wing.
+
+    Strict: if no priority entry matches (e.g. the server advertises only
+    a KEM the client doesn't have in its priority list, or the user pinned
+    classical-only and the server only advertises X-Wing), raise rather
+    than silently fall back to an unlisted KEM. Picking a KEM the client
+    didn't list violates pinning intent; picking a KEM the client doesn't
+    have a primitive for would crash at encap anyway.
+
+    Args:
+        keys: registry → public-key bytes, as returned by
+            ``parse_discovery_keys``.
+        priority: client-side preference order. Default prefers PQ.
+
+    Returns:
+        ``(kem_id, public_key)`` ready to feed ``RequestEncryptor``.
+
+    Raises:
+        KeyDiscoveryError: no priority entry matches the server's keys.
+    """
+    for kem_id in priority:
+        if kem_id in keys:
+            return (kem_id, keys[kem_id])
+    advertised = ", ".join(f"0x{int(k):04x}" for k in keys) or "(none)"
+    wanted = ", ".join(f"0x{int(k):04x}" for k in priority) or "(empty)"
+    raise KeyDiscoveryError(f"No KEM in priority list ({wanted}) matches server-advertised KEMs ({advertised})")
 
 
 def parse_accept_encoding(header: str) -> set[str]:
@@ -462,6 +573,7 @@ class BaseHPKEClient(ABC):
         *,
         compress: bool = False,
         require_encryption: bool = False,
+        kem_priority: Sequence[KemId] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         """
@@ -475,6 +587,11 @@ class BaseHPKEClient(ABC):
             compress: Enable Zstd compression for request bodies
             require_encryption: If True, raise EncryptionRequiredError when
                 server responds with plaintext instead of encrypted response.
+            kem_priority: Suite preference order when picking from the
+                discovery doc. Default is ``DEFAULT_KEM_PRIORITY`` from
+                ``hpke_http.constants``: post-quantum first (X-Wing), then
+                classical X25519. Override to force a specific order, e.g.
+                ``[KemId.DHKEM_X25519_HKDF_SHA256]`` to pin classical only.
             logger: Logger instance for debug output
         """
         self.base_url = base_url.rstrip("/")
@@ -483,6 +600,7 @@ class BaseHPKEClient(ABC):
         self.discovery_url = discovery_url or urljoin(self.base_url, DISCOVERY_PATH)
         self.compress = compress
         self.require_encryption = require_encryption
+        self._kem_priority: Sequence[KemId] = kem_priority if kem_priority is not None else DEFAULT_KEM_PRIORITY
         self._logger = logger
 
         self._platform_keys: dict[KemId, bytes] | None = None
@@ -636,13 +754,8 @@ class BaseHPKEClient(ABC):
             Tuple of (chunk_iterator, headers_dict, sender_context)
 
         Raises:
-            KeyDiscoveryError: If no X25519 key available
+            KeyDiscoveryError: If no compatible KEM key is advertised.
         """
-        # Use X25519 (default suite)
-        pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
-        if not pk_r:
-            raise KeyDiscoveryError("No X25519 key available from platform")
-
         # Auto-negotiate compression: use best available encoding
         # Priority: zstd > gzip > identity
         # This prevents 415 errors when server lacks zstd support
@@ -650,10 +763,8 @@ class BaseHPKEClient(ABC):
         effective_compress = best_encoding != EncodingName.IDENTITY
 
         # Use centralized RequestEncryptor - handles compression, chunking, encryption
-        encryptor = RequestEncryptor(
-            public_key=pk_r,
-            psk=self.psk,
-            psk_id=self.psk_id,
+        encryptor = self._make_encryptor(
+            keys,
             compress=effective_compress,
             zstd=(best_encoding == EncodingName.ZSTD),  # Use zstd only if negotiated
         )
@@ -691,19 +802,10 @@ class BaseHPKEClient(ABC):
             Tuple of (headers_dict, sender_context)
 
         Raises:
-            KeyDiscoveryError: If no X25519 key available
+            KeyDiscoveryError: If no compatible KEM key is advertised.
         """
         keys = await self._ensure_keys()
-
-        pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
-        if not pk_r:
-            raise KeyDiscoveryError("No X25519 key available from platform")
-
-        encryptor = RequestEncryptor(
-            public_key=pk_r,
-            psk=self.psk,
-            psk_id=self.psk_id,
-        )
+        encryptor = self._make_encryptor(keys)
         headers = encryptor.get_headers()
 
         if self._logger:
@@ -711,36 +813,28 @@ class BaseHPKEClient(ABC):
 
         return (headers, encryptor.context)
 
-    def _check_encrypted_response(
+    def _make_encryptor(
         self,
-        response_headers: Mapping[str, Any],
-        sender_ctx: SenderContext | None,
-    ) -> bool:
-        """Check if response is encrypted and should be wrapped.
+        keys: dict[KemId, bytes],
+        *,
+        compress: bool = False,
+        zstd: bool = True,
+    ) -> RequestEncryptor:
+        """Pick a suite from ``keys`` (honoring ``self._kem_priority``) and
+        build a ``RequestEncryptor`` with the client's PSK identity.
 
-        Args:
-            response_headers: Response headers
-            sender_ctx: Sender context from request encryption (None if unencrypted request)
-
-        Returns:
-            True if response should be wrapped in DecryptedResponse
-
-        Raises:
-            EncryptionRequiredError: If require_encryption is True and response is plaintext
+        Centralizes the ``_select_suite`` + ``RequestEncryptor(...)`` pattern
+        shared by every client encryption path.
         """
-        if not sender_ctx:
-            return False
-
-        if HEADER_HPKE_STREAM in response_headers:
-            content_type = response_headers.get("Content-Type", "")
-            if "text/event-stream" not in str(content_type):
-                return True
-        elif self.require_encryption:
-            # Allow error responses from HPKE middleware through (they can't be encrypted)
-            if HEADER_HPKE_ERROR.lower() not in {str(k).lower() for k in response_headers}:
-                raise EncryptionRequiredError("Response was not encrypted")
-
-        return False
+        kem_id, pk_r = _select_suite(keys, priority=self._kem_priority)
+        return RequestEncryptor(
+            public_key=pk_r,
+            psk=self.psk,
+            psk_id=self.psk_id,
+            compress=compress,
+            zstd=zstd,
+            kem_id=kem_id,
+        )
 
 
 # =============================================================================
@@ -773,17 +867,22 @@ class RequestEncryptor:
         *,
         compress: bool = False,
         zstd: bool = True,
+        kem_id: KemId = KemId.DHKEM_X25519_HKDF_SHA256,
     ) -> None:
         """
         Initialize request encryptor.
 
         Args:
-            public_key: Server's X25519 public key (32 bytes)
+            public_key: Server's public key (size depends on kem_id)
             psk: Pre-shared key / API key (>= 32 bytes)
             psk_id: PSK identifier (e.g., tenant ID)
             compress: Enable compression for request body.
             zstd: Allow zstd compression. If False, uses gzip.
                 Priority: zstd (if allowed and available) > gzip.
+            kem_id: KEM to use for encapsulation. Defaults to X25519 for
+                back-compat. The on-wire ``X-HPKE-Suite`` header is emitted
+                only when this differs from the legacy default, keeping
+                X25519 traffic byte-equivalent to pre-refactor behavior.
         """
         self._compress = compress
         self._was_compressed = False
@@ -791,11 +890,10 @@ class RequestEncryptor:
         # Check zstd availability only if compression enabled and zstd allowed
         self._zstd_available = _check_zstd_available() if (compress and zstd) else False
 
-        # Store PSK ID for header (RFC 9180 §5.1 - psk_id should be transported)
-        self._psk_id = psk_id
+        self._kem_id = kem_id
 
         # Set up HPKE context
-        self._ctx = setup_sender_psk(pk_r=public_key, info=psk_id, psk=psk, psk_id=psk_id)
+        self._ctx = setup_sender_psk(pk_r=public_key, info=psk_id, psk=psk, psk_id=psk_id, kem_id=kem_id)
 
         # Derive request key and create session
         request_key = self._ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
@@ -825,6 +923,10 @@ class RequestEncryptor:
             HEADER_HPKE_ENC: _b64url_encode(self._ctx.enc),
             HEADER_HPKE_STREAM: _b64url_encode(self._session.session_salt),
         }
+        # Signal non-default suite. Omitted for the legacy X25519 default so
+        # X25519 traffic is wire byte-equivalent to pre-refactor behavior.
+        if self._kem_id != KemId.DHKEM_X25519_HKDF_SHA256:
+            headers[HEADER_HPKE_SUITE] = f"kem=0x{int(self._kem_id):04x}"
         # Signal whole-body compression via header (chunks have 0x00 encoding ID)
         if self._was_compressed and self._encoding:
             headers[HEADER_HPKE_ENCODING] = self._encoding
@@ -1175,24 +1277,46 @@ class RequestDecryptor:
         private_key: bytes,
         psk: bytes,
         psk_id: bytes,
+        *,
+        kem_id: KemId | None = None,
     ) -> None:
         """
         Initialize request decryptor.
 
         Args:
-            headers: Request headers (parses X-HPKE-Enc, X-HPKE-Stream)
-            private_key: Server's X25519 private key (32 bytes)
+            headers: Request headers (parses X-HPKE-Enc, X-HPKE-Stream,
+                X-HPKE-Suite). When ``X-HPKE-Suite`` is absent the legacy
+                X25519 suite is assumed (back-compat).
+            private_key: Server's private key bytes for the chosen KEM.
             psk: Pre-shared key (must match client)
             psk_id: PSK identifier (must match client)
+            kem_id: Optional override; if provided, ignores any
+                ``X-HPKE-Suite`` header and uses this KEM. Used by the
+                middleware after it has already routed the request to the
+                right private key.
 
         Raises:
-            DecryptionError: If required headers are missing
+            DecryptionError: If required headers are missing or malformed.
+            UnsupportedKEMError: ``X-HPKE-Suite`` advertises a KEM not
+                registered on this server.
         """
-        # Parse enc from header
+        # Suite negotiation: explicit kwarg wins; otherwise parse the header;
+        # fallback to the legacy default for back-compat with old clients.
+        if kem_id is None:
+            suite_header = _get_header(headers, HEADER_HPKE_SUITE)
+            kem_id = _parse_suite_header(suite_header) if suite_header else KemId.DHKEM_X25519_HKDF_SHA256
+        self._kem_id = kem_id
+        kem = get_kem(kem_id)
+
+        # Parse enc from header. Length-cap to fail loud on adversarial sizes.
         enc_header = _get_header(headers, HEADER_HPKE_ENC)
         if not enc_header:
             raise DecryptionError(f"Missing {HEADER_HPKE_ENC} header")
+        if len(enc_header) > MAX_HPKE_ENC_HEADER_SIZE:
+            raise DecryptionError(f"{HEADER_HPKE_ENC} value too long")
         enc = _b64url_decode(enc_header)
+        # Reject before allocating crypto state (defends against malicious sizes).
+        kem.validate_enc(enc)
 
         # Parse session salt from header
         stream_header = _get_header(headers, HEADER_HPKE_STREAM)
@@ -1208,8 +1332,15 @@ class RequestDecryptor:
         self._is_compressed = encoding_header in (EncodingName.ZSTD, EncodingName.GZIP)
         self._encoding = encoding_header if self._is_compressed else None
 
-        # Set up HPKE context
-        self._ctx = setup_recipient_psk(enc=enc, sk_r=private_key, info=psk_id, psk=psk, psk_id=psk_id)
+        # Set up HPKE context (suite-aware via the KEM identifier above).
+        self._ctx = setup_recipient_psk(
+            enc=enc,
+            sk_r=private_key,
+            info=psk_id,
+            psk=psk,
+            psk_id=psk_id,
+            kem_id=self._kem_id,
+        )
 
         # Derive request key and create session
         request_key = self._ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)

@@ -8,48 +8,16 @@ import aiohttp
 import pytest
 
 from hpke_http.constants import (
-    CHACHA20_POLY1305_KEY_SIZE,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
-    REQUEST_KEY_LABEL,
+    HEADER_HPKE_SUITE,
+    KemId,
 )
 from hpke_http.core import parse_accept_encoding
-from hpke_http.headers import b64url_encode
-from hpke_http.hpke import setup_sender_psk
-from hpke_http.streaming import ChunkEncryptor, RawFormat, StreamingSession
 
-from .conftest import E2EServer
-
-
-def _encrypt_request(
-    body: bytes,
-    pk_r: bytes,
-    psk: bytes,
-    psk_id: bytes,
-) -> tuple[bytes, str, str, str]:
-    """Encrypt request body for testing using chunked streaming format.
-
-    Returns:
-        Tuple of (encrypted_body, enc_header_value, stream_header_value, psk_id_header_value)
-    """
-    ctx = setup_sender_psk(
-        pk_r=pk_r,
-        info=psk_id,
-        psk=psk,
-        psk_id=psk_id,
-    )
-    request_key = ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
-    session = StreamingSession.create(request_key)
-    encryptor = ChunkEncryptor(session, format=RawFormat(), compress=False)
-
-    encrypted_body = encryptor.encrypt(body) if body else encryptor.encrypt(b"")
-    enc_header = b64url_encode(ctx.enc)
-    stream_header = b64url_encode(session.session_salt)
-    psk_id_header = b64url_encode(psk_id)
-    return (encrypted_body, enc_header, stream_header, psk_id_header)
-
+from .conftest import E2EServer, encrypt_chunked_request
 
 # =============================================================================
 # Discovery Endpoint Tests
@@ -97,15 +65,19 @@ class TestUnsupportedEncodingRejection:
     async def test_zstd_rejected_when_unavailable(
         self,
         granian_server_no_zstd: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """X-HPKE-Encoding: zstd to server without zstd returns 415."""
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
+        _sk, pk = platform_keys[kem]
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
             b'{"test": "data"}',
-            granian_server_no_zstd.public_key,
+            pk,
             test_psk,
             test_psk_id,
+            kem_id=kem,
         )
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -114,6 +86,7 @@ class TestUnsupportedEncodingRejection:
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_PSK_ID: psk_id_header,
+                    HEADER_HPKE_SUITE: suite_header,
                     HEADER_HPKE_ENCODING: "zstd",
                     "Content-Type": "application/octet-stream",
                 },
@@ -129,15 +102,19 @@ class TestUnsupportedEncodingRejection:
     async def test_uppercase_zstd_ignored(
         self,
         granian_server_no_zstd: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """X-HPKE-Encoding: ZSTD (uppercase) is rejected as unknown (case-sensitive)."""
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
+        _sk, pk = platform_keys[kem]
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
             b'{"test": "data"}',
-            granian_server_no_zstd.public_key,
+            pk,
             test_psk,
             test_psk_id,
+            kem_id=kem,
         )
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -146,6 +123,7 @@ class TestUnsupportedEncodingRejection:
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_PSK_ID: psk_id_header,
+                    HEADER_HPKE_SUITE: suite_header,
                     HEADER_HPKE_ENCODING: "ZSTD",  # Uppercase - should be ignored
                     "Content-Type": "application/octet-stream",
                 },
@@ -157,6 +135,8 @@ class TestUnsupportedEncodingRejection:
     async def test_zstd_accepted_when_available(
         self,
         granian_server: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -166,11 +146,13 @@ class TestUnsupportedEncodingRejection:
         compressed, so it will fail with 400 during decompression, not 415.
         The point is that it passes the early 415 check.
         """
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
+        _sk, pk = platform_keys[kem]
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
             b'{"test": "data"}',
-            granian_server.public_key,
+            pk,
             test_psk,
             test_psk_id,
+            kem_id=kem,
         )
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -179,6 +161,7 @@ class TestUnsupportedEncodingRejection:
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_PSK_ID: psk_id_header,
+                    HEADER_HPKE_SUITE: suite_header,
                     HEADER_HPKE_ENCODING: "zstd",
                     "Content-Type": "application/octet-stream",
                 },
@@ -210,17 +193,21 @@ class TestEncodingEdgeCases:
     async def test_encoding_values(
         self,
         granian_server_no_zstd: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
         encoding: str,
         expected_status: int,
     ) -> None:
         """Test various X-HPKE-Encoding values against no-zstd server."""
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
+        _sk, pk = platform_keys[kem]
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
             b'{"test": "data"}',
-            granian_server_no_zstd.public_key,
+            pk,
             test_psk,
             test_psk_id,
+            kem_id=kem,
         )
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -229,6 +216,7 @@ class TestEncodingEdgeCases:
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_PSK_ID: psk_id_header,
+                    HEADER_HPKE_SUITE: suite_header,
                     HEADER_HPKE_ENCODING: encoding,
                     "Content-Type": "application/octet-stream",
                 },
@@ -239,15 +227,19 @@ class TestEncodingEdgeCases:
     async def test_empty_encoding_accepted(
         self,
         granian_server_no_zstd: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Empty X-HPKE-Encoding header is treated as identity."""
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
+        _sk, pk = platform_keys[kem]
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
             b'{"test": "data"}',
-            granian_server_no_zstd.public_key,
+            pk,
             test_psk,
             test_psk_id,
+            kem_id=kem,
         )
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -256,6 +248,7 @@ class TestEncodingEdgeCases:
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_PSK_ID: psk_id_header,
+                    HEADER_HPKE_SUITE: suite_header,
                     HEADER_HPKE_ENCODING: "",
                     "Content-Type": "application/octet-stream",
                 },
@@ -266,15 +259,19 @@ class TestEncodingEdgeCases:
     async def test_no_encoding_header_accepted(
         self,
         granian_server_no_zstd: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Missing X-HPKE-Encoding header is treated as identity."""
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(
+        _sk, pk = platform_keys[kem]
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
             b'{"test": "data"}',
-            granian_server_no_zstd.public_key,
+            pk,
             test_psk,
             test_psk_id,
+            kem_id=kem,
         )
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -283,6 +280,7 @@ class TestEncodingEdgeCases:
                     HEADER_HPKE_ENC: enc_header,
                     HEADER_HPKE_STREAM: stream_header,
                     HEADER_HPKE_PSK_ID: psk_id_header,
+                    HEADER_HPKE_SUITE: suite_header,
                     # No X-HPKE-Encoding header
                     "Content-Type": "application/octet-stream",
                 },

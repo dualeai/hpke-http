@@ -149,6 +149,7 @@ class TestEncryptRequestSync:
     async def test_returns_iterator_headers_context(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -157,7 +158,7 @@ class TestEncryptRequestSync:
 
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
-        async with HPKEClientSession(base_url, test_psk, test_psk_id) as client:
+        async with HPKEClientSession(base_url, test_psk, test_psk_id, kem_priority=[kem]) as client:
             keys = await client._ensure_keys()  # noqa: SLF001
             iterator, headers, ctx = client._encrypt_request_sync(b"test body", keys)  # noqa: SLF001
 
@@ -176,6 +177,7 @@ class TestEncryptRequestSync:
     async def test_encrypt_with_compression(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -184,7 +186,7 @@ class TestEncryptRequestSync:
 
         base_url = f"http://{granian_server.host}:{granian_server.port}"
 
-        async with HPKEClientSession(base_url, test_psk, test_psk_id, compress=True) as client:
+        async with HPKEClientSession(base_url, test_psk, test_psk_id, compress=True, kem_priority=[kem]) as client:
             keys = await client._ensure_keys()  # noqa: SLF001
             # Use large body to trigger compression (>= ZSTD_MIN_SIZE)
             large_body = b"x" * 100

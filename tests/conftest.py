@@ -4,14 +4,13 @@ import asyncio
 import contextlib
 import logging
 import os
-import secrets
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import IO, Any
 
@@ -21,8 +20,14 @@ import pytest
 import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import x25519
 
-from hpke_http.constants import PSK_MIN_SIZE
-from hpke_http.streaming import ChunkDecryptor, ChunkEncryptor, StreamingSession
+from hpke_http.constants import (
+    CHACHA20_POLY1305_KEY_SIZE,
+    REQUEST_KEY_LABEL,
+    KemId,
+)
+from hpke_http.headers import b64url_encode
+from hpke_http.hpke import setup_sender_psk
+from hpke_http.streaming import ChunkDecryptor, ChunkEncryptor, RawFormat, StreamingSession
 
 # Enable hpke_http debug logging during tests
 logging.getLogger("hpke_http").setLevel(logging.DEBUG)
@@ -100,16 +105,20 @@ CHI_SQUARE_P_THRESHOLD: float = 0.01
 
 
 @pytest.fixture(scope="session")
-def platform_keypair() -> tuple[bytes, bytes]:
-    """Generate a platform X25519 keypair for testing.
+def platform_keys() -> dict[KemId, tuple[bytes, bytes]]:
+    """Generate one platform keypair per registered KEM.
 
-    Session-scoped: one keypair per xdist worker, shared across all tests.
+    Session-scoped: one set of keypairs per xdist worker, shared across all
+    tests. Registry-driven: adding a new KEM via ``@register_kem`` makes its
+    keypair available here automatically — no fixture-name proliferation.
+
+    Returns:
+        ``dict`` mapping ``KemId`` → ``(private_key_bytes, public_key_bytes)``.
+        Look up the suite you want: ``platform_keys[KemId.XWING]``.
     """
-    private_key = x25519.X25519PrivateKey.generate()
-    return (
-        private_key.private_bytes_raw(),
-        private_key.public_key().public_bytes_raw(),
-    )
+    from hpke_http.primitives import get_kem, registered_kem_ids
+
+    return {kem_id: get_kem(kem_id).generate_keypair() for kem_id in registered_kem_ids()}
 
 
 @pytest.fixture
@@ -123,22 +132,6 @@ def client_keypair() -> tuple[bytes, bytes]:
 
 
 # === PSK Fixtures ===
-
-
-@pytest.fixture
-def psk_factory() -> Callable[[int], bytes]:
-    """Factory for generating PSKs of specified length.
-
-    Usage:
-        def test_something(psk_factory):
-            psk = psk_factory(32)  # Generate 32-byte PSK
-            psk_64 = psk_factory(64)  # Generate 64-byte PSK
-    """
-
-    def _make_psk(length: int = PSK_MIN_SIZE) -> bytes:
-        return secrets.token_bytes(length)
-
-    return _make_psk
 
 
 @pytest.fixture(scope="session")
@@ -172,6 +165,40 @@ def wrong_psk() -> bytes:
 def wrong_psk_id() -> bytes:
     """A PSK ID that differs from test_psk_id."""
     return b"wrong-tenant"
+
+
+# === Request Encryption Test Utilities ===
+
+
+def encrypt_chunked_request(
+    body: bytes,
+    pk_r: bytes,
+    psk: bytes,
+    psk_id: bytes,
+    kem_id: KemId,
+) -> tuple[bytes, str, str, str, str]:
+    """Build a single-chunk encrypted request for raw-aiohttp E2E tests.
+
+    Mirrors what ``HPKEClientSession`` does internally; used by tests that
+    bypass the client to send malformed or specially-crafted requests.
+
+    Returns:
+        ``(encrypted_body, enc_header, stream_header, psk_id_header,
+        suite_header)``. Caller threads ``suite_header`` into
+        ``HEADER_HPKE_SUITE`` unconditionally; server accepts the header for
+        any registered KEM.
+    """
+    ctx = setup_sender_psk(pk_r=pk_r, info=psk_id, psk=psk, psk_id=psk_id, kem_id=kem_id)
+    request_key = ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
+    session = StreamingSession.create(request_key)
+    encryptor = ChunkEncryptor(session, format=RawFormat(), compress=False)
+
+    encrypted_body = encryptor.encrypt(body) if body else encryptor.encrypt(b"")
+    enc_header = b64url_encode(ctx.enc)
+    stream_header = b64url_encode(session.session_salt)
+    psk_id_header = b64url_encode(psk_id)
+    suite_header = f"kem=0x{int(kem_id):04x}"
+    return (encrypted_body, enc_header, stream_header, psk_id_header, suite_header)
 
 
 # === SSE Test Utilities ===
@@ -270,19 +297,6 @@ class SSETestPair:
             data = extract_sse_data_field(encrypted)
             self.decryptor.decrypt(data)
 
-    def roundtrip(self, chunk: bytes) -> bytes:
-        """Encrypt then decrypt a chunk.
-
-        Args:
-            chunk: Data to roundtrip
-
-        Returns:
-            Decrypted data (should equal input)
-        """
-        encrypted = self.encryptor.encrypt(chunk)
-        data = extract_sse_data_field(encrypted)
-        return self.decryptor.decrypt(data)
-
 
 @pytest.fixture
 def sse_session() -> StreamingSession:
@@ -311,7 +325,6 @@ class E2EServer:
 
     host: str
     port: int
-    public_key: bytes
     _log_file: IO[bytes]
 
     def get_logs(self) -> str:
@@ -348,7 +361,7 @@ TEST_SERVER_MODULE = "tests.e2e_server:app"
 
 
 async def _start_granian_server(
-    platform_keypair: tuple[bytes, bytes],
+    platform_keys: dict[KemId, tuple[bytes, bytes]],
     test_psk: bytes,
     test_psk_id: bytes,
     *,
@@ -358,26 +371,34 @@ async def _start_granian_server(
     """Start granian server with HPKE middleware.
 
     Args:
-        platform_keypair: (private_key, public_key) tuple
+        platform_keys: ``KemId`` → ``(private_key, public_key)`` for every
+            KEM the server should register. Server advertises every entry on
+            its discovery doc; clients pick which to use via their own
+            ``kem_priority``.
         test_psk: Pre-shared key
         test_psk_id: Pre-shared key ID
         compress: Enable Zstd compression for SSE responses
         disable_zstd: Simulate zstd being unavailable (for 415 tests)
 
     Yields:
-        E2EServer with host, port, public_key, and log access
+        E2EServer with host, port, and log access.
     """
-    sk, pk = platform_keypair
+    if not platform_keys:
+        raise ValueError("platform_keys must contain at least one KEM")
     port = get_free_port()
     host = "127.0.0.1"
 
-    # Start granian as subprocess with env vars for config
+    # Start granian as subprocess with env vars for config. Serialize every
+    # configured KEM via a generic ``TEST_HPKE_KEY_<hex_kem_id>`` env var.
+    # Server reads this naming pattern back, no per-KEM hardcoding either side.
     env = {
         **dict(os.environ),
-        "TEST_HPKE_PRIVATE_KEY": sk.hex(),
         "TEST_PSK": test_psk.hex(),
         "TEST_PSK_ID": test_psk_id.hex(),
     }
+    for kem_id, (sk, _) in platform_keys.items():
+        env[f"TEST_HPKE_KEY_{int(kem_id):04x}"] = sk.hex()
+
     if compress:
         env["TEST_COMPRESS"] = "true"
     if disable_zstd:
@@ -419,7 +440,7 @@ async def _start_granian_server(
 
     try:
         await wait_for_server(host, port)
-        yield E2EServer(host=host, port=port, public_key=pk, _log_file=log_file)
+        yield E2EServer(host=host, port=port, _log_file=log_file)
     finally:
         # Kill entire process group to avoid orphaned workers
         _kill_process_group(signal.SIGTERM)
@@ -433,7 +454,7 @@ async def _start_granian_server(
 
 @pytest_asyncio.fixture
 async def granian_server(
-    platform_keypair: tuple[bytes, bytes],
+    platform_keys: dict[KemId, tuple[bytes, bytes]],
     test_psk: bytes,
     test_psk_id: bytes,
     request: pytest.FixtureRequest,
@@ -443,7 +464,7 @@ async def granian_server(
     Function-scoped: each test gets its own server with isolated logs.
     Server logs are printed to console after each test.
     """
-    async for server in _start_granian_server(platform_keypair, test_psk, test_psk_id):
+    async for server in _start_granian_server(platform_keys, test_psk, test_psk_id):
         yield server
         # Print server logs after test completes
         logs = server.get_logs()
@@ -459,7 +480,7 @@ async def granian_server(
 
 @pytest_asyncio.fixture
 async def granian_server_compressed(
-    platform_keypair: tuple[bytes, bytes],
+    platform_keys: dict[KemId, tuple[bytes, bytes]],
     test_psk: bytes,
     test_psk_id: bytes,
     request: pytest.FixtureRequest,
@@ -469,7 +490,7 @@ async def granian_server_compressed(
     Function-scoped: each test gets its own server with isolated logs.
     Server logs are printed to console after each test.
     """
-    async for server in _start_granian_server(platform_keypair, test_psk, test_psk_id, compress=True):
+    async for server in _start_granian_server(platform_keys, test_psk, test_psk_id, compress=True):
         yield server
         # Print server logs after test completes
         logs = server.get_logs()
@@ -485,7 +506,7 @@ async def granian_server_compressed(
 
 @pytest_asyncio.fixture
 async def granian_server_no_zstd(
-    platform_keypair: tuple[bytes, bytes],
+    platform_keys: dict[KemId, tuple[bytes, bytes]],
     test_psk: bytes,
     test_psk_id: bytes,
     request: pytest.FixtureRequest,
@@ -495,7 +516,7 @@ async def granian_server_no_zstd(
     Function-scoped: each test gets its own server with isolated logs.
     Used for testing 415 rejection when client sends zstd-compressed requests.
     """
-    async for server in _start_granian_server(platform_keypair, test_psk, test_psk_id, disable_zstd=True):
+    async for server in _start_granian_server(platform_keys, test_psk, test_psk_id, disable_zstd=True):
         yield server
         # Print server logs after test completes
         logs = server.get_logs()
@@ -509,40 +530,34 @@ async def granian_server_no_zstd(
             sys.stdout.flush()
 
 
-@pytest_asyncio.fixture
-async def granian_server_gzip_only(
-    platform_keypair: tuple[bytes, bytes],
-    test_psk: bytes,
-    test_psk_id: bytes,
-    request: pytest.FixtureRequest,
-) -> AsyncIterator[E2EServer]:
-    """Start granian server with compression enabled but zstd unavailable (gzip fallback).
-
-    Function-scoped: each test gets its own server with isolated logs.
-    Used for testing compression negotiation with gzip-only server.
-    """
-    async for server in _start_granian_server(
-        platform_keypair, test_psk, test_psk_id, compress=True, disable_zstd=True
-    ):
-        yield server
-        # Print server logs after test completes
-        logs = server.get_logs()
-        if logs.strip():
-            test_name: str = request.node.name  # type: ignore[attr-defined]
-            sys.stdout.write(f"\n{'=' * 60}\n")
-            sys.stdout.write(f"Server logs for: {test_name} (gzip-only)\n")
-            sys.stdout.write(f"{'=' * 60}\n")
-            sys.stdout.write(logs)
-            sys.stdout.write(f"\n{'=' * 60}\n\n")
-            sys.stdout.flush()
-
-
 # === HPKE Client Fixtures (Separate) ===
 
 # Default timeouts (httpx 5s, aiohttp 300s) are misaligned and can cause flaky
 # failures on CI runners during large encrypted uploads. Use 180s for both
 # clients to handle 1GB+ payloads with virtualized I/O variance.
 _TEST_TIMEOUT_SECS = 180.0
+
+
+def _all_registered_kem_ids() -> tuple[KemId, ...]:
+    """Tuple of every registered KEM, used to parametrize client fixtures.
+
+    Computed once at conftest import time — the registry is stable after
+    package load. Returning a sorted tuple gives stable test IDs across runs.
+    """
+    from hpke_http.primitives import registered_kem_ids
+
+    return tuple(sorted(registered_kem_ids(), key=int))
+
+
+@pytest.fixture(params=_all_registered_kem_ids(), ids=lambda k: k.name.lower())
+def kem(request: pytest.FixtureRequest) -> KemId:
+    """KEM identifier the client fixture should pin via ``kem_priority``.
+
+    Parametrized over every registered KEM. Tests using ``aiohttp_client`` /
+    ``httpx_client`` (or any of their variants) auto-run once per KEM.
+    """
+    return request.param
+
 
 # --- aiohttp fixtures ---
 
@@ -552,6 +567,7 @@ async def aiohttp_client(
     granian_server: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """aiohttp HPKEClientSession connected to test server."""
     from hpke_http.middleware.aiohttp import HPKEClientSession
@@ -561,6 +577,7 @@ async def aiohttp_client(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
@@ -571,6 +588,7 @@ async def aiohttp_client_compressed(
     granian_server_compressed: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """aiohttp HPKEClientSession with compression enabled."""
     from hpke_http.middleware.aiohttp import HPKEClientSession
@@ -580,6 +598,7 @@ async def aiohttp_client_compressed(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         compress=True,
         timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
@@ -591,6 +610,7 @@ async def aiohttp_client_small_pool(
     granian_server: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """aiohttp HPKEClientSession with small pool to detect leaks."""
     from hpke_http.middleware.aiohttp import HPKEClientSession
@@ -601,6 +621,7 @@ async def aiohttp_client_small_pool(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         connector=connector,
         timeout=aiohttp.ClientTimeout(total=5.0),
     ) as client:
@@ -612,6 +633,7 @@ async def aiohttp_client_no_compress_server_compress(
     granian_server_compressed: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """aiohttp client without compression, server with compression."""
     from hpke_http.middleware.aiohttp import HPKEClientSession
@@ -621,27 +643,8 @@ async def aiohttp_client_no_compress_server_compress(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         compress=False,
-        timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
-    ) as client:
-        yield client
-
-
-@pytest_asyncio.fixture
-async def aiohttp_client_gzip_only(
-    granian_server_gzip_only: E2EServer,
-    test_psk: bytes,
-    test_psk_id: bytes,
-) -> AsyncIterator[Any]:
-    """aiohttp client with compression to gzip-only server (no zstd)."""
-    from hpke_http.middleware.aiohttp import HPKEClientSession
-
-    base_url = f"http://{granian_server_gzip_only.host}:{granian_server_gzip_only.port}"
-    async with HPKEClientSession(
-        base_url=base_url,
-        psk=test_psk,
-        psk_id=test_psk_id,
-        compress=True,
         timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
@@ -655,6 +658,7 @@ async def httpx_client(
     granian_server: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """httpx HPKEAsyncClient connected to test server."""
     from hpke_http.middleware.httpx import HPKEAsyncClient
@@ -664,6 +668,7 @@ async def httpx_client(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
         yield client
@@ -674,6 +679,7 @@ async def httpx_client_compressed(
     granian_server_compressed: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """httpx HPKEAsyncClient with compression enabled."""
     from hpke_http.middleware.httpx import HPKEAsyncClient
@@ -683,46 +689,7 @@ async def httpx_client_compressed(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
-        compress=True,
-        timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
-    ) as client:
-        yield client
-
-
-@pytest_asyncio.fixture
-async def httpx_client_no_compress_server_compress(
-    granian_server_compressed: E2EServer,
-    test_psk: bytes,
-    test_psk_id: bytes,
-) -> AsyncIterator[Any]:
-    """httpx client without compression, server with compression."""
-    from hpke_http.middleware.httpx import HPKEAsyncClient
-
-    base_url = f"http://{granian_server_compressed.host}:{granian_server_compressed.port}"
-    async with HPKEAsyncClient(
-        base_url=base_url,
-        psk=test_psk,
-        psk_id=test_psk_id,
-        compress=False,
-        timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
-    ) as client:
-        yield client
-
-
-@pytest_asyncio.fixture
-async def httpx_client_gzip_only(
-    granian_server_gzip_only: E2EServer,
-    test_psk: bytes,
-    test_psk_id: bytes,
-) -> AsyncIterator[Any]:
-    """httpx client with compression to gzip-only server (no zstd)."""
-    from hpke_http.middleware.httpx import HPKEAsyncClient
-
-    base_url = f"http://{granian_server_gzip_only.host}:{granian_server_gzip_only.port}"
-    async with HPKEAsyncClient(
-        base_url=base_url,
-        psk=test_psk,
-        psk_id=test_psk_id,
+        kem_priority=[kem],
         compress=True,
         timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
@@ -737,6 +704,7 @@ async def aiohttp_client_release_encrypted(
     granian_server: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """aiohttp HPKEClientSession with release_encrypted=True."""
     from hpke_http.middleware.aiohttp import HPKEClientSession
@@ -746,6 +714,7 @@ async def aiohttp_client_release_encrypted(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         release_encrypted=True,
         timeout=aiohttp.ClientTimeout(total=_TEST_TIMEOUT_SECS),
     ) as client:
@@ -757,6 +726,7 @@ async def httpx_client_release_encrypted(
     granian_server: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """httpx HPKEAsyncClient with release_encrypted=True."""
     from hpke_http.middleware.httpx import HPKEAsyncClient
@@ -766,6 +736,7 @@ async def httpx_client_release_encrypted(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         release_encrypted=True,
         timeout=httpx.Timeout(_TEST_TIMEOUT_SECS),
     ) as client:
@@ -780,6 +751,7 @@ async def httpx_client_small_pool(
     granian_server: E2EServer,
     test_psk: bytes,
     test_psk_id: bytes,
+    kem: KemId,
 ) -> AsyncIterator[Any]:
     """httpx HPKEAsyncClient with small pool to detect leaks."""
     from hpke_http.middleware.httpx import HPKEAsyncClient
@@ -789,6 +761,7 @@ async def httpx_client_small_pool(
         base_url=base_url,
         psk=test_psk,
         psk_id=test_psk_id,
+        kem_priority=[kem],
         limits=httpx.Limits(max_connections=2),
         timeout=httpx.Timeout(5.0),
     ) as client:

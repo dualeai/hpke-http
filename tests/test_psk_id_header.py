@@ -12,7 +12,7 @@ Tests that the PSK ID is correctly:
 import aiohttp
 import pytest
 
-from hpke_http.constants import HEADER_HPKE_ERROR, HEADER_HPKE_PSK_ID
+from hpke_http.constants import HEADER_HPKE_ERROR, HEADER_HPKE_PSK_ID, KemId
 from hpke_http.headers import b64url_decode, b64url_encode
 from hpke_http.middleware.aiohttp import HPKEClientSession
 from hpke_http.middleware.httpx import HPKEAsyncClient
@@ -65,6 +65,7 @@ class TestPSKIDHeaderE2E:
     async def test_psk_id_roundtrip_aiohttp(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -74,6 +75,7 @@ class TestPSKIDHeaderE2E:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             resp = await client.post("/echo", json={"test": "psk_id"})
@@ -83,6 +85,7 @@ class TestPSKIDHeaderE2E:
     async def test_psk_id_roundtrip_httpx(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -92,6 +95,7 @@ class TestPSKIDHeaderE2E:
         async with HPKEAsyncClient(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             resp = await client.post("/echo", json={"test": "psk_id"})
@@ -108,6 +112,7 @@ class TestPSKIDHeaderE2E:
     async def test_psk_id_edge_cases(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         psk_id: bytes,
         description: str,
@@ -122,6 +127,7 @@ class TestPSKIDHeaderE2E:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=psk_id,  # Different from server's test_psk_id
         ) as client:
             # psk_resolver raises ValueError for unknown PSK ID → 401
@@ -135,6 +141,7 @@ class TestPSKIDMismatch:
     async def test_wrong_psk_id_rejected(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         wrong_psk_id: bytes,
     ) -> None:
@@ -147,6 +154,7 @@ class TestPSKIDMismatch:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=wrong_psk_id,  # Different from server's test_psk_id
         ) as client:
             resp = await client.post("/echo", json={"test": "wrong_id"})
@@ -155,6 +163,7 @@ class TestPSKIDMismatch:
     async def test_psk_id_case_sensitive(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -173,6 +182,7 @@ class TestPSKIDMismatch:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=wrong_case_id,
         ) as client:
             resp = await client.post("/echo", json={"test": "case_sensitive"})
@@ -185,6 +195,7 @@ class TestBackwardsCompatibility:
     async def test_psk_resolver_still_works(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -198,6 +209,7 @@ class TestBackwardsCompatibility:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             # Normal request should work
@@ -218,6 +230,7 @@ class TestBodylessRequestPSKID:
     async def test_aiohttp_get_whoami(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -227,6 +240,7 @@ class TestBodylessRequestPSKID:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             resp = await client.get("/whoami")
@@ -237,6 +251,7 @@ class TestBodylessRequestPSKID:
     async def test_httpx_get_whoami(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -246,6 +261,7 @@ class TestBodylessRequestPSKID:
         async with HPKEAsyncClient(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             resp = await client.get("/whoami")
@@ -256,6 +272,7 @@ class TestBodylessRequestPSKID:
     async def test_aiohttp_delete_sends_psk_id(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -265,6 +282,7 @@ class TestBodylessRequestPSKID:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             # /echo accepts DELETE, check headers are sent
@@ -276,6 +294,7 @@ class TestBodylessRequestPSKID:
     async def test_httpx_head_sends_psk_id(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -285,6 +304,7 @@ class TestBodylessRequestPSKID:
         async with HPKEAsyncClient(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             resp = await client.head("/health")
@@ -293,6 +313,7 @@ class TestBodylessRequestPSKID:
     async def test_aiohttp_get_whoami_header_encoding(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -304,6 +325,7 @@ class TestBodylessRequestPSKID:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             # Use echo-headers to verify the header value
@@ -336,6 +358,7 @@ class TestBodylessRequestPSKIDDeny:
     async def test_unknown_psk_id_bodyless_rejected(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
     ) -> None:
         """Bodyless GET with unknown PSK ID → psk_resolver rejects → 401."""
@@ -344,6 +367,7 @@ class TestBodylessRequestPSKIDDeny:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=b"unknown-tenant",
         ) as client:
             resp = await client.get("/whoami")
@@ -352,6 +376,7 @@ class TestBodylessRequestPSKIDDeny:
     async def test_unknown_psk_id_encrypted_rejected(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
     ) -> None:
         """Encrypted POST with unknown PSK ID → psk_resolver rejects → 401."""
@@ -360,6 +385,7 @@ class TestBodylessRequestPSKIDDeny:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=b"unknown-tenant",
         ) as client:
             resp = await client.post("/echo", json={"test": "deny"})
@@ -393,6 +419,7 @@ class TestBodylessRequestPSKIDDeny:
     async def test_wrong_psk_id_encrypted_httpx(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         wrong_psk_id: bytes,
     ) -> None:
@@ -402,6 +429,7 @@ class TestBodylessRequestPSKIDDeny:
         async with HPKEAsyncClient(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=wrong_psk_id,
         ) as client:
             resp = await client.post("/echo", json={"test": "deny"})
@@ -420,6 +448,7 @@ class TestPSKResolverHTTPExceptionForwarding:
     async def test_403_forwarded_encrypted(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
     ) -> None:
         """Encrypted POST with magic PSK ID → psk_resolver raises HTTPException(403) → 403."""
@@ -428,6 +457,7 @@ class TestPSKResolverHTTPExceptionForwarding:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=b"raise-http-403",
         ) as client:
             resp = await client.post("/echo", json={"test": "http-exception"})
@@ -436,6 +466,7 @@ class TestPSKResolverHTTPExceptionForwarding:
     async def test_503_forwarded_encrypted(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
     ) -> None:
         """Encrypted POST with magic PSK ID → HTTPException(503) → 503."""
@@ -444,6 +475,7 @@ class TestPSKResolverHTTPExceptionForwarding:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=b"raise-http-503",
         ) as client:
             resp = await client.post("/echo", json={"test": "http-exception"})
@@ -497,6 +529,7 @@ class TestPSKResolverHTTPExceptionForwarding:
     async def test_happy_path_regression(
         self,
         granian_server: E2EServer,
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -506,6 +539,7 @@ class TestPSKResolverHTTPExceptionForwarding:
         async with HPKEClientSession(
             base_url=base_url,
             psk=test_psk,
+            kem_priority=[kem],
             psk_id=test_psk_id,
         ) as client:
             resp = await client.post("/echo", json={"regression": True})

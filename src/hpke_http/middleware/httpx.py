@@ -42,7 +42,7 @@ Reference: RFC-065 §4.4, §5.2
 import json as json_module
 import types
 import weakref
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import timedelta
 from http import HTTPStatus
 from typing import Any
@@ -63,7 +63,6 @@ from hpke_http.constants import (
 )
 from hpke_http.core import (
     BaseHPKEClient,
-    RequestEncryptor,
     ResponseDecryptor,
     SSEDecryptor,
     SSELineParser,
@@ -333,6 +332,7 @@ class HPKEAsyncClient(BaseHPKEClient):
         compress: bool = False,
         require_encryption: bool = False,
         release_encrypted: bool = False,
+        kem_priority: Sequence[KemId] | None = None,
         **httpx_kwargs: Any,
     ) -> None:
         """
@@ -351,6 +351,9 @@ class HPKEAsyncClient(BaseHPKEClient):
             release_encrypted: If True, release encrypted response content after
                 decryption to reduce held memory from 2x to 1x payload. Trade-off:
                 response.unwrap().content will return empty bytes after decryption.
+            kem_priority: KEM preference order; default ``DEFAULT_KEM_PRIORITY``
+                (post-quantum first, classical fallback). Strict — raises
+                ``KeyDiscoveryError`` if no entry matches the server's keys.
             **httpx_kwargs: Additional arguments passed to httpx.AsyncClient
         """
         super().__init__(
@@ -360,6 +363,7 @@ class HPKEAsyncClient(BaseHPKEClient):
             discovery_url=discovery_url,
             compress=compress,
             require_encryption=require_encryption,
+            kem_priority=kem_priority,
             logger=_logger,
         )
 
@@ -465,18 +469,9 @@ class HPKEAsyncClient(BaseHPKEClient):
         Returns:
             Tuple of (sync_encrypted_iterator, headers_dict, sender_context)
         """
-        pk_r = keys.get(KemId.DHKEM_X25519_HKDF_SHA256)
-        if not pk_r:
-            raise KeyDiscoveryError("No X25519 key available from platform")
-
-        # Create encryptor without compression (streaming doesn't support whole-body)
-        # Same pattern as aiohttp.py:515-520
-        encryptor = RequestEncryptor(
-            public_key=pk_r,
-            psk=self.psk,
-            psk_id=self.psk_id,
-            compress=False,  # Streaming doesn't support whole-body compression
-        )
+        # Streaming doesn't support whole-body compression. Mirror of
+        # aiohttp.py:_encrypt_stream_async.
+        encryptor = self._make_encryptor(keys, compress=False)
 
         def encrypt_gen() -> Iterator[bytes]:
             for chunk in chunks:

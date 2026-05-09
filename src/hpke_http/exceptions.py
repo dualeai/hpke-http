@@ -28,7 +28,24 @@ class InvalidPSKError(CryptoError):
 
 
 class KeyDiscoveryError(CryptoError):
-    """Failed to fetch or parse HPKE keys from discovery endpoint."""
+    """Failed to obtain a usable KEM key from the discovery endpoint.
+
+    Raised when:
+    - HTTP fetch of ``/.well-known/hpke-keys`` failed.
+    - Discovery doc is structurally malformed (missing fields, bad version).
+    - No entry in the client's ``kem_priority`` matches a server-advertised
+      KEM (strict suite negotiation; see ``_select_suite``).
+    """
+
+
+class UnsupportedKEMError(CryptoError):
+    """KEM is not registered.
+
+    Raised by ``primitives.get_kem(kem_id)`` when no implementation is
+    registered for the given identifier, and by the ``X-HPKE-Suite`` header
+    parser when a client advertises a KEM the server doesn't recognize. The
+    server-side middleware maps this to HTTP 415.
+    """
 
 
 class SequenceOverflowError(CryptoError):

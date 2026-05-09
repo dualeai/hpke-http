@@ -6,6 +6,7 @@ from hpke_http.constants import (
     CHACHA20_POLY1305_KEY_SIZE,
     RESPONSE_KEY_LABEL,
     SSE_SESSION_KEY_LABEL,
+    KemId,
 )
 from hpke_http.exceptions import DecryptionError, ReplayAttackError, SessionExpiredError
 from hpke_http.hpke import setup_recipient_psk, setup_sender_psk
@@ -214,15 +215,16 @@ class TestResponseKeyDerivation:
 
     def test_response_key_differs_from_sse_key(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Response key and SSE key should be different (domain separation)."""
-        _sk_r, pk_r = platform_keypair
+        _sk_r, pk_r = platform_keys[kem]
 
         # Sender context (client side)
-        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id)
+        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id, kem_id=kem)
 
         # Export both keys
         response_key = sender_ctx.export(RESPONSE_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
@@ -235,18 +237,19 @@ class TestResponseKeyDerivation:
 
     def test_sender_recipient_derive_same_key(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Sender and recipient should derive the same response key."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
 
         # Sender context (client)
-        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id)
+        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id, kem_id=kem)
 
         # Recipient context (server)
-        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id)
+        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id, kem_id=kem)
 
         # Derive response keys
         sender_response_key = sender_ctx.export(RESPONSE_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)

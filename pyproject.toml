@@ -39,7 +39,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "cryptography~=46.0",
+    "cryptography~=48.0",
 ]
 
 [project.optional-dependencies]
@@ -101,6 +101,16 @@ build-backend = "setuptools.build_meta"
 # Resolved to an absolute timestamp at `uv lock` time (re-run `uv lock
 # --upgrade` to advance the window).
 exclude-newer = "7 days"
+
+# Per-package overrides for the supply-chain cooldown. Use sparingly and
+# only with strong justification documented inline.
+exclude-newer-package = { cryptography = "2026-05-05" }
+# Reason: cryptography 48.0.0 (2026-05-04) is required for ML-KEM-768
+# support via OpenSSL 3.5+ wheels, used by the X-Wing post-quantum KEM
+# implementation in hpke_http.primitives.xwing_kem. Override allows this
+# release before the standard 7-day cooldown elapses. pyca/cryptography
+# is a core, widely-audited package; the cooldown's threat model
+# (typosquatting / malicious unknown publishers) doesn't apply.
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -185,6 +195,7 @@ ignore = ["PLR0913", "RUF012", "S311"]  # S311: random for non-crypto (we use se
 "tests/**/*.py" = ["PLR2004", "PLR0915", "S101", "S603", "S607", "SIM115", "ASYNC109", "ASYNC220", "ASYNC230", "SIM117", "F841", "RUF059", "PLC0415", "ARG001"]  # Tests: magic values, too many statements, assert, subprocess, async patterns, nested with, unused vars, local imports, unused args (callback signatures)
 "src/**/streaming.py" = ["PLW0603", "PLC0415", "RUF002"]  # Optional zstd: module caching requires global, lazy import for optional deps, unicode multiplication sign
 "src/**/middleware/fastapi.py" = ["PLC0415"]  # Lazy import for optional zstd dependency
+"src/**/primitives/xwing_kem.py" = ["N803", "N806"]  # X-Wing draft notation uses uppercase suffixes (pk_M, pk_X, ss_M, ss_X, ct_M, ct_X) for parameters and locals
 
 [tool.vulture]
 exclude = [".venv/"]  # Exclude deps

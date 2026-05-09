@@ -903,8 +903,9 @@ class ChunkDecryptor:
             raise ReplayAttackError(self.expected_counter, counter)
 
         # Decrypt
-        # TODO(perf): When cryptography >= 47.0.0 is available, use decrypt_into()
-        # to eliminate per-chunk allocation. Example:
+        # TODO(perf): cryptography>=47.0 ships ``ChaCha20Poly1305.decrypt_into``;
+        # the dependency is satisfied (project pins cryptography~=48.0). Switching
+        # eliminates the per-chunk plaintext allocation. Example:
         #   buffer = bytearray(len(ciphertext) - 16)
         #   self._cipher.decrypt_into(nonce, ciphertext, None, buffer)
         # See: https://cryptography.io/en/latest/hazmat/primitives/aead/

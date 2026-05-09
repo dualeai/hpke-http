@@ -28,7 +28,7 @@ import httpx
 import pytest
 from typing_extensions import assert_type
 
-from hpke_http.constants import HEADER_HPKE_STREAM
+from hpke_http.constants import HEADER_HPKE_STREAM, KemId
 from hpke_http.middleware.aiohttp import DecryptedResponse, HPKEClientSession
 from hpke_http.middleware.httpx import DecryptedResponse as HTTPXDecryptedResponse
 from hpke_http.middleware.httpx import HPKEAsyncClient
@@ -2055,7 +2055,8 @@ class TestNetworkLevelVerification:
         self,
         tcpdump_capture: str,
         aiohttp_client: HPKEClientSession,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
     ) -> None:
         """Verify private key and derived session keys never appear in traffic.
 
@@ -2064,7 +2065,7 @@ class TestNetworkLevelVerification:
         """
         import asyncio
 
-        private_key, _public_key = platform_keypair
+        private_key, _public_key = platform_keys[kem]
 
         # Generate traffic
         resp = await aiohttp_client.post("/echo", json={"test": "key_leak_check"})
@@ -2096,7 +2097,8 @@ class TestActiveAttackResistance:
 
     async def test_tampered_ciphertext_rejected(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
@@ -2109,7 +2111,7 @@ class TestActiveAttackResistance:
         from hpke_http.exceptions import DecryptionError
         from hpke_http.hpke import open_psk, seal_psk
 
-        private_key, public_key = platform_keypair
+        private_key, public_key = platform_keys[kem]
 
         # Create a valid HPKE-encrypted message
         plaintext = b"This is a secret message that will be tampered with"
@@ -2123,6 +2125,7 @@ class TestActiveAttackResistance:
             psk_id=test_psk_id,
             aad=aad,
             plaintext=plaintext,
+            kem_id=kem,
         )
 
         # Verify valid ciphertext decrypts correctly
@@ -2134,6 +2137,7 @@ class TestActiveAttackResistance:
             psk_id=test_psk_id,
             aad=aad,
             ciphertext=ciphertext,
+            kem_id=kem,
         )
         assert decrypted == plaintext
 
@@ -2153,6 +2157,7 @@ class TestActiveAttackResistance:
                 psk_id=test_psk_id,
                 aad=aad,
                 ciphertext=bytes(tampered_ciphertext),
+                kem_id=kem,
             )
             raise AssertionError("CRITICAL: Tampered ciphertext was decrypted! AEAD authentication is not working.")
         except DecryptionError:
@@ -2171,6 +2176,7 @@ class TestActiveAttackResistance:
                 psk_id=test_psk_id,
                 aad=aad,
                 ciphertext=bytes(tag_tampered),
+                kem_id=kem,
             )
             raise AssertionError(
                 "CRITICAL: Tag-tampered ciphertext was decrypted! AEAD tag verification is not working."
@@ -3434,7 +3440,8 @@ class TestNetworkLevelVerificationHTTPX:
         self,
         tcpdump_capture: str,
         httpx_client: HPKEAsyncClient,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
     ) -> None:
         """Verify private key and derived session keys never appear in traffic.
 
@@ -3443,7 +3450,7 @@ class TestNetworkLevelVerificationHTTPX:
         """
         import asyncio
 
-        private_key, _public_key = platform_keypair
+        private_key, _public_key = platform_keys[kem]
 
         # Generate traffic
         resp = await httpx_client.post("/echo", json={"test": "httpx_key_leak_check"})

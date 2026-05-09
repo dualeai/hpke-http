@@ -8,19 +8,17 @@ import aiohttp
 import pytest
 
 from hpke_http.constants import (
-    CHACHA20_POLY1305_KEY_SIZE,
     HEADER_HPKE_ENC,
     HEADER_HPKE_ENCODING,
     HEADER_HPKE_ERROR,
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
-    REQUEST_KEY_LABEL,
+    HEADER_HPKE_SUITE,
+    KemId,
 )
 from hpke_http.headers import b64url_encode
-from hpke_http.hpke import setup_sender_psk
-from hpke_http.streaming import ChunkEncryptor, RawFormat, StreamingSession
 
-from .conftest import E2EServer
+from .conftest import E2EServer, encrypt_chunked_request
 
 
 class TestMalformedRequests:
@@ -89,36 +87,6 @@ class TestMalformedRequests:
                 assert data["status"] == "ok"
 
 
-def _encrypt_request(
-    body: bytes,
-    pk_r: bytes,
-    psk: bytes,
-    psk_id: bytes,
-) -> tuple[bytes, str, str, str]:
-    """Encrypt request body for testing using chunked streaming format.
-
-    Returns:
-        Tuple of (encrypted_body, enc_header_value, stream_header_value, psk_id_header_value)
-    """
-    ctx = setup_sender_psk(
-        pk_r=pk_r,
-        info=psk_id,
-        psk=psk,
-        psk_id=psk_id,
-    )
-    # Derive request key from HPKE context (matches HPKEClientSession)
-    request_key = ctx.export(REQUEST_KEY_LABEL, CHACHA20_POLY1305_KEY_SIZE)
-    session = StreamingSession.create(request_key)
-    encryptor = ChunkEncryptor(session, format=RawFormat(), compress=False)
-
-    # Encrypt body as single chunk
-    encrypted_body = encryptor.encrypt(body) if body else encryptor.encrypt(b"")
-    enc_header = b64url_encode(ctx.enc)
-    stream_header = b64url_encode(session.session_salt)
-    psk_id_header = b64url_encode(psk_id)
-    return (encrypted_body, enc_header, stream_header, psk_id_header)
-
-
 class TestMalformedCompressionHeaders:
     """Test server handling of invalid compression headers.
 
@@ -142,6 +110,8 @@ class TestMalformedCompressionHeaders:
     async def test_encoding_header_handling(
         self,
         granian_server: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
         encoding_value: str,
@@ -149,21 +119,27 @@ class TestMalformedCompressionHeaders:
         description: str,
     ) -> None:
         """X-HPKE-Encoding header handling: {description}."""
-        host, port, pk = granian_server.host, granian_server.port, granian_server.public_key
+        host, port = granian_server.host, granian_server.port
+        _sk, pk = platform_keys[kem]
         body = b'{"test": "compression header test"}'
 
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(body, pk, test_psk, test_psk_id)
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
+            body, pk, test_psk, test_psk_id, kem_id=kem
+        )
+
+        headers = {
+            HEADER_HPKE_ENC: enc_header,
+            HEADER_HPKE_STREAM: stream_header,
+            HEADER_HPKE_ENCODING: encoding_value,
+            HEADER_HPKE_PSK_ID: psk_id_header,
+            HEADER_HPKE_SUITE: suite_header,
+            "Content-Type": "application/octet-stream",
+        }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"http://{host}:{port}/echo",
-                headers={
-                    HEADER_HPKE_ENC: enc_header,
-                    HEADER_HPKE_STREAM: stream_header,
-                    HEADER_HPKE_ENCODING: encoding_value,
-                    HEADER_HPKE_PSK_ID: psk_id_header,
-                    "Content-Type": "application/octet-stream",
-                },
+                headers=headers,
                 data=encrypted_body,
             ) as resp:
                 assert resp.status == expected_status, f"Failed for {description}"
@@ -175,24 +151,31 @@ class TestEncodingValidation:
     async def test_identity_encoding_accepted(
         self,
         granian_server: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """X-HPKE-Encoding: identity -> 200."""
-        host, port, pk = granian_server.host, granian_server.port, granian_server.public_key
+        host, port = granian_server.host, granian_server.port
+        _sk, pk = platform_keys[kem]
         body = b'{"test": "identity"}'
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(body, pk, test_psk, test_psk_id)
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
+            body, pk, test_psk, test_psk_id, kem_id=kem
+        )
+        headers = {
+            HEADER_HPKE_ENC: enc_header,
+            HEADER_HPKE_STREAM: stream_header,
+            HEADER_HPKE_ENCODING: "identity",
+            HEADER_HPKE_PSK_ID: psk_id_header,
+            HEADER_HPKE_SUITE: suite_header,
+            "Content-Type": "application/octet-stream",
+        }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"http://{host}:{port}/echo",
-                headers={
-                    HEADER_HPKE_ENC: enc_header,
-                    HEADER_HPKE_STREAM: stream_header,
-                    HEADER_HPKE_ENCODING: "identity",
-                    HEADER_HPKE_PSK_ID: psk_id_header,
-                    "Content-Type": "application/octet-stream",
-                },
+                headers=headers,
                 data=encrypted_body,
             ) as resp:
                 assert resp.status == 200
@@ -200,24 +183,31 @@ class TestEncodingValidation:
     async def test_brotli_encoding_rejected(
         self,
         granian_server: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """X-HPKE-Encoding: brotli -> 415."""
-        host, port, pk = granian_server.host, granian_server.port, granian_server.public_key
+        host, port = granian_server.host, granian_server.port
+        _sk, pk = platform_keys[kem]
         body = b'{"test": "brotli"}'
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(body, pk, test_psk, test_psk_id)
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
+            body, pk, test_psk, test_psk_id, kem_id=kem
+        )
+        headers = {
+            HEADER_HPKE_ENC: enc_header,
+            HEADER_HPKE_STREAM: stream_header,
+            HEADER_HPKE_ENCODING: "brotli",
+            HEADER_HPKE_PSK_ID: psk_id_header,
+            HEADER_HPKE_SUITE: suite_header,
+            "Content-Type": "application/octet-stream",
+        }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"http://{host}:{port}/echo",
-                headers={
-                    HEADER_HPKE_ENC: enc_header,
-                    HEADER_HPKE_STREAM: stream_header,
-                    HEADER_HPKE_ENCODING: "brotli",
-                    HEADER_HPKE_PSK_ID: psk_id_header,
-                    "Content-Type": "application/octet-stream",
-                },
+                headers=headers,
                 data=encrypted_body,
             ) as resp:
                 assert resp.status == 415
@@ -225,24 +215,31 @@ class TestEncodingValidation:
     async def test_injection_attempt_rejected(
         self,
         granian_server: E2EServer,
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """X-HPKE-Encoding: ../../etc/passwd -> 415."""
-        host, port, pk = granian_server.host, granian_server.port, granian_server.public_key
+        host, port = granian_server.host, granian_server.port
+        _sk, pk = platform_keys[kem]
         body = b'{"test": "injection"}'
-        encrypted_body, enc_header, stream_header, psk_id_header = _encrypt_request(body, pk, test_psk, test_psk_id)
+        encrypted_body, enc_header, stream_header, psk_id_header, suite_header = encrypt_chunked_request(
+            body, pk, test_psk, test_psk_id, kem_id=kem
+        )
+        headers = {
+            HEADER_HPKE_ENC: enc_header,
+            HEADER_HPKE_STREAM: stream_header,
+            HEADER_HPKE_ENCODING: "../../etc/passwd",
+            HEADER_HPKE_PSK_ID: psk_id_header,
+            HEADER_HPKE_SUITE: suite_header,
+            "Content-Type": "application/octet-stream",
+        }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"http://{host}:{port}/echo",
-                headers={
-                    HEADER_HPKE_ENC: enc_header,
-                    HEADER_HPKE_STREAM: stream_header,
-                    HEADER_HPKE_ENCODING: "../../etc/passwd",
-                    HEADER_HPKE_PSK_ID: psk_id_header,
-                    "Content-Type": "application/octet-stream",
-                },
+                headers=headers,
                 data=encrypted_body,
             ) as resp:
                 assert resp.status == 415

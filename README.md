@@ -16,6 +16,7 @@ End-to-end encryption for HTTP APIs using RFC 9180 HPKE (Hybrid Public Key Encry
 - **PSK binding** - Each request cryptographically bound to pre-shared key (API key)
 - **Replay protection** - Counter-based nonces prevent replay attacks
 - **RFC 9180 compliant** - Auditable, interoperable standard
+- **Post-quantum** - X-Wing hybrid KEM (X25519 + ML-KEM-768) for harvest-now-decrypt-later defense; clients auto-upgrade when server registers an X-Wing key (see [Post-Quantum (X-Wing)](#post-quantum-x-wing))
 - **Memory-efficient** - Streams large file uploads with O(chunk_size) memory
 
 ## Installation
@@ -163,10 +164,196 @@ async with HPKEAsyncClient(
 
 | Component | Algorithm | ID |
 | --------- | --------- | ------ |
-| KEM (Key Encapsulation) | DHKEM(X25519, HKDF-SHA256) | 0x0020 |
+| KEM (Key Encapsulation, classical) | DHKEM(X25519, HKDF-SHA256) | 0x0020 |
+| KEM (Key Encapsulation, post-quantum) | X-Wing (X25519 + ML-KEM-768) | 0x647A |
 | KDF (Key Derivation) | HKDF-SHA256 | 0x0001 |
 | AEAD (Authenticated Encryption) | ChaCha20-Poly1305 | 0x0003 |
 | Mode | PSK (Pre-Shared Key) | 0x01 |
+
+Clients pick the best advertised KEM per ``DEFAULT_KEM_PRIORITY`` —
+post-quantum first, classical fallback. See [Post-Quantum (X-Wing)](#post-quantum-x-wing).
+
+## Post-Quantum (X-Wing)
+
+X-Wing is a hybrid post-quantum KEM combining X25519 with ML-KEM-768 (FIPS 203).
+Server-side opt-in: register an X-Wing private key in ``HPKEMiddleware`` and
+clients automatically upgrade. X25519-only deployments work unchanged
+(server doesn't register an X-Wing key → not advertised → clients fall back
+to X25519).
+
+### Why
+
+X25519 falls to Shor's algorithm on a cryptographically-relevant quantum
+computer. Any traffic captured today and decrypted later — the
+"harvest-now-decrypt-later" threat — is exposed retroactively. X-Wing's
+ML-KEM-768 leg defends against this; the X25519 leg keeps a classical
+fallback in case ML-KEM is later cryptanalyzed.
+
+### Status
+
+Pre-RFC. The IANA HPKE registry has assigned `0x647A` as an early allocation
+referencing `draft-connolly-cfrg-xwing-kem-06`; we implement the wire format
+of the latest revision (`draft-connolly-cfrg-xwing-kem-10`), pinned at
+`hpke_http.constants.XWING_DRAFT_REVISION`. The wire format may change
+before RFC publication — version-tag any X-Wing traffic accordingly.
+
+### Server: register an X-Wing key
+
+X-Wing private keys are 32-byte seeds (the wire-canonical form). Generate one
+with `XWingKEM.generate_keypair()` and register both the X25519 and X-Wing
+keys on the middleware:
+
+```python
+from hpke_http.constants import KemId
+from hpke_http.middleware.fastapi import HPKEMiddleware
+from hpke_http.primitives import X25519KEM, XWingKEM
+
+x25519_sk, _ = X25519KEM.generate_keypair()
+xwing_sk, _ = XWingKEM.generate_keypair()  # 32-byte seed
+
+app.add_middleware(
+    HPKEMiddleware,
+    private_keys={
+        KemId.DHKEM_X25519_HKDF_SHA256: x25519_sk,
+        KemId.XWING: xwing_sk,
+    },
+    psk_resolver=resolve_psk,
+)
+```
+
+The middleware advertises both KEMs on `/.well-known/hpke-keys`; clients pick
+which to use.
+
+### Client: zero config
+
+Clients automatically pick the best suite the server advertises, per the
+default priority order in
+`hpke_http.constants.DEFAULT_KEM_PRIORITY = (KemId.XWING, KemId.DHKEM_X25519_HKDF_SHA256)`.
+Server with X-Wing key registered → client uses X-Wing. Server with only
+X25519 → client uses X25519. No client-side flag.
+
+```python
+from hpke_http.middleware.httpx import HPKEAsyncClient
+
+client = HPKEAsyncClient(
+    base_url="https://api.example.com",
+    psk=api_key,
+    psk_id=tenant_id,
+)
+```
+
+To pin a specific suite (e.g. force classical for testing or compliance):
+
+```python
+from hpke_http.constants import KemId
+
+client = HPKEAsyncClient(
+    base_url="https://api.example.com",
+    psk=api_key,
+    kem_priority=[KemId.DHKEM_X25519_HKDF_SHA256],  # never use X-Wing
+)
+```
+
+`kem_priority` is a left-to-right preference list and is **strict**: if
+no entry matches a server-advertised KEM, the client raises
+`KeyDiscoveryError` rather than silently picking an unlisted KEM. Pin
+intent is preserved (e.g. classical-only client never silently upgrades
+to X-Wing). Same kwarg works on `HPKEClientSession` (aiohttp).
+
+### Wire effect
+
+X25519 traffic is byte-equivalent to pre-X-Wing: no extra header, X25519
+enc (43 base64url chars). X-Wing traffic adds:
+
+```
+X-HPKE-Suite: kem=0x647a
+X-HPKE-Enc:   <base64url(1120 bytes) = 1494 chars>
+```
+
+`X-HPKE-Suite` value format is strict: `kem=0x{kem_id:04x}`, lowercase, no
+whitespace, no extra params. Header is omitted entirely for the legacy
+X25519 default to keep wire identical for existing deployments.
+
+### Server error responses (PQ-related)
+
+| Status | Trigger |
+|--------|---------|
+| `400 Bad Request` | Malformed `X-HPKE-Suite` (regex mismatch, oversize, extras), oversize `X-HPKE-Enc`, or `enc` length doesn't match the suite's `Nenc`. |
+| `415 Unsupported Media Type` | Header advertises a `kem_id` the server hasn't registered (e.g., client sends `kem=0x647a` against an X25519-only deployment). |
+
+All HPKE error responses set `X-HPKE-Error: true` so clients with
+`require_encryption=True` can distinguish middleware errors from app
+plaintext fall-throughs.
+
+### Discovery doc
+
+`/.well-known/hpke-keys` advertises every registered KEM:
+
+```json
+{
+  "version": 1,
+  "keys": [
+    {"kem_id": "0x0020", "kdf_id": "0x0001", "aead_id": "0x0003", "public_key": "..."},
+    {"kem_id": "0x647a", "kdf_id": "0x0001", "aead_id": "0x0003", "public_key": "..."}
+  ],
+  "default_suite": {"kem_id": "0x647a", ...}
+}
+```
+
+`default_suite` is informational — clients run their own `_select_suite`
+over the full `keys` array using their own `kem_priority`. Server-side
+the field reflects ``DEFAULT_KEM_PRIORITY`` over registered keys
+(post-quantum first, classical fallback): if X-Wing is registered, it's
+the advertised default; otherwise X25519.
+
+Clients silently skip unknown `kem_id` values from the discovery doc
+(forward-compat: server may advertise future KEMs this client doesn't know).
+
+### Performance
+
+Indicative warm-cache latencies on Apple M-series, `cryptography` 48.0:
+
+| Operation | X25519 | X-Wing (warm) | X-Wing (cold first call) |
+|-----------|--------|---------------|--------------------------|
+| `encap`   | ~360 µs | ~410 µs | ~420 µs |
+| `decap`   | ~270 µs | ~380 µs | ~960 µs |
+| `derive_public_key` | ~95 µs | ~30 µs (cached) / ~620 µs (cold) | — |
+
+X-Wing is dominated by ML-KEM-768 (FIPS 203) keygen + encaps/decaps. Two
+internal caches in `xwing_kem.py` keep the warm path tight:
+
+- `_expand_decapsulation_key` (`maxsize=8`): caches per-seed `(MLKEM768
+  private key, X25519 private key, pk_X)` triple. Server reuses one seed
+  across all requests → ~100% hit rate. Avoids ~600 µs of FIPS 203 KeyGen
+  per decap.
+- `_load_mlkem_public` (`maxsize=16`): caches `MLKEM768PublicKey` handle per
+  pk_M bytes. Client reuses one server pk repeatedly → ~100% hit rate.
+
+Decap cold first-call is ~2.5× warm (~960 µs vs ~380 µs); encap cold barely
+differs (encap doesn't run ML-KEM KeyGen). In production the first request
+after process restart pays the cold decap cost; subsequent requests are
+warm. Both caches are bounded; adversarial inputs cannot grow them past
+`maxsize`.
+
+AEAD seal/open per chunk and SSE chunk throughput are unchanged — KEM cost
+is paid once per HPKE context, not per message. Long-lived encrypted streams
+amortize KEM setup across many seal/opens.
+
+### Adding a new KEM
+
+`hpke-http` ships KEMs as plug-in modules behind the `KEM` ABC in
+`src/hpke_http/primitives/kem_base.py`. To add a new KEM:
+
+1. Add the IANA-assigned identifier to `KemId` in
+   `src/hpke_http/constants.py`.
+2. Create `src/hpke_http/primitives/<name>_kem.py` with a class subclassing
+   `KEM` and decorated with `@register_kem`.
+3. Import the module from `src/hpke_http/primitives/__init__.py` so the
+   self-registration runs at package import time.
+
+No changes to `hpke.py`, `core.py`, or middleware are needed; `get_kem()`
+dispatches by `KemId`. See `primitives/x25519_kem.py` and
+`primitives/xwing_kem.py` for reference implementations.
 
 ## PSK Authentication
 
@@ -300,7 +487,8 @@ See [Header Modifications](#header-modifications) for when headers are added.
 
 ```text
 Headers:
-  X-HPKE-Enc: <base64url(32B ephemeral key)>
+  X-HPKE-Suite: kem=0x{kem_id:04x}            (omitted when default X25519)
+  X-HPKE-Enc:   <base64url(Nenc bytes)>       (32B for X25519; 1120B for X-Wing)
   X-HPKE-Stream: <base64url(4B session salt)>
   X-HPKE-PSK-ID: <base64url(derived key ID, 32B recommended)>
 
@@ -440,11 +628,13 @@ Disable gzip/brotli on CDN/LB for HPKE endpoints. Ciphertext is incompressible�
 | ------ | ------- | -------- | ------ |
 | `Content-Type` | Set to `application/octet-stream` (if body) | Preserved | Encrypted body is binary |
 | `Content-Length` | Auto (chunked, if body) | Removed | Size changes after encryption |
-| `X-HPKE-Enc` | Always | - | Ephemeral public key |
+| `X-HPKE-Suite` | Added (non-default KEM only) | - | Suite negotiation: `kem=0x{id:04x}` |
+| `X-HPKE-Enc` | Always | - | Encapsulated key (size varies per suite) |
 | `X-HPKE-Stream` | Always | Added | Session salt for nonces |
 | `X-HPKE-PSK-ID` | Always | - | Derived PSK identifier (see [PSK Authentication](#psk-authentication)) |
 | `X-HPKE-Encoding` | Added (if compressed) | - | Compression algorithm |
 | `X-HPKE-Content-Type` | Added (if body) | - | Original Content-Type for server parsing |
+| `X-HPKE-Error` | - | Added (on middleware errors) | Distinguishes middleware errors from app plaintext |
 
 ### Security Boundary
 

@@ -2,6 +2,7 @@
 
 import pytest
 
+from hpke_http.constants import KemId
 from hpke_http.exceptions import DecryptionError, InvalidPSKError
 from hpke_http.hpke import (
     open_psk,
@@ -16,12 +17,13 @@ class TestHPKESealOpen:
 
     def test_seal_open_roundtrip(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Test basic encryption/decryption roundtrip."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
         plaintext = b"Hello, HPKE!"
         info = b"test-context"
 
@@ -31,6 +33,7 @@ class TestHPKESealOpen:
             info=info,
             psk=test_psk,
             psk_id=test_psk_id,
+            kem_id=kem,
             aad=b"",
             plaintext=plaintext,
         )
@@ -42,6 +45,7 @@ class TestHPKESealOpen:
             info=info,
             psk=test_psk,
             psk_id=test_psk_id,
+            kem_id=kem,
             aad=b"",
             ciphertext=ciphertext,
         )
@@ -50,12 +54,13 @@ class TestHPKESealOpen:
 
     def test_seal_open_with_aad(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Test encryption/decryption with additional authenticated data."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
         plaintext = b"Secret message"
         aad = b"authenticated-but-not-encrypted"
 
@@ -64,6 +69,7 @@ class TestHPKESealOpen:
             info=b"",
             psk=test_psk,
             psk_id=test_psk_id,
+            kem_id=kem,
             aad=aad,
             plaintext=plaintext,
         )
@@ -74,6 +80,7 @@ class TestHPKESealOpen:
             info=b"",
             psk=test_psk,
             psk_id=test_psk_id,
+            kem_id=kem,
             aad=aad,
             ciphertext=ciphertext,
         )
@@ -82,18 +89,20 @@ class TestHPKESealOpen:
 
     def test_wrong_aad_fails(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Test that wrong AAD causes decryption failure."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
 
         enc, ciphertext = seal_psk(
             pk_r=pk_r,
             info=b"",
             psk=test_psk,
             psk_id=test_psk_id,
+            kem_id=kem,
             aad=b"correct-aad",
             plaintext=b"test",
         )
@@ -105,25 +114,28 @@ class TestHPKESealOpen:
                 info=b"",
                 psk=test_psk,
                 psk_id=test_psk_id,
+                kem_id=kem,
                 aad=b"wrong-aad",
                 ciphertext=ciphertext,
             )
 
     def test_wrong_psk_fails(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
         wrong_psk: bytes,
     ) -> None:
         """Test that wrong PSK causes decryption failure."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
 
         enc, ciphertext = seal_psk(
             pk_r=pk_r,
             info=b"",
             psk=test_psk,
             psk_id=test_psk_id,
+            kem_id=kem,
             aad=b"",
             plaintext=b"test",
         )
@@ -135,16 +147,18 @@ class TestHPKESealOpen:
                 info=b"",
                 psk=wrong_psk,
                 psk_id=test_psk_id,
+                kem_id=kem,
                 aad=b"",
                 ciphertext=ciphertext,
             )
 
     def test_empty_psk_fails(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
     ) -> None:
         """Test that empty PSK raises InvalidPSKError."""
-        _, pk_r = platform_keypair
+        _, pk_r = platform_keys[kem]
 
         with pytest.raises(InvalidPSKError):
             seal_psk(
@@ -152,16 +166,18 @@ class TestHPKESealOpen:
                 info=b"",
                 psk=b"",  # Empty PSK
                 psk_id=b"id",
+                kem_id=kem,
                 aad=b"",
                 plaintext=b"test",
             )
 
     def test_empty_psk_id_fails(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
     ) -> None:
         """Test that empty PSK ID raises InvalidPSKError."""
-        _, pk_r = platform_keypair
+        _, pk_r = platform_keys[kem]
 
         with pytest.raises(InvalidPSKError):
             seal_psk(
@@ -169,6 +185,7 @@ class TestHPKESealOpen:
                 info=b"",
                 psk=b"some-psk",
                 psk_id=b"",  # Empty PSK ID
+                kem_id=kem,
                 aad=b"",
                 plaintext=b"test",
             )
@@ -179,15 +196,16 @@ class TestHPKEContext:
 
     def test_multiple_messages(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Test encrypting/decrypting multiple messages with context."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
 
-        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id)
-        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id)
+        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id, kem_id=kem)
+        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id, kem_id=kem)
 
         messages = [b"First message", b"Second message", b"Third message"]
 
@@ -198,15 +216,16 @@ class TestHPKEContext:
 
     def test_export_secret(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Test that export secret derivation is consistent."""
-        sk_r, pk_r = platform_keypair
+        sk_r, pk_r = platform_keys[kem]
 
-        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id)
-        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id)
+        sender_ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id, kem_id=kem)
+        recipient_ctx = setup_recipient_psk(sender_ctx.enc, sk_r, b"", test_psk, test_psk_id, kem_id=kem)
 
         # Both contexts should derive the same export secret
         label = b"test-export"
@@ -218,14 +237,15 @@ class TestHPKEContext:
 
     def test_different_export_labels_differ(
         self,
-        platform_keypair: tuple[bytes, bytes],
+        platform_keys: dict[KemId, tuple[bytes, bytes]],
+        kem: KemId,
         test_psk: bytes,
         test_psk_id: bytes,
     ) -> None:
         """Test that different export labels produce different secrets."""
-        _sk_r, pk_r = platform_keypair
+        _sk_r, pk_r = platform_keys[kem]
 
-        ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id)
+        ctx = setup_sender_psk(pk_r, b"", test_psk, test_psk_id, kem_id=kem)
 
         export1 = ctx.export(b"label-1", 32)
         export2 = ctx.export(b"label-2", 32)

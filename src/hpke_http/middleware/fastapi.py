@@ -35,7 +35,6 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from cryptography.hazmat.primitives.asymmetric import x25519
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -43,6 +42,7 @@ from hpke_http._logging import get_logger
 from hpke_http.constants import (
     AEAD_ID,
     CHUNK_SIZE,
+    DEFAULT_KEM_PRIORITY,
     DISCOVERY_CACHE_MAX_AGE,
     DISCOVERY_PATH,
     GZIP_STREAMING_THRESHOLD,
@@ -52,6 +52,7 @@ from hpke_http.constants import (
     HEADER_HPKE_ERROR,
     HEADER_HPKE_PSK_ID,
     HEADER_HPKE_STREAM,
+    HEADER_HPKE_SUITE,
     KDF_ID,
     KNOWN_ENCODING_BYTES,
     MAX_DECOMPRESSION_RATIO,
@@ -69,10 +70,12 @@ from hpke_http.core import (
     ResponseEncryptor,
     SSEEncryptor,
     SSEEventParser,
+    _parse_suite_header,  # pyright: ignore[reportPrivateUsage]
     is_sse_response,
 )
-from hpke_http.exceptions import CryptoError, DecryptionError
+from hpke_http.exceptions import CryptoError, DecryptionError, UnsupportedKEMError
 from hpke_http.headers import b64url_decode, b64url_encode
+from hpke_http.primitives.kem_base import get_kem
 from hpke_http.streaming import gzip_decompress, zstd_decompress
 
 __all__ = [
@@ -106,9 +109,6 @@ class ResponseEncryptionState:
 
     body_buffer: bytearray = field(default_factory=bytearray)
     """Buffer for standard response body to enforce consistent chunk sizes."""
-
-    headers_sent: bool = False
-    """Whether response headers have been sent."""
 
 
 @dataclass
@@ -180,7 +180,10 @@ class HPKEMiddleware:
 
         Args:
             app: ASGI application
-            private_keys: Private keys by KEM ID (e.g., {KemId.DHKEM_X25519_HKDF_SHA256: sk})
+            private_keys: Private keys by KEM ID (e.g.,
+                ``{KemId.DHKEM_X25519_HKDF_SHA256: sk}``). Add an
+                ``KemId.XWING`` entry to advertise the post-quantum hybrid;
+                clients pick PQ automatically per ``DEFAULT_KEM_PRIORITY``.
             psk_resolver: Async callback to get (psk, psk_id) from request scope.
                 Raise HTTPException for specific error responses (401, 403, etc.).
                 Any other exception returns 401 "PSK authentication failed".
@@ -206,12 +209,20 @@ class HPKEMiddleware:
         # If zstd unavailable, gzip (stdlib) is used as fallback
         self._zstd_available = self._check_zstd_available()
 
-        # Derive public keys for discovery endpoint
+        # Derive public keys for the discovery endpoint via the KEM registry.
+        # Adding a new KEM = drop in primitives/<name>_kem.py + register; this
+        # loop picks it up automatically.
         self._public_keys: dict[KemId, bytes] = {}
         for kem_id, sk in private_keys.items():
-            if kem_id == KemId.DHKEM_X25519_HKDF_SHA256:
-                private_key = x25519.X25519PrivateKey.from_private_bytes(sk)
-                self._public_keys[kem_id] = private_key.public_key().public_bytes_raw()
+            try:
+                kem = get_kem(kem_id)
+            except UnsupportedKEMError:
+                _logger.warning(
+                    "HPKEMiddleware: skipping kem_id=0x%04x — not registered (backend missing or unknown KEM)",
+                    int(kem_id),
+                )
+                continue
+            self._public_keys[kem_id] = kem.derive_public_key(sk)
 
     @staticmethod
     def _check_zstd_available() -> bool:
@@ -335,6 +346,11 @@ class HPKEMiddleware:
         except HTTPException as e:
             await self._send_http_exception(send, e, method, path)
             return
+        except UnsupportedKEMError as e:
+            # Client speaks a KEM we don't have a key for. 415 Unsupported.
+            _logger.debug("Unsupported KEM: method=%s path=%s msg=%s", method, path, e)
+            await self._send_error(send, 415, "Unsupported KEM")
+            return
         except CryptoError as e:
             # Real crypto failure (missing headers, bad format, etc.)
             _logger.debug("Decryption setup failed: method=%s path=%s error_type=%s", method, path, type(e).__name__)
@@ -423,7 +439,6 @@ class HPKEMiddleware:
                 ]
                 new_headers.append((HEADER_HPKE_STREAM.encode(), crypto_headers[HEADER_HPKE_STREAM].encode()))
                 message = {**message, "headers": new_headers}
-                state.headers_sent = True
                 await send(message)
 
             else:
@@ -555,11 +570,21 @@ class HPKEMiddleware:
             for kem_id, pk in self._public_keys.items()
         ]
 
+        # ``default_suite`` advertises the server's preferred suite over its
+        # registered keys, using the same priority as the client default
+        # (``DEFAULT_KEM_PRIORITY``: post-quantum first, classical fallback).
+        # Informational only — clients run their own ``_select_suite`` over
+        # the full ``keys`` array using their own priority list.
+        default_kem_id = next(
+            (k for k in DEFAULT_KEM_PRIORITY if k in self._public_keys),
+            KemId.DHKEM_X25519_HKDF_SHA256,
+        )
+
         response = {
             "version": 1,
             "keys": keys,
             "default_suite": {
-                "kem_id": f"0x{KemId.DHKEM_X25519_HKDF_SHA256:04x}",
+                "kem_id": f"0x{int(default_kem_id):04x}",
                 "kdf_id": f"0x{KDF_ID:04x}",
                 "aead_id": f"0x{AEAD_ID:04x}",
             },
@@ -600,6 +625,7 @@ class HPKEMiddleware:
         enc_header: bytes,
         stream_header: bytes,
         encoding_header: bytes | None,
+        suite_header: bytes | None = None,
     ) -> RequestDecryptor:
         """
         Set up HPKE decryption context and return request decryptor.
@@ -616,10 +642,14 @@ class HPKEMiddleware:
         # auth failures (non-CryptoError → 401) from crypto errors (→ 400)
         psk, psk_id = await self.psk_resolver(scope)
 
-        # Get private key for the KEM (default X25519)
-        kem_id = KemId.DHKEM_X25519_HKDF_SHA256
+        # Suite negotiation: parse X-HPKE-Suite if present, else legacy X25519.
+        # Unknown kem_ids surface as UnsupportedKEMError → caller maps to 415.
+        if suite_header is not None:
+            kem_id = _parse_suite_header(suite_header.decode("ascii"))
+        else:
+            kem_id = KemId.DHKEM_X25519_HKDF_SHA256
         if kem_id not in self.private_keys:
-            raise DecryptionError(f"Unsupported KEM: 0x{kem_id:04x}")
+            raise UnsupportedKEMError(f"Server has no key registered for kem_id=0x{int(kem_id):04x}")
         sk_r = self.private_keys[kem_id]
 
         # Build headers dict for RequestDecryptor
@@ -630,9 +660,11 @@ class HPKEMiddleware:
         if encoding_header:
             request_headers[HEADER_HPKE_ENCODING] = encoding_header.decode("ascii")
 
-        # Create request decryptor (handles HPKE setup, key derivation, chunk parsing)
+        # Create request decryptor; pass kem_id explicitly so it skips header re-parsing.
         try:
-            decryptor = RequestDecryptor(request_headers, sk_r, psk, psk_id)
+            decryptor = RequestDecryptor(request_headers, sk_r, psk, psk_id, kem_id=kem_id)
+        except (DecryptionError, UnsupportedKEMError):
+            raise
         except Exception as e:
             raise DecryptionError(f"Decryption setup failed: {e}") from e
 
@@ -642,7 +674,7 @@ class HPKEMiddleware:
         _logger.debug(
             "Request decryption context created: path=%s kem_id=0x%04x compressed=%s",
             scope.get("path", ""),
-            kem_id,
+            int(kem_id),
             decryptor.is_compressed,
         )
 
@@ -772,8 +804,11 @@ class HPKEMiddleware:
         # Get encoding header for compression detection
         encoding_header = headers.get(HEADER_HPKE_ENCODING.lower().encode())
 
+        # Optional X-HPKE-Suite for KEM negotiation (absent = legacy X25519)
+        suite_header = headers.get(HEADER_HPKE_SUITE.lower().encode())
+
         # Set up decryption context (resolves PSK, creates RequestDecryptor)
-        decryptor = await self._setup_decryption(scope, enc_header, stream_header, encoding_header)
+        decryptor = await self._setup_decryption(scope, enc_header, stream_header, encoding_header, suite_header)
 
         # Restore original Content-Type for multipart parsing
         # Client sends original Content-Type (with boundary) via X-HPKE-Content-Type header
