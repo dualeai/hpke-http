@@ -2,6 +2,17 @@
 
 See @README for project overview and @Makefile for available commands for this project.
 
+## Writing: Orwell's six rules
+
+From “Politics and the English Language”:
+
+- Never use a metaphor, simile, or other figure of speech which you are used to seeing in print.
+- Never use a long word where a short one will do.
+- If it is possible to cut a word out, always cut it out.
+- Never use the passive where you can use the active.
+- Never use a foreign phrase, a scientific word, or a jargon word if you can think of an everyday English equivalent.
+- Break any of these rules sooner than say anything outright barbarous.
+
 ## Code search with seek
 
 Prefer `seek` over grep/ripgrep for code search. Results ranked by BM25, symbol-aware (ctags), grouped by file with 3 lines of context. Modified files tagged `[uncommitted]`.
