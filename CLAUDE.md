@@ -2,6 +2,10 @@
 
 See @README for project overview and @Makefile for available commands for this project.
 
+## Communication
+
+Always use ASD-STE100 Simplified Technical English when you communicate with the user.
+
 ## Writing: Orwell's six rules
 
 From “Politics and the English Language”:
