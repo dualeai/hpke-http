@@ -1,66 +1,118 @@
-name: Test
+name: CI
 
 on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.87.0
+  PYTHON_VERSION: "3.10"
+  NODE_VERSION: "24"
+  NPM_VERSION: 11.19.1
+  WASM_BINDGEN_VERSION: 0.2.128
 
 jobs:
-  test:
-    name: ${{ matrix.os }} / python ${{ matrix.python-version }} / ${{ matrix.test-step }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04-arm, macos-15, macos-26]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
-        test-step: [standard, root, slow]
-
-    env:
-      JUNIT_XML: junit-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.test-step }}.xml
+  core-and-bindings:
+    name: Rust + Python + TypeScript
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out the candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install uv
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: "uv.lock"
+          cache-dependency-glob: python/uv.lock
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          python-version: ${{ matrix.python-version }}
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
 
-      - name: Install dependencies
-        run: make install-deps
-
-      - name: Run static checks
-        if: matrix.test-step == 'standard'
-        run: make test-static
-
-      - name: Run tests
-        if: matrix.test-step == 'standard'
-        run: make test-func-ci
-        env:
-          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
-
-      - name: Run root-required tests (tcpdump network capture)
-        if: matrix.test-step == 'root'
-        run: sudo env "PATH=$PATH" "PYTEST_ADDOPTS=--junit-xml=${{ env.JUNIT_XML }}" make test-func-root
-
-      - name: Run slow tests (large payloads)
-        if: matrix.test-step == 'slow'
-        run: make test-func-slow
-        env:
-          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - name: Set up the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          name: ${{ env.JUNIT_XML }}
-          path: ${{ env.JUNIT_XML }}
-          if-no-files-found: ignore
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt,clippy
+          target: wasm32-unknown-unknown
+          cache: false
+
+      - name: Restore the Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install pinned build tools and dependencies
+        run: |
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+          uv sync --project python --frozen \
+            --extra dev --extra fastapi --extra aiohttp --extra httpx
+          npm install --global "npm@$NPM_VERSION"
+          npm ci --prefix typescript --ignore-scripts
+
+      - name: Verify the Rust core and boundary crates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace --all-targets
+          cargo test --locked --doc --package hpke-http
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --package hpke-http
+          cargo package --locked --package hpke-http
+
+      - name: Build and verify the Python binding
+        run: |
+          uv run --project python --frozen maturin develop --locked \
+            --manifest-path python/native/Cargo.toml
+          make test-static
+          make test-func-ci
+
+      - name: Build and verify the TypeScript/WASM package
+        run: |
+          npm --prefix typescript run build
+          npm --prefix typescript run check
+          npm --prefix typescript test
+
+      - name: Build the distributable Python and npm artifacts
+        run: |
+          mkdir -p artifacts/python artifacts/npm
+          uv run --project python --frozen maturin build --release --locked \
+            --manifest-path python/native/Cargo.toml --out artifacts/python
+          uv run --project python --frozen maturin sdist \
+            --manifest-path python/native/Cargo.toml --out artifacts/python
+          uv run --project python --frozen twine check artifacts/python/*
+          (cd typescript && npm pack --pack-destination "$GITHUB_WORKSPACE/artifacts/npm")
+
+      - name: Smoke-test the exact Python wheel
+        run: |
+          uv venv .artifact-smoke/python --python "$PYTHON_VERSION"
+          uv pip install --python .artifact-smoke/python/bin/python artifacts/python/*.whl
+          .artifact-smoke/python/bin/python python/tests/artifact_smoke.py
+
+      - name: Smoke-test the exact npm tarball
+        run: |
+          mkdir -p .artifact-smoke/npm
+          cd .artifact-smoke/npm
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/artifacts/npm/*.tgz
+          cp "$GITHUB_WORKSPACE/typescript/test/artifact-smoke.mjs" .
+          node artifact-smoke.mjs
