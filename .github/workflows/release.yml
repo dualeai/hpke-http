@@ -1,206 +1,802 @@
 name: Release
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-# CLI versions are centralized here for easy maintenance
-env:
-  CYCLONEDX_CLI_VERSION: v0.29.2 # https://github.com/CycloneDX/cyclonedx-cli/releases
-
 permissions:
-  attestations: write # Required for GitHub attestations
-  contents: write # Required for release asset upload
-  id-token: write # Required for PyPI trusted publishing + Sigstore signing
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.87.0
+  PYTHON_VERSION: "3.10"
+  NODE_VERSION: "24"
+  NPM_VERSION: 11.19.1
+  MATURIN_VERSION: v1.15.0
+  WASM_BINDGEN_VERSION: 0.2.128
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
+  test-and-build-base:
+    name: Test source and build portable artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Check out the tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
-        run: make install-deps
-
-      - name: Inject version from git tag
-        run: |
-          VERSION=$(./cicd/version.sh -g .)
-          VERSION_FULL=$(./cicd/version.sh -g . -c -m)
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "VERSION_FULL=$VERSION_FULL" >> $GITHUB_ENV
-          echo "Injecting version: $VERSION (full: $VERSION_FULL)"
-          sed -i "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
-          sed -i "s/__version_full__ = .*/__version_full__ = \"$VERSION_FULL\"/" src/hpke_http/__init__.py
-
-      - name: Build package
-        run: uv build
-
-      - name: Verify build artifacts
-        run: |
-          ls -la dist/
-          test -f dist/hpke_http-*.whl
-          test -f dist/hpke_http-*.tar.gz
-          uv run twine check dist/*
-
-      - name: Generate SBOM (CycloneDX)
-        run: uv export --format cyclonedx1.5 --all-extras --output-file sbom.cyclonedx.json
-
-      - name: Install CycloneDX CLI
-        run: |
-          curl -sSfL "https://github.com/CycloneDX/cyclonedx-cli/releases/download/${{ env.CYCLONEDX_CLI_VERSION }}/cyclonedx-linux-arm64" -o cyclonedx
-          chmod +x cyclonedx
-
-      - name: Convert to SPDX
-        run: ./cyclonedx convert --input-file sbom.cyclonedx.json --output-file sbom.spdx.json --output-format spdxjson
-
-      - name: Validate SBOMs
-        run: |
-          echo "Validating CycloneDX SBOM..."
-          jq empty sbom.cyclonedx.json
-          echo "- Components: $(jq '.components | length' sbom.cyclonedx.json)"
-          echo "Validating SPDX SBOM..."
-          jq empty sbom.spdx.json
-          echo "- Packages: $(jq '.packages | length' sbom.spdx.json)"
-
-      - name: Attest SBOM (CycloneDX)
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
-          subject-path: dist/*
-          sbom-path: sbom.cyclonedx.json
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
 
-      - name: Attest SBOM (SPDX)
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          subject-path: dist/*
-          sbom-path: sbom.spdx.json
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+      - name: Set up the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          subject-path: dist/*
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt,clippy
+          target: wasm32-unknown-unknown
+          cache: false
 
-      - name: Upload build artifacts
+      - name: Restore the Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
+
+      - name: Derive and inject the exact tag version
+        id: version
+        run: |
+          version=$(python cicd/prepare-release-version.py "$GITHUB_REF_NAME")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned build tools and dependencies
+        run: |
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+          uv sync --project python --frozen \
+            --extra dev --extra fastapi --extra aiohttp --extra httpx
+          npm install --global "npm@$NPM_VERSION"
+          npm ci --prefix typescript --ignore-scripts
+
+      - name: Verify the Rust core and boundary crates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace --all-targets
+          cargo test --locked --doc --package hpke-http
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --package hpke-http
+
+      - name: Build and verify the Python binding
+        run: |
+          uv run --project python --frozen maturin develop --locked \
+            --manifest-path python/native/Cargo.toml
+          make test-static
+          make test-func-ci
+
+      - name: Build and verify the TypeScript/WASM package
+        run: |
+          npm --prefix typescript run build
+          npm --prefix typescript run check
+          npm --prefix typescript test
+
+      - name: Build the crate, Python sdist, and npm tarball once
+        run: |
+          version=${{ steps.version.outputs.version }}
+          mkdir -p release/rust release/python release/npm
+
+          cargo package --locked --allow-dirty --package hpke-http
+          cp "target/package/hpke-http-$version.crate" release/rust/
+
+          uv run --project python --frozen maturin sdist \
+            --manifest-path python/native/Cargo.toml --out release/python
+          (cd typescript && npm pack --pack-destination "$GITHUB_WORKSPACE/release/npm")
+
+      - name: Inspect the portable artifacts
+        run: |
+          test "$(find release/rust -maxdepth 1 -name '*.crate' -type f | wc -l)" -eq 1
+          test "$(find release/python -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
+          test "$(find release/npm -maxdepth 1 -name '*.tgz' -type f | wc -l)" -eq 1
+          uv run --project python --frozen twine check release/python/*
+          tar -tzf release/npm/*.tgz > /tmp/hpke-http-npm-files.txt
+          grep -Fxq 'package/_wasm/browser/hpke_http_wasm_bg.wasm' /tmp/hpke-http-npm-files.txt
+          grep -Fxq 'package/_wasm/node/hpke_http_wasm_bg.wasm' /tmp/hpke-http-npm-files.txt
+
+      - name: Smoke-test the exact Python source distribution
+        run: |
+          uv venv .artifact-smoke/python-sdist --python "$PYTHON_VERSION"
+          uv pip install --python .artifact-smoke/python-sdist/bin/python \
+            "maturin==${MATURIN_VERSION#v}"
+          uv pip install --python .artifact-smoke/python-sdist/bin/python \
+            --no-build-isolation release/python/*.tar.gz
+          .artifact-smoke/python-sdist/bin/python \
+            python/tests/artifact_smoke.py "${{ steps.version.outputs.version }}"
+
+      - name: Smoke-test the exact npm tarball
+        run: |
+          mkdir -p .artifact-smoke/npm
+          cd .artifact-smoke/npm
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/release/npm/*.tgz
+          cp "$GITHUB_WORKSPACE/typescript/test/artifact-smoke.mjs" .
+          EXPECTED_VERSION="${{ steps.version.outputs.version }}" node artifact-smoke.mjs
+
+      - name: Upload the tested portable artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: dist
-          path: dist/
+          name: release-base-${{ github.sha }}
+          path: release/
+          if-no-files-found: error
+          overwrite: true
           retention-days: 30
 
-      - name: Upload SBOM artifacts
+  build-python-wheels:
+    name: Python wheel / ${{ matrix.name }}
+    needs: test-and-build-base
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            rust-targets: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+            interpreter: python3.10
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            rust-targets: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+            interpreter: python3.10
+          - name: macos-universal2
+            os: macos-15
+            target: universal2-apple-darwin
+            rust-targets: x86_64-apple-darwin,aarch64-apple-darwin
+            manylinux: ""
+            interpreter: python
+          - name: windows-x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+            manylinux: ""
+            interpreter: python
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.rust-targets }}
+          cache: false
+
+      - name: Restore the Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
+          key: wheel-${{ matrix.name }}
+
+      - name: Derive and inject the exact tag version
+        id: version
+        shell: bash
+        run: |
+          version=$(python cicd/prepare-release-version.py "$GITHUB_REF_NAME")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the platform wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: build
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: >-
+            --release --locked --compatibility pypi
+            --out dist --interpreter ${{ matrix.interpreter }}
+            --manifest-path python/native/Cargo.toml
+
+      - name: Smoke-test the exact platform wheel
+        shell: bash
+        run: |
+          test "$(find dist -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 1
+          python -m pip install --disable-pip-version-check dist/*.whl
+          python python/tests/artifact_smoke.py "${{ steps.version.outputs.version }}"
+
+      - name: Upload the tested platform wheel
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: sbom
-          path: |
-            sbom.cyclonedx.json
-            sbom.spdx.json
+          name: python-wheel-${{ matrix.name }}-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+          overwrite: true
           retention-days: 30
 
-  publish-testpypi:
-    needs: build
-    runs-on: ubuntu-24.04  # x64 required: pypi-publish action is amd64 only
+  assemble-candidate:
+    name: Assemble the immutable release candidate
+    needs: [test-and-build-base, build-python-wheels]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/p/hpke_http
-    permissions:
-      id-token: write
 
     steps:
-      - name: Download build artifacts
+      - name: Check out the tagged source for release evidence
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Download the portable artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
-          path: dist/
+          name: release-base-${{ github.sha }}
+          path: release/
 
-      - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+      - name: Download and merge every tested wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          repository-url: https://test.pypi.org/legacy/
-          attestations: true
-          print-hash: true
+          pattern: python-wheel-*-${{ github.sha }}
+          path: release/python/
+          merge-multiple: true
 
-  publish-pypi:
-    needs: [build, publish-testpypi]
-    runs-on: ubuntu-24.04  # x64 required: pypi-publish action is amd64 only
+      - name: Verify the selected artifact set
+        run: |
+          test "$(find release/python -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 4
+          test "$(find release/python -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
+          ls release/python/*manylinux*_x86_64.whl >/dev/null
+          ls release/python/*manylinux*_aarch64.whl >/dev/null
+          ls release/python/*universal2.whl >/dev/null
+          ls release/python/*win_amd64.whl >/dev/null
+          test "$(find release/rust -maxdepth 1 -name '*.crate' -type f | wc -l)" -eq 1
+          test "$(find release/npm -maxdepth 1 -name '*.tgz' -type f | wc -l)" -eq 1
+
+      - name: Record source, protocol ID, corpus, coordinates, and digests
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" "$GITHUB_REF_NAME" "$GITHUB_SHA" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          version, tag, source_sha = sys.argv[1:]
+          release = pathlib.Path("release")
+          corpus = pathlib.Path("rust/hpke-http/tests/vectors/protocol-v1.json")
+          artifacts = []
+          for path in sorted(release.rglob("*")):
+              if path.is_file():
+                  payload = path.read_bytes()
+                  artifacts.append(
+                      {
+                          "path": path.relative_to(release).as_posix(),
+                          "sha256": hashlib.sha256(payload).hexdigest(),
+                          "size": len(payload),
+                      }
+                  )
+
+          manifest = {
+              "schema": 1,
+              "version": version,
+              "tag": tag,
+              "source_sha": source_sha,
+              "protocol_id": "hpke-http/1",
+              "corpus": {
+                  "path": corpus.as_posix(),
+                  "sha256": hashlib.sha256(corpus.read_bytes()).hexdigest(),
+              },
+              "packages": {
+                  "crates_io": "hpke-http",
+                  "pypi": "hpke_http",
+                  "npm": "@dualeai/hpke-http",
+              },
+              "artifacts": artifacts,
+          }
+          (release / "release-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          checksums = []
+          names = set()
+          for path in sorted(release.rglob("*")):
+              if not path.is_file() or path.name == "SHA256SUMS":
+                  continue
+              if path.name in names:
+                  raise SystemExit(f"duplicate release asset basename: {path.name}")
+              names.add(path.name)
+              checksums.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+          (release / "SHA256SUMS").write_text(
+              "\n".join(checksums) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload the immutable candidate
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  stage-release:
+    name: Stage the GitHub release
+    needs: assemble-candidate
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment:
-      name: pypi
-      url: https://pypi.org/p/hpke_http
-    permissions:
-      id-token: write
-
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: dist
-          path: dist/
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
-        with:
-          attestations: true
-          print-hash: true
-
-  upload-release:
-    needs: [build, publish-pypi]
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
-    if: github.event_name == 'release'
     permissions:
       contents: write
 
     steps:
-      - name: Download build artifacts
+      - name: Download the tested candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
-          path: dist/
+          name: release-candidate-${{ github.sha }}
+          path: release/
 
-      - name: Download SBOM artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: sbom
-          path: sbom/
-
-      - name: Upload to GitHub release
+      - name: Create a draft release with the tested bytes
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
-          files: |
-            sbom/sbom.cyclonedx.json
-            sbom/sbom.spdx.json
-            dist/*
+          tag_name: ${{ github.ref_name }}
+          name: hpke-http ${{ github.ref_name }}
+          draft: true
+          body: |
+            Coordinated Rust, Python, and TypeScript/WASM release from `${{ github.sha }}`.
 
-      - name: Generate job summary
+            This Rust-backed release line is not a compatibility fallback for the
+            pre-Rust Python 1.x packages. It removes the old Python protocol,
+            streaming, compression, discovery, and implicit-key APIs. Applications
+            must use the packaged Rust, Python, or TypeScript binding APIs and
+            configure recipient keys, PSK identities, bounds, and replay admission
+            explicitly. Each packaged README contains the current API examples.
+
+            This draft is published only after every registry artifact is byte-verified.
+          fail_on_unmatched_files: true
+          files: |
+            release/SHA256SUMS
+            release/release-manifest.json
+            release/rust/*
+            release/python/*
+            release/npm/*
+
+  publish-crates-io:
+    name: Publish crates.io
+    needs: publish-npm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/hpke-http
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache: false
+
+      - name: Restore the Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
+          save-if: false
+
+      - name: Derive and inject the exact tag version
+        id: version
         run: |
-          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Published To" >> $GITHUB_STEP_SUMMARY
-          echo "- [TestPyPI](https://test.pypi.org/p/hpke_http)" >> $GITHUB_STEP_SUMMARY
-          echo "- [PyPI](https://pypi.org/p/hpke_http)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Attestations" >> $GITHUB_STEP_SUMMARY
-          echo "- GitHub: SBOM (CycloneDX + SPDX), Build Provenance" >> $GITHUB_STEP_SUMMARY
-          echo "- PyPI: PEP 740 Digital Attestations" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "- $(ls -1 dist/ | wc -l | tr -d ' ') distribution files" >> $GITHUB_STEP_SUMMARY
-          echo "- 2 SBOM files (CycloneDX, SPDX)" >> $GITHUB_STEP_SUMMARY
+          version=$(python3 cicd/prepare-release-version.py "$GITHUB_REF_NAME")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download the tested candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release/
+
+      - name: Detect an already-published identical crate
+        id: existing
+        run: |
+          version=${{ steps.version.outputs.version }}
+          status=$(curl --silent --show-error --location \
+            --user-agent "hpke-http-release/$GITHUB_SHA" \
+            --output /tmp/hpke-http-metadata.json \
+            --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/hpke-http/$version")
+          case "$status" in
+            200)
+              curl --fail --silent --show-error --location \
+                --user-agent "hpke-http-release/$GITHUB_SHA" \
+                "https://crates.io/api/v1/crates/hpke-http/$version/download" \
+                --output /tmp/hpke-http.crate
+              cmp release/rust/*.crate /tmp/hpke-http.crate
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "crates.io returned HTTP $status" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Prove Cargo will upload the tested crate bytes
+        if: steps.existing.outputs.publish == 'true'
+        run: |
+          version=${{ steps.version.outputs.version }}
+          cargo package --locked --allow-dirty --package hpke-http
+          cmp "target/package/hpke-http-$version.crate" release/rust/*.crate
+
+      - name: Publish the crate
+        if: steps.existing.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --allow-dirty --package hpke-http
+
+  publish-pypi:
+    name: Publish PyPI
+    needs: publish-npm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hpke-http/
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download the tested candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release/
+
+      - name: Verify any files already present on PyPI
+        id: existing
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" "$GITHUB_OUTPUT" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          import urllib.error
+          import urllib.request
+
+          version, output_path = sys.argv[1:]
+          request = urllib.request.Request(
+              f"https://pypi.org/pypi/hpke_http/{version}/json",
+              headers={"User-Agent": "hpke-http-release"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  metadata = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              metadata = {"urls": []}
+
+          remote = {item["filename"]: item for item in metadata["urls"]}
+          local = {path.name for path in pathlib.Path("release/python").iterdir()}
+          unexpected = set(remote) - local
+          if unexpected:
+              raise SystemExit(f"PyPI already has unexpected files for this version: {sorted(unexpected)}")
+          missing = False
+          for path in sorted(pathlib.Path("release/python").iterdir()):
+              item = remote.get(path.name)
+              if item is None:
+                  missing = True
+                  continue
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != item["digests"]["sha256"]:
+                  raise SystemExit(f"PyPI already has different bytes for {path.name}")
+
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"publish={'true' if missing else 'false'}\n")
+          PY
+
+      - name: Publish all tested Python artifacts together
+        if: steps.existing.outputs.publish == 'true'
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: release/python/
+          attestations: true
+          print-hash: true
+          skip-existing: true
+
+  publish-npm:
+    name: Publish npm
+    needs: stage-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@dualeai/hpke-http
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download the tested candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release/
+
+      - name: Set up Node.js for trusted publishing
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Install the trusted-publishing npm client
+        run: npm install --global "npm@$NPM_VERSION"
+
+      - name: Detect an already-published identical npm package
+        id: existing
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          status=$(curl --silent --show-error --location \
+            --output /tmp/hpke-http-npm.json \
+            --write-out '%{http_code}' \
+            "https://registry.npmjs.org/@dualeai%2fhpke-http/$version")
+          case "$status" in
+            200)
+              url=$(node -e '
+                const fs = require("node:fs");
+                const metadata = JSON.parse(fs.readFileSync("/tmp/hpke-http-npm.json", "utf8"));
+                if (typeof metadata.dist?.tarball !== "string") process.exit(1);
+                process.stdout.write(metadata.dist.tarball);
+              ')
+              curl --fail --silent --show-error --location "$url" --output /tmp/hpke-http.tgz
+              cmp release/npm/*.tgz /tmp/hpke-http.tgz
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "npm registry returned HTTP $status" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Require the one-time npm trusted-publisher bootstrap
+        env:
+          NPM_TRUSTED_PUBLISHING_CONFIGURED: ${{ vars.NPM_TRUSTED_PUBLISHING_CONFIGURED }}
+        run: |
+          if [[ "$NPM_TRUSTED_PUBLISHING_CONFIGURED" != "true" ]]; then
+            echo "::error::npm requires a package to exist before trusted publishing can be configured. If @dualeai/hpke-http is still unpublished, manually publish the exact release/npm/*.tgz candidate as a public package. Then configure its GitHub Actions trusted publisher for workflow filename release.yml, environment npm, and direct npm publish permission; set the npm-environment variable NPM_TRUSTED_PUBLISHING_CONFIGURED=true; and rerun this workflow. The rerun byte-compares an existing version before continuing."
+            exit 1
+          fi
+
+      - name: Publish the npm/WASM package
+        if: steps.existing.outputs.publish == 'true'
+        run: npm publish release/npm/*.tgz --access public --provenance
+
+  verify-public:
+    name: Verify public package coordinates
+    needs: [publish-crates-io, publish-pypi, publish-npm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the tagged source for installed-artifact tests
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download the tested candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release/
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Fetch and compare the public crate
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          curl --fail --location --retry 12 --retry-all-errors --retry-delay 5 \
+            --user-agent "hpke-http-release/$GITHUB_SHA" \
+            "https://crates.io/api/v1/crates/hpke-http/$version/download" \
+            --output /tmp/hpke-http.crate
+          cmp release/rust/*.crate /tmp/hpke-http.crate
+
+      - name: Fetch and compare every public PyPI artifact
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
+          from __future__ import annotations
+
+          import json
+          import pathlib
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          version = sys.argv[1]
+          endpoint = f"https://pypi.org/pypi/hpke_http/{version}/json"
+          metadata = None
+          for attempt in range(12):
+              try:
+                  request = urllib.request.Request(
+                      endpoint,
+                      headers={"User-Agent": "hpke-http-release"},
+                  )
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      metadata = json.load(response)
+                  break
+              except (urllib.error.URLError, TimeoutError):
+                  if attempt == 11:
+                      raise
+                  time.sleep(5)
+
+          assert metadata is not None
+          remote = {item["filename"]: item for item in metadata["urls"]}
+          local_paths = sorted(pathlib.Path("release/python").iterdir())
+          local = {path.name for path in local_paths}
+          if set(remote) != local:
+              raise SystemExit(
+                  f"PyPI artifact set differs: expected {sorted(local)}, found {sorted(remote)}"
+              )
+          for path in local_paths:
+              if path.name not in remote:
+                  raise SystemExit(f"PyPI is missing {path.name}")
+              request = urllib.request.Request(
+                  remote[path.name]["url"],
+                  headers={"User-Agent": "hpke-http-release"},
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  published = response.read()
+              if published != path.read_bytes():
+                  raise SystemExit(f"PyPI bytes differ for {path.name}")
+          PY
+
+      - name: Fetch and compare the public npm package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          mkdir -p published/npm
+          for attempt in {1..12}; do
+            if npm pack "@dualeai/hpke-http@$version" \
+              --ignore-scripts --pack-destination "$GITHUB_WORKSPACE/published/npm"; then
+              break
+            fi
+            if [[ "$attempt" -eq 12 ]]; then
+              exit 1
+            fi
+            sleep 5
+          done
+          cmp release/npm/*.tgz published/npm/*.tgz
+
+      - name: Smoke-test the public Python and npm packages
+        run: |
+          version=${GITHUB_REF_NAME#v}
+
+          uv venv .public-smoke/python --python "$PYTHON_VERSION"
+          uv pip install --python .public-smoke/python/bin/python \
+            --only-binary :all: "hpke_http==$version"
+          .public-smoke/python/bin/python python/tests/artifact_smoke.py "$version"
+
+          mkdir -p .public-smoke/npm
+          cd .public-smoke/npm
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/published/npm/*.tgz
+          cp "$GITHUB_WORKSPACE/typescript/test/artifact-smoke.mjs" .
+          EXPECTED_VERSION="$version" node artifact-smoke.mjs
+
+      - name: Record the completed coordinated publication
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" "$GITHUB_REF_NAME" "$GITHUB_SHA" <<'PY'
+          import json
+          import sys
+
+          version, tag, source_sha = sys.argv[1:]
+          status = {
+              "schema": 1,
+              "version": version,
+              "tag": tag,
+              "source_sha": source_sha,
+              "state": "published-and-verified",
+              "packages": {
+                  "crates_io": f"https://crates.io/crates/hpke-http/{version}",
+                  "pypi": f"https://pypi.org/project/hpke-http/{version}/",
+                  "npm": f"https://www.npmjs.com/package/@dualeai/hpke-http/v/{version}",
+              },
+          }
+          with open("release-status.json", "w", encoding="utf-8") as output:
+              json.dump(status, output, indent=2, sort_keys=True)
+              output.write("\n")
+          PY
+
+      - name: Upload the verified publication status
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-status-${{ github.sha }}
+          path: release-status.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  publish-release:
+    name: Publish the GitHub release
+    needs: verify-public
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the verified publication status
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-status-${{ github.sha }}
+
+      - name: Attach status and publish the draft release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          fail_on_unmatched_files: true
+          files: release-status.json
+
+      - name: Summarize the coordinated release
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          {
+            echo "## hpke-http $version"
+            echo
+            echo "Published and re-verified from commit \`$GITHUB_SHA\`:"
+            echo "- crates.io: \`hpke-http@$version\`"
+            echo "- PyPI: \`hpke_http==$version\`"
+            echo "- npm: \`@dualeai/hpke-http@$version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
