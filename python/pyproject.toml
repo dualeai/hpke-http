@@ -1,0 +1,173 @@
+[project]
+name = "hpke_http"
+version = "0.1.0"
+description = "Bounded HPKE-protected HTTP transactions backed by a shared Rust engine."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    {name = "Duale AI"},
+]
+keywords = [
+    "hpke",
+    "encryption",
+    "rfc9180",
+    "cryptography",
+    "http",
+    "e2e",
+    "chacha20",
+    "x25519",
+    "fastapi",
+    "aiohttp",
+    "httpx",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
+]
+dependencies = [
+    "typing_extensions~=4.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "maturin>=1.9,<2",           # Build and develop the private PyO3 extension
+    "pytest-codspeed==5.0.3",    # CI benchmarks for the Python binding
+    "pyright~=1.1",
+    "pytest-asyncio~=0.24",
+    "pytest-cov~=7.0",
+    "pytest-xdist[psutil]~=3.8",
+    "pytest~=8.3",
+    "ruff~=0.7",
+    "trustme~=1.2",              # Ephemeral TLS certificates for real aiohttp transport tests
+    "twine~=6.1",                # Package verification before PyPI upload
+    "vulture~=2.14",
+]
+# For downstream services using testing fixtures
+testing = [
+    "pytest-asyncio~=0.24",
+    "pytest~=8.3",
+]
+# FastAPI middleware (optional for server-side)
+fastapi = [
+    "starlette~=0.50",
+]
+# aiohttp client (optional for client-side)
+aiohttp = [
+    "aiohttp~=3.13",
+]
+# httpx client (optional for client-side)
+httpx = [
+    "httpx~=0.28",
+]
+
+[project.urls]
+Homepage = "https://github.com/dualeai/hpke-http"
+Documentation = "https://github.com/dualeai/hpke-http#readme"
+Repository = "https://github.com/dualeai/hpke-http.git"
+Changelog = "https://github.com/dualeai/hpke-http/releases"
+Issues = "https://github.com/dualeai/hpke-http/issues"
+
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[tool.uv]
+# Supply-chain protection: only resolve packages published ≥7 days ago.
+# Mitigates typosquatting and malicious-release attacks by allowing time
+# for the community and index moderators to flag bad packages.
+# Resolved to an absolute timestamp at `uv lock` time (re-run `uv lock
+# --upgrade` to advance the window).
+exclude-newer = "7 days"
+
+[tool.maturin]
+manifest-path = "native/Cargo.toml"
+python-source = "src"
+module-name = "hpke_http._native"
+bindings = "pyo3"
+include = ["src/hpke_http/_native.pyi", "src/hpke_http/py.typed"]
+exclude = ["src/**/__pycache__", "src/**/*.pyc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "--cov=hpke_http",            # Package name
+    "--cov-report=term-missing", # Show missing lines in terminal
+    "--cov-report=html",         # Generate HTML report
+    "--cov-fail-under=80",       # Require 80% minimum coverage
+    "--tb=short",                # Short traceback format
+    "-v",                        # Show each test in CI diagnostics
+    "--strict-markers",          # Ensure all markers are registered
+    "-n",                        # Run tests in parallel
+    "auto",                      # Use all available CPUs
+]
+[tool.coverage.run]
+parallel = true
+
+# Static checks are shared release gates. Keep exceptions narrow and documented.
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
+venv = ".venv"
+venvPath = "."
+exclude = [".venv"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "A",     # flake8-builtins
+    "ARG",   # flake8-unused-arguments
+    "ASYNC", # flake8-async
+    "B",     # flake8-bugbear
+    "BLE",   # flake8-blind-except
+    "DTZ",   # flake8-datetimez
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "FAST",  # FastAPI
+    "FBT",   # flake8-boolean-trap
+    "I",     # isort
+    "N",     # pep8-naming
+    "PERF",  # Perflint
+    "PIE",   # flake8-pie
+    "PL",    # Pylint
+    "PYI",   # flake8-pyi
+    "Q",     # flake8-quotes
+    "RET",   # flake8-return
+    "RUF",   # Ruff-specific
+    "S",     # flake8-bandit (security)
+    "SIM",   # flake8-simplify
+    "SLF",   # flake8-self
+    "T20",   # flake8-print
+    "TID",   # flake8-tidy-imports
+    "UP",    # pyupgrade
+    "W",     # pycodestyle warnings
+]
+ignore = ["PLR0913", "RUF012"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["PLR2004", "PLR0915", "S101", "S603", "S607", "SIM115", "ASYNC109", "ASYNC220", "ASYNC230", "SIM117", "F841", "RUF059", "PLC0415", "ARG001"]  # Tests: magic values, too many statements, assert, subprocess, async patterns, nested with, unused vars, local imports, unused args (callback signatures)
+
+[tool.vulture]
+exclude = [".venv/"]  # Exclude deps
+paths = ["src", "tests"]
+min_confidence = 80  # Ignore low-confidence detections
+sort_by_size = true  # Most impactful issues first

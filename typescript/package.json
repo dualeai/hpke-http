@@ -1,0 +1,63 @@
+{
+  "name": "@dualeai/hpke-http",
+  "version": "0.1.0",
+  "description": "Bounded whole-message HPKE protection for TypeScript, backed by Rust/WASM",
+  "license": "Apache-2.0",
+  "keywords": [
+    "hpke",
+    "http",
+    "encryption",
+    "rfc9180",
+    "wasm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dualeai/hpke-http.git",
+    "directory": "typescript"
+  },
+  "homepage": "https://github.com/dualeai/hpke-http#readme",
+  "bugs": {
+    "url": "https://github.com/dualeai/hpke-http/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "exports": {
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "_wasm",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "generate:version": "node scripts/generate-version.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build:ts": "npm run generate:version && tsc -p tsconfig.json",
+    "build": "npm run clean && npm run build:wasm && npm run build:ts",
+    "check": "npm run generate:version && tsc -p tsconfig.json --noEmit",
+    "test:node": "node --test test/*.test.mjs",
+    "test:browser": "node scripts/test-browser.mjs",
+    "test": "npm run test:node && npm run test:browser",
+    "benchmark": "vitest bench --run",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@codspeed/vitest-plugin": "5.7.1",
+    "@types/node": "24.13.6",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  },
+  "packageManager": "npm@11.19.1"
+}

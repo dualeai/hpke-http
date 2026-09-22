@@ -1,33 +1,9 @@
-# Misc
-name ?= hpke_http
-python_version ?= 3.10  # Lowest compatible version (see pyproject.toml requires-python)
+PYTHON_DIR := python
 
-# Versions
-version_full ?= $(shell $(MAKE) --silent version-full)
-version_small ?= $(shell $(MAKE) --silent version)
-
-# Test vectors
-VECTORS_DIR := tests/vectors
-
-# RFC 9180 HPKE vectors from CFRG
-CFRG_URL := https://raw.githubusercontent.com/cfrg/draft-irtf-cfrg-hpke/master/test-vectors.json
-CFRG_RAW := $(VECTORS_DIR)/rfc9180_all.json
-CFRG_PSK := $(VECTORS_DIR)/rfc9180_psk_x25519_chacha.json
-
-# Wycheproof vectors for primitives
-WYCHEPROOF_BASE := https://raw.githubusercontent.com/C2SP/wycheproof/master/testvectors_v1
-WYCHEPROOF_X25519 := $(VECTORS_DIR)/wycheproof_x25519.json
-WYCHEPROOF_CHACHA := $(VECTORS_DIR)/wycheproof_chacha20_poly1305.json
-WYCHEPROOF_HKDF := $(VECTORS_DIR)/wycheproof_hkdf_sha256.json
-WYCHEPROOF_HMAC := $(VECTORS_DIR)/wycheproof_hmac_sha256.json
-
-# Flamegraph profiling for e2e tests
-# Requires: sudo (py-spy needs elevated privileges on macOS)
-# Output: profiles/flamegraph_<timestamp>.json
-PROFILES_DIR := profiles
-PYSPY_RATE := 80
-PYSPY_BASETEMP := /tmp/pytest-flamegraph
-PYSPY_OUTPUT = $(PROFILES_DIR)/flamegraph_$(shell date +%Y%m%d_%H%M%S).json
+.PHONY: \
+	develop-python install install-deps lint test test-func test-func-ci \
+	test-python test-rust test-static test-typescript upgrade version \
+	version-full version-pypi
 
 version:
 	@bash ./cicd/version.sh -g . -c
@@ -38,119 +14,46 @@ version-full:
 version-pypi:
 	@bash ./cicd/version.sh -g .
 
-install:
-	uv venv --python $(python_version) --allow-existing
-	$(MAKE) install-deps
-	# Code search using seek (trigram index via zoekt, sub-second queries)
-	# Usage: seek "pattern" (on PATH via direnv)
-	# See: https://github.com/dualeai/seek
-	@curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
+install: install-deps develop-python
 
 install-deps:
-	uv sync --extra dev --extra fastapi --extra aiohttp --extra httpx --extra zstd
+	uv sync --project $(PYTHON_DIR) --all-extras
+	npm ci --prefix typescript --ignore-scripts
 
 upgrade:
-	uv lock --upgrade --refresh
-	$(MAKE) download-vectors
+	uv lock --project $(PYTHON_DIR) --upgrade --refresh
 
-# Download all test vectors
-download-vectors:
-	$(MAKE) download-vectors-cfrg
-	$(MAKE) download-vectors-wycheproof
+develop-python:
+	uv run --project $(PYTHON_DIR) maturin develop \
+		--manifest-path $(PYTHON_DIR)/native/Cargo.toml
 
-# Download official CFRG HPKE vectors and extract our cipher suite
-download-vectors-cfrg:
-	@echo "Downloading RFC 9180 test vectors from CFRG..."
-	@mkdir -p $(VECTORS_DIR)
-	@curl -sL "$(CFRG_URL)" -o $(CFRG_RAW)
-	@echo "Extracting PSK mode + X25519 + HKDF-SHA256 + ChaCha20-Poly1305..."
-	@uv run python -c "\
-import json; \
-data = json.load(open('$(CFRG_RAW)')); \
-filtered = [v for v in data if v['mode']==1 and v['kem_id']==32 and v['kdf_id']==1 and v['aead_id']==3]; \
-json.dump(filtered, open('$(CFRG_PSK)', 'w'), indent=2); \
-print(f'  Extracted {len(filtered)} HPKE vector(s)')"
-	@rm $(CFRG_RAW)
+test: test-rust test-python test-typescript
 
-# Download Wycheproof vectors for underlying primitives
-download-vectors-wycheproof:
-	@echo "Downloading Wycheproof vectors..."
-	@mkdir -p $(VECTORS_DIR)
-	@curl -sL "$(WYCHEPROOF_BASE)/x25519_test.json" -o $(WYCHEPROOF_X25519)
-	@curl -sL "$(WYCHEPROOF_BASE)/chacha20_poly1305_test.json" -o $(WYCHEPROOF_CHACHA)
-	@curl -sL "$(WYCHEPROOF_BASE)/hkdf_sha256_test.json" -o $(WYCHEPROOF_HKDF)
-	@curl -sL "$(WYCHEPROOF_BASE)/hmac_sha256_test.json" -o $(WYCHEPROOF_HMAC)
-	@uv run python -c "\
-import json; \
-x = json.load(open('$(WYCHEPROOF_X25519)')); \
-c = json.load(open('$(WYCHEPROOF_CHACHA)')); \
-h = json.load(open('$(WYCHEPROOF_HKDF)')); \
-m = json.load(open('$(WYCHEPROOF_HMAC)')); \
-print(f'  X25519: {sum(len(g[\"tests\"]) for g in x[\"testGroups\"])} tests'); \
-print(f'  ChaCha20-Poly1305: {sum(len(g[\"tests\"]) for g in c[\"testGroups\"])} tests'); \
-print(f'  HKDF-SHA256: {sum(len(g[\"tests\"]) for g in h[\"testGroups\"])} tests'); \
-print(f'  HMAC-SHA256: {sum(len(g[\"tests\"]) for g in m[\"testGroups\"])} tests')"
+test-rust:
+	cargo fmt --all -- --check
+	cargo clippy --locked --workspace --all-targets -- -D warnings
+	cargo test --locked --workspace --all-targets
+	cargo test --locked --doc --package hpke-http
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --package hpke-http
 
-test:
-	$(MAKE) test-static
-	$(MAKE) test-func
+test-python: test-static test-func
 
 test-static:
-	uv run ruff format --check .
-	uv run ruff check .
-	uv run pyright .
-	uv run -m vulture .
+	cd $(PYTHON_DIR) && uv run ruff format --check .
+	cd $(PYTHON_DIR) && uv run ruff check .
+	cd $(PYTHON_DIR) && uv run pyright .
+	cd $(PYTHON_DIR) && uv run -m vulture .
 
-# All tests together for accurate coverage measurement
 test-func:
-	uv run pytest tests/ -v -n auto --ignore=tests/benchmarks
+	cd $(PYTHON_DIR) && uv run pytest tests/
 
-# CI-friendly tests (no root required, no slow tests, parallel execution)
-test-func-ci:
-	uv run pytest tests/ -v -n auto -m "not requires_root and not slow" --ignore=tests/benchmarks
+test-func-ci: test-func
 
-# Slow tests only (large payloads 1GB+, requires large CI runners)
-test-func-slow:
-	uv run pytest tests/ -v -n auto -m "slow" --no-cov --ignore=tests/benchmarks
-
-# Root-required tests only (tcpdump network capture, must run serial)
-# Usage: sudo make test-func-root
-test-func-root:
-	uv run pytest tests/ -v -n 0 -m "requires_root" --no-cov --ignore=tests/benchmarks
-
-# Property-based fuzz tests (slower, more thorough)
-test-fuzz:
-	uv run pytest tests/ -v -m "fuzz" --hypothesis-show-statistics --ignore=tests/benchmarks
+test-typescript:
+	npm --prefix typescript run build
+	npm --prefix typescript run check
+	npm --prefix typescript test
 
 lint:
-	uv run ruff format .
-	uv run ruff check --fix .
-
-# Profile e2e tests (client + server subprocesses)
-# Outputs speedscope JSON (open at https://speedscope.app for filtering)
-# Usage: sudo make test-flamegraph
-test-flamegraph:
-	@mkdir -p $(PROFILES_DIR)
-	@echo "Profiling e2e tests (requires sudo for py-spy)..."
-	uv run py-spy record \
-		--subprocesses \
-		--rate $(PYSPY_RATE) \
-		--format speedscope \
-		--output $(PYSPY_OUTPUT) \
-		-- uv run pytest tests/test_middleware.py -v -n auto --no-cov --basetemp=$(PYSPY_BASETEMP)
-	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
-	@echo "Open at https://speedscope.app for interactive filtering (search 'hpke_http')"
-
-# Profile specific test file or pattern
-# Usage: sudo make test-flamegraph-pattern PATTERN=test_middleware.py::TestStandardResponseEncryption PYSPY_RATE=250
-test-flamegraph-pattern:
-	@mkdir -p $(PROFILES_DIR)
-	@echo "Profiling: $(PATTERN)"
-	uv run py-spy record \
-		--subprocesses \
-		--rate $(PYSPY_RATE) \
-		--format speedscope \
-		--output $(PYSPY_OUTPUT) \
-		-- uv run pytest tests/$(PATTERN) -v -n 0 --no-cov --basetemp=$(PYSPY_BASETEMP)
-	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
-	@echo "Open at https://speedscope.app for interactive filtering"
+	cd $(PYTHON_DIR) && uv run ruff format .
+	cd $(PYTHON_DIR) && uv run ruff check --fix .

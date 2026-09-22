@@ -1,0 +1,21 @@
+[package]
+name = "hpke-http-py"
+description = "Private PyO3 boundary for the hpke-http Python package"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hpke-http = { path = "../../rust/hpke-http" }
+pyo3.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>hpke-http browser smoke test</title>
+<body data-result="pending">pending</body>
+<script type="module">
+  import {
+    RESPONSE_MEDIA_TYPE,
+    Server,
+    createHpkeFetch,
+    generateKeyPair,
+    initialize,
+  } from "../dist/browser.js";
+
+  const text = new TextEncoder();
+  let hpkeFetch;
+  let server;
+  async function report(status, detail = "") {
+    document.body.dataset.result = status;
+    document.body.textContent = detail || status;
+    await globalThis.fetch(`/result?status=${encodeURIComponent(status)}`, {
+      method: "POST",
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: detail,
+    });
+  }
+
+  try {
+    await initialize();
+    const keys = generateKeyPair();
+    const keyId = text.encode("browser-key");
+    const psk = text.encode("a 32-byte minimum browser credential");
+    const pskId = text.encode("browser-tenant");
+    server = new Server(keys.privateKey, keyId);
+    hpkeFetch = createHpkeFetch({
+      recipientPublicKey: keys.publicKey,
+      recipientKeyId: keyId,
+      psk,
+      pskId,
+      fetch: async (input, init) => {
+        const outer = new Request(input, init);
+        const opened = server
+          .preparse(new Uint8Array(await outer.arrayBuffer()))
+          .authenticate(psk)
+          .admit({ accepted: true });
+        if (opened.request.path !== "/browser") {
+          throw new Error(`unexpected authenticated path: ${opened.request.path}`);
+        }
+        const envelope = opened.protectResponse({
+          status: 200,
+          headers: [{ name: "content-type", value: "text/plain" }],
+          body: text.encode("browser-ok"),
+        });
+        return new Response(envelope, {
+          status: 200,
+          headers: { "content-type": RESPONSE_MEDIA_TYPE },
+        });
+      },
+    });
+
+    const response = await hpkeFetch("https://api.example.test/browser");
+    if (response.status !== 200 || (await response.text()) !== "browser-ok") {
+      throw new Error("authenticated browser Fetch response did not round-trip");
+    }
+    await report("pass");
+  } catch (error) {
+    const detail = error instanceof Error ? `${error.stack ?? error.message}` : String(error);
+    await report("fail", detail);
+  } finally {
+    hpkeFetch?.close();
+    server?.close();
+  }
+</script>
