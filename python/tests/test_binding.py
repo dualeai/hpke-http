@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.machinery
-import importlib.util
 import time
 from typing import Literal, cast
 
@@ -70,7 +70,11 @@ def test_removed_python_protocol_modules_are_not_importable() -> None:
         "hpke_http.primitives.kem",
         "hpke_http.streaming",
     ):
-        assert importlib.util.find_spec(module) is None
+        with pytest.raises(ModuleNotFoundError) as error:
+            importlib.import_module(module)
+        missing_module = error.value.name
+        assert missing_module is not None
+        assert module == missing_module or module.startswith(f"{missing_module}.")
 
 
 @pytest.mark.parametrize(
