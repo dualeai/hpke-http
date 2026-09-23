@@ -251,6 +251,8 @@ Query, and additional framework adapters are not part of the current package.
 
 ## Development
 
-From the repository root, `npm --prefix typescript test` runs the Node facade
-tests and one real browser transaction. The browser test requires Chrome or
-Chromium; set `CHROME_BIN` when it is not installed in a conventional location.
+Set up Rust and the WASM target as shown in the repository README. Then run
+`make install-deps-typescript install-wasm-bindgen test-typescript` from the
+repository root. The test target builds the WASM package, runs the Node facade
+tests, and runs one real browser transaction. The browser test requires Chrome
+or Chromium; set `CHROME_BIN` when it is not in a standard path.

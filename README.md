@@ -129,18 +129,35 @@ joins the same coordinated release pipeline.
 
 ## Development
 
-Install the Python and TypeScript dependencies, then build the local Python
-extension:
+Install Rust with `rustup`, then use its `cargo` and `rustc` for the WASM target.
+Put the Rust toolchain ahead of any Rust tools from another package manager.
+Install `uv` and Node.js 24 before you run these commands:
 
 ```sh
+rustup update stable
+export PATH="$(dirname "$(rustup which cargo --toolchain stable)"):$PATH"
+rustup target add --toolchain stable wasm32-unknown-unknown
 make install
-```
-
-Run all checks:
-
-```sh
+make install-wasm-bindgen
+make build
 make test
 ```
+
+Use `make build-rust`, `make build-python`, or `make build-typescript` to build
+one language. Use `make test-rust`, `make test-python`, or `make test-typescript`
+to check one language. `make test-python` runs `make test-static` and
+`make test-func`. `make package` packs all three languages from a clean checkout;
+`package-rust`, `package-python-wheel`, `package-python-sdist`, and
+`package-typescript` select one package type. CI and release jobs use Makefile
+targets for source builds, tests, package checks, and smoke tests. The release
+wheel job reads its build options from the Makefile and uses `maturin-action` for
+each platform.
+
+Local Python targets update `uv.lock` when dependencies change. CI uses the
+locked versions. Package targets write to `artifacts/`. Run
+`make smoke-python-wheel`, `make smoke-python-sdist`, or `make smoke-typescript`
+after you build the matching package. Pass `EXPECTED_VERSION=2.0.0` to check a
+specific release version.
 
 The separate CodSpeed workflow benchmarks complete public-API transactions in
 Rust, Python, and Node/WASM at empty, 1 KiB, 1 MiB, and 8 MiB body sizes. It prepares
@@ -149,9 +166,11 @@ suite enables CodSpeed's allocation-memory mode. There are no local stopwatch
 scripts or hardware-dependent timing thresholds.
 
 `wasm-bindgen-cli` 0.2.128 and the Rust `wasm32-unknown-unknown` target are
-required for the TypeScript build. CI installs the pinned Rust toolchain and
-uses a shared Rust build cache. The TypeScript runtime test also requires Chrome
-or Chromium; set `CHROME_BIN` for a nonstandard installation path.
+required for the TypeScript build. CI uses Rust 1.98.1 and a shared Rust build
+cache. The crate supports Rust 1.87 and newer, but installing the pinned
+`wasm-bindgen-cli` from source needs Rust 1.88 or newer. Use the current stable
+Rust release to build all bindings. The TypeScript runtime test also requires
+Chrome or Chromium; set `CHROME_BIN` for a nonstandard path.
 
 ## Versions and releases
 

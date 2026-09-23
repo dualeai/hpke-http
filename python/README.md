@@ -293,6 +293,6 @@ Whole-message buffering and explicit key configuration are protocol constraints.
 From the repository root:
 
 ```sh
-uv run --project python maturin develop --manifest-path python/native/Cargo.toml
-uv run --project python pytest
+make install-deps-python build-python
+make test-python
 ```
