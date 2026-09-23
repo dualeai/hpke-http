@@ -8,8 +8,8 @@ fallback when its private extension is absent or mismatched.
 ## Install and runtime support
 
 The package supports CPython 3.10 through 3.14. Release wheels target Linux
-x86-64 and AArch64, macOS universal2, and Windows x86-64. Other CPython targets
-need a Rust source build. PyPy is not supported.
+x86-64 and AArch64 and macOS universal2. Windows is not supported. Other Linux
+and macOS CPython targets need a Rust source build. PyPy is not supported.
 
 ```sh
 python -m pip install hpke_http

@@ -165,12 +165,11 @@ check-release-portable-artifacts: check-python-package
 	grep -Fxq 'package/_wasm/node/hpke_http_wasm_bg.wasm' /tmp/hpke-http-npm-files.txt
 
 check-release-candidate:
-	test "$$(find $(ARTIFACT_DIR)/python -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 4
+	test "$$(find $(ARTIFACT_DIR)/python -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 3
 	test "$$(find $(ARTIFACT_DIR)/python -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
 	ls $(ARTIFACT_DIR)/python/*manylinux*_x86_64.whl >/dev/null
 	ls $(ARTIFACT_DIR)/python/*manylinux*_aarch64.whl >/dev/null
 	ls $(ARTIFACT_DIR)/python/*universal2.whl >/dev/null
-	ls $(ARTIFACT_DIR)/python/*win_amd64.whl >/dev/null
 	test "$$(find $(ARTIFACT_DIR)/rust -maxdepth 1 -name '*.crate' -type f | wc -l)" -eq 1
 	test "$$(find $(ARTIFACT_DIR)/npm -maxdepth 1 -name '*.tgz' -type f | wc -l)" -eq 1
 

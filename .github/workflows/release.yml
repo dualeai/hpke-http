@@ -141,12 +141,6 @@ jobs:
             rust-targets: x86_64-apple-darwin,aarch64-apple-darwin
             manylinux: ""
             interpreter: python
-          - name: windows-x86_64
-            os: windows-2025
-            target: x86_64-pc-windows-msvc
-            rust-targets: x86_64-pc-windows-msvc
-            manylinux: ""
-            interpreter: python
 
     steps:
       - name: Check out the tagged source
@@ -178,11 +172,6 @@ jobs:
         run: |
           version=$(python cicd/prepare-release-version.py "$GITHUB_REF_NAME")
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Install Make on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install make --version=4.4.1 --yes --no-progress
 
       - name: Build the platform wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0

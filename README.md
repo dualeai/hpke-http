@@ -31,10 +31,10 @@ npm install @dualeai/hpke-http
 ```
 
 The Rust crate requires Rust 1.87 or newer. Python supports CPython 3.10 through
-3.14; release wheels target Linux x86-64 and AArch64, macOS universal2, and
-Windows x86-64. The npm package supports Node.js 24 and browsers with
-WebAssembly, Fetch, Web Crypto, and Web Streams. It has explicit `./node` and
-`./browser` exports and no root export.
+3.14; release wheels target Linux x86-64 and AArch64 and macOS universal2.
+Windows Python builds are not supported. The npm package supports Node.js 24
+and browsers with WebAssembly, Fetch, Web Crypto, and Web Streams. It has
+explicit `./node` and `./browser` exports and no root export.
 
 ## Protocol properties
 
