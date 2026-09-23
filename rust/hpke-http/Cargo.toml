@@ -1,0 +1,43 @@
+[package]
+name = "hpke-http"
+description = "Bounded whole-message HPKE engine for HTTP request and response protection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/hpke-http"
+readme = "../../README.md"
+keywords = ["hpke", "http", "encryption", "rfc9180"]
+categories = ["cryptography", "web-programming"]
+
+[dependencies]
+chacha20poly1305.workspace = true
+flate2.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+hpke.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+ruzstd.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+divan = { package = "codspeed-divan-compat", version = "=5.0.2" }
+serde_json.workspace = true
+
+[[bench]]
+name = "transactions"
+harness = false
+
+[lints]
+workspace = true

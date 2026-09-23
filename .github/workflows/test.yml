@@ -1,51 +1,82 @@
-name: Test
+name: CI
 
 on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.98.1
+  PYTHON_VERSION: "3.10"
+  NODE_VERSION: "24"
 
 jobs:
-  test:
-    name: ${{ matrix.os }} / python ${{ matrix.python-version }} / ${{ matrix.test-step }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
-        test-step: [standard, root, slow]
+  core-and-bindings:
+    name: Rust + Python + TypeScript
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6.0.1
+      - name: Check out the candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7.1.6
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: "uv.lock"
+          cache-dependency-glob: python/uv.lock
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          python-version: ${{ matrix.python-version }}
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
 
-      - name: Install dependencies
-        run: make install-deps
+      - name: Set up the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt,clippy
+          target: wasm32-unknown-unknown
+          cache: false
 
-      - name: Run static checks
-        if: matrix.test-step == 'standard'
-        run: make test-static
+      - name: Restore the Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
 
-      - name: Run tests
-        if: matrix.test-step == 'standard'
-        run: make test-func-ci
+      - name: Install pinned build tools and dependencies
+        run: make install-ci
 
-      - name: Run root-required tests (tcpdump network capture)
-        if: matrix.test-step == 'root'
-        run: sudo env "PATH=$PATH" make test-func-root
+      - name: Verify the Rust core and boundary crates
+        run: make test-rust package-rust
 
-      - name: Run slow tests (large payloads)
-        if: matrix.test-step == 'slow'
-        run: make test-func-slow
+      - name: Build and verify the Python binding
+        run: make test-python
+
+      - name: Build and verify the TypeScript/WASM package
+        run: make test-typescript
+
+      - name: Build the distributable Python and npm artifacts
+        run: make package-python-wheel package-python-sdist package-typescript check-python-package
+
+      - name: Smoke-test the exact Python wheel
+        run: make smoke-python-wheel
+
+      - name: Smoke-test the exact npm tarball
+        run: make smoke-typescript
