@@ -342,7 +342,7 @@ jobs:
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: ${{ github.ref_name }}
-          name: hpke-http ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           draft: true
           body: |
             Coordinated Rust, Python, and TypeScript/WASM release from `${{ github.sha }}`.
