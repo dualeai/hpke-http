@@ -16,7 +16,6 @@ rust/hpke-http/       safe protocol engine and executable protocol contract
 python/               Python API, PyO3 boundary, and HTTP framework adapters
 typescript/           TypeScript API, WASM boundary, and native Fetch adapter
 cicd/                 tag-derived coordinated release tooling
-scratchpad/TODO.md    central implementation record and future work
 ```
 
 The Rust crate owns byte encoding, HPKE operations, limits, validation, replay

@@ -41,29 +41,29 @@ Project examples (validated):
 # Find ASGI middleware class definition
 seek 'sym:HPKEMiddleware'
 
-# Encrypt-related symbols in core.py, excluding tests
-seek 'sym:encrypt file:core -file:test'
+# Request-protection symbols in the Rust engine, excluding tests
+seek 'sym:protect file:engine -file:test' rust/
 
-# KEM ABC declarations across Python files
-seek 'content:class.*KEM.*ABC lang:python'
+# Python facade declarations
+seek 'content:class.*Client lang:python' python/src/
 
 # Locate config/entry-point files
 seek 'type:file pyproject'
 
 # Restrict to single exact file
-seek 'KemId' src/hpke_http/constants.py
+seek 'ReplayRequest' rust/hpke-http/src/engine.rs
 
 # Search across multiple files
-seek 'encrypt' src/hpke_http/core.py src/hpke_http/streaming.py
+seek 'protect' rust/hpke-http/src/engine.rs python/src/hpke_http/protocol.py
 
 # Search across multiple folders (tests + src)
-seek 'def test_' tests/ src/
+seek 'def test_' python/tests/ python/src/
 
 # Search outside the git worktree (any folder on disk)
 seek 'export' ~/.claude/
 
 # Limit output noise
-seek -n 5 -m 3 'ChunkEncryptor'
+seek -n 5 -m 3 'protect' rust/hpke-http/src/
 ```
 
 Pitfalls:
