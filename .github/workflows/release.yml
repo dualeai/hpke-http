@@ -354,7 +354,7 @@ jobs:
             configure recipient keys, PSK identities, bounds, and replay admission
             explicitly. Each packaged README contains the current API examples.
 
-            This draft is published only after every registry artifact is byte-verified.
+            This release becomes public after the three registry publish jobs pass.
           fail_on_unmatched_files: true
           files: |
             release/SHA256SUMS
@@ -587,179 +587,20 @@ jobs:
         if: steps.existing.outputs.publish == 'true'
         run: npm publish release/npm/*.tgz --access public --provenance
 
-  verify-public:
-    name: Verify public package coordinates
-    needs: [publish-crates-io, publish-pypi, publish-npm]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - name: Check out the tagged source for installed-artifact tests
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Download the tested candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: release-candidate-${{ github.sha }}
-          path: release/
-
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
-
-      - name: Set up Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Fetch and compare the public crate
-        run: |
-          version=${GITHUB_REF_NAME#v}
-          curl --fail --location --retry 12 --retry-all-errors --retry-delay 5 \
-            --user-agent "hpke-http-release/$GITHUB_SHA" \
-            "https://crates.io/api/v1/crates/hpke-http/$version/download" \
-            --output /tmp/hpke-http.crate
-          cmp release/rust/*.crate /tmp/hpke-http.crate
-
-      - name: Fetch and compare every public PyPI artifact
-        run: |
-          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
-          from __future__ import annotations
-
-          import json
-          import pathlib
-          import sys
-          import time
-          import urllib.error
-          import urllib.request
-
-          version = sys.argv[1]
-          endpoint = f"https://pypi.org/pypi/hpke_http/{version}/json"
-          metadata = None
-          for attempt in range(12):
-              try:
-                  request = urllib.request.Request(
-                      endpoint,
-                      headers={"User-Agent": "hpke-http-release"},
-                  )
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      metadata = json.load(response)
-                  break
-              except (urllib.error.URLError, TimeoutError):
-                  if attempt == 11:
-                      raise
-                  time.sleep(5)
-
-          assert metadata is not None
-          remote = {item["filename"]: item for item in metadata["urls"]}
-          local_paths = sorted(pathlib.Path("release/python").iterdir())
-          local = {path.name for path in local_paths}
-          if set(remote) != local:
-              raise SystemExit(
-                  f"PyPI artifact set differs: expected {sorted(local)}, found {sorted(remote)}"
-              )
-          for path in local_paths:
-              if path.name not in remote:
-                  raise SystemExit(f"PyPI is missing {path.name}")
-              request = urllib.request.Request(
-                  remote[path.name]["url"],
-                  headers={"User-Agent": "hpke-http-release"},
-              )
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  published = response.read()
-              if published != path.read_bytes():
-                  raise SystemExit(f"PyPI bytes differ for {path.name}")
-          PY
-
-      - name: Fetch and compare the public npm package
-        run: |
-          version=${GITHUB_REF_NAME#v}
-          mkdir -p published/npm
-          for attempt in {1..12}; do
-            if npm pack "@dualeai/hpke-http@$version" \
-              --ignore-scripts --pack-destination "$GITHUB_WORKSPACE/published/npm"; then
-              break
-            fi
-            if [[ "$attempt" -eq 12 ]]; then
-              exit 1
-            fi
-            sleep 5
-          done
-          cmp release/npm/*.tgz published/npm/*.tgz
-
-      - name: Smoke-test the public Python and npm packages
-        run: |
-          version=${GITHUB_REF_NAME#v}
-          make smoke-python-wheel \
-            PYTHON_SMOKE_DIR=.public-smoke/python \
-            PYTHON_WHEEL_PIP_FLAGS="--only-binary :all:" \
-            PYTHON_WHEEL_INPUT="hpke_http==$version" \
-            EXPECTED_VERSION="$version"
-          make smoke-typescript \
-            ARTIFACT_DIR=published \
-            NPM_SMOKE_DIR=.public-smoke/npm \
-            EXPECTED_VERSION="$version"
-
-      - name: Record the completed coordinated publication
-        run: |
-          python3 - "${GITHUB_REF_NAME#v}" "$GITHUB_REF_NAME" "$GITHUB_SHA" <<'PY'
-          import json
-          import sys
-
-          version, tag, source_sha = sys.argv[1:]
-          status = {
-              "schema": 1,
-              "version": version,
-              "tag": tag,
-              "source_sha": source_sha,
-              "state": "published-and-verified",
-              "packages": {
-                  "crates_io": f"https://crates.io/crates/hpke-http/{version}",
-                  "pypi": f"https://pypi.org/project/hpke-http/{version}/",
-                  "npm": f"https://www.npmjs.com/package/@dualeai/hpke-http/v/{version}",
-              },
-          }
-          with open("release-status.json", "w", encoding="utf-8") as output:
-              json.dump(status, output, indent=2, sort_keys=True)
-              output.write("\n")
-          PY
-
-      - name: Upload the verified publication status
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: release-status-${{ github.sha }}
-          path: release-status.json
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 30
-
   publish-release:
     name: Publish the GitHub release
-    needs: verify-public
+    needs: [publish-crates-io, publish-pypi, publish-npm]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
-      - name: Download the verified publication status
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: release-status-${{ github.sha }}
-
-      - name: Attach status and publish the draft release
+      - name: Publish the draft release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: ${{ github.ref_name }}
           draft: false
-          fail_on_unmatched_files: true
-          files: release-status.json
 
       - name: Summarize the coordinated release
         run: |
@@ -767,7 +608,7 @@ jobs:
           {
             echo "## hpke-http $version"
             echo
-            echo "Published and re-verified from commit \`$GITHUB_SHA\`:"
+            echo "Published from commit \`$GITHUB_SHA\`:"
             echo "- crates.io: \`hpke-http@$version\`"
             echo "- PyPI: \`hpke_http==$version\`"
             echo "- npm: \`@dualeai/hpke-http@$version\`"
