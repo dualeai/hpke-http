@@ -583,15 +583,6 @@ jobs:
               ;;
           esac
 
-      - name: Require the one-time npm trusted-publisher bootstrap
-        env:
-          NPM_TRUSTED_PUBLISHING_CONFIGURED: ${{ vars.NPM_TRUSTED_PUBLISHING_CONFIGURED }}
-        run: |
-          if [[ "$NPM_TRUSTED_PUBLISHING_CONFIGURED" != "true" ]]; then
-            echo "::error::npm requires a package to exist before trusted publishing can be configured. If @dualeai/hpke-http is still unpublished, manually publish the exact release/npm/*.tgz candidate as a public package. Then configure its GitHub Actions trusted publisher for workflow filename release.yml, environment npm, and direct npm publish permission; set the npm-environment variable NPM_TRUSTED_PUBLISHING_CONFIGURED=true; and rerun this workflow. The rerun byte-compares an existing version before continuing."
-            exit 1
-          fi
-
       - name: Publish the npm/WASM package
         if: steps.existing.outputs.publish == 'true'
         run: npm publish release/npm/*.tgz --access public --provenance
