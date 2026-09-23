@@ -44,3 +44,33 @@ for (const [label, size] of [["empty", 0], ["1KiB", 1024], ["1MiB", 1024 * 1024]
     });
   });
 }
+
+for (const [label, payloadSize, count] of [["100-small-blocks", 1, 100], ["one-large-block", 1024 * 1024, 1]]) {
+  describe(`sse/${label}`, () => {
+    const request = { method: "GET", authority: "api.example.test", path: "/events" };
+    const block = encoder.encode(`data:${"x".repeat(payloadSize)}\n\n`);
+    const headers = [{ name: "content-type", value: "text/event-stream" }];
+
+    bench("protect-authenticate-seal-open", () => {
+      const protectedRequest = client.protect(request);
+      const opened = server.preparse(protectedRequest.envelope).authenticate(psk).admit({ accepted: true });
+      const writer = opened.startResponse(200, headers);
+      const reader = protectedRequest.intoOpener();
+      try {
+        assert.equal(reader.feed(writer.start).record?.kind, "start");
+        let total = 0;
+        for (let index = 0; index < count; index += 1) {
+          const record = reader.feed(writer.sealSseBlock(block)).record;
+          assert.equal(record?.kind, "sse_data");
+          total += record.block.byteLength;
+        }
+        assert.equal(reader.feed(writer.finish()).record?.kind, "end");
+        assert.equal(reader.finishEof(), undefined);
+        assert.equal(total, block.byteLength * count);
+      } finally {
+        writer.close();
+        reader.close();
+      }
+    });
+  });
+}

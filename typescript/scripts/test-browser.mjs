@@ -9,13 +9,18 @@ import { fileURLToPath } from "node:url";
 const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const chrome = await findChrome();
 let resolveBrowserResult = () => {};
+let pendingRelay;
 const browserResult = new Promise((resolveResult) => {
   resolveBrowserResult = resolveResult;
 });
 const server = createServer((request, response) => {
   void serve(request, response).catch((error) => {
-    response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-    response.end(String(error));
+    if (response.headersSent) {
+      response.destroy(error);
+    } else {
+      response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      response.end(String(error));
+    }
   });
 });
 
@@ -82,6 +87,48 @@ try {
 async function serve(request, response) {
   const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
   const pathname = decodeURIComponent(requestUrl.pathname);
+  if (pathname === "/relay") {
+    if (request.method === "PUT") {
+      if (pendingRelay === undefined) {
+        response.writeHead(409).end();
+        return;
+      }
+      const held = pendingRelay;
+      if (held.middle === undefined) {
+        pendingRelay = undefined;
+        held.response.end(held.last);
+      } else {
+        held.response.write(held.middle);
+        held.middle = undefined;
+      }
+      response.writeHead(204).end();
+      return;
+    }
+    if (request.method !== "POST" || pendingRelay !== undefined) {
+      response.writeHead(409).end();
+      return;
+    }
+    let body = "";
+    for await (const part of request) {
+      body += part;
+      if (body.length > 65_536) { throw new Error("browser relay input exceeds 64 KiB"); }
+    }
+    const parts = JSON.parse(body);
+    if (!Array.isArray(parts.first) || !Array.isArray(parts.last) ||
+        (parts.middle !== undefined && !Array.isArray(parts.middle))) {
+      throw new Error("browser relay needs byte arrays");
+    }
+    const first = Buffer.from(parts.first);
+    const middle = parts.middle === undefined ? undefined : Buffer.from(parts.middle);
+    const last = Buffer.from(parts.last);
+    response.writeHead(200, { "content-type": "message/hpke-http-response", "cache-control": "no-store" });
+    response.write(first);
+    pendingRelay = { response, middle, last };
+    response.once("close", () => {
+      if (pendingRelay?.response === response) { pendingRelay = undefined; }
+    });
+    return;
+  }
   if (pathname === "/result") {
     if (request.method !== "POST") {
       response.writeHead(405).end();

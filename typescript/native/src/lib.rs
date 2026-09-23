@@ -4,8 +4,9 @@
 
 use hpke_http::{
     Client as CoreClient, CompressionCoding, Error, HeaderField, Limits, Method, ReplayRequest,
-    ReplayToken, Request, Response, ResponseCapability, ResponseToken, Server as CoreServer,
-    StartToken, generate_key_pair,
+    ReplayToken, Request, Response, ResponseCapability, ResponseMode, ResponseOpener,
+    ResponseRecord, ResponseSealer, ResponseToken, Server as CoreServer, StartToken,
+    generate_key_pair,
 };
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -205,15 +206,143 @@ impl WasmProtectedRequest {
     ///
     /// Returns a stable JavaScript error value for consumed state or invalid
     /// response bytes.
-    pub fn open_response(&mut self, envelope: &[u8]) -> Result<WasmResponse, JsValue> {
+    pub fn open_finite_response(&mut self, envelope: &[u8]) -> Result<WasmResponse, JsValue> {
         let token = self.response_token.take().ok_or_else(consumed_error)?;
-        let response = token.open(envelope).map_err(js_error)?;
+        let response = token.open_finite(envelope).map_err(js_error)?;
         WasmResponse::from_core(response)
+    }
+
+    /// Transfer the response token to a checked record reader.
+    ///
+    /// # Errors
+    /// Returns a state error if this token was used.
+    pub fn into_opener(&mut self) -> Result<WasmResponseOpener, JsValue> {
+        let token = self.response_token.take().ok_or_else(consumed_error)?;
+        Ok(WasmResponseOpener {
+            inner: Some(token.into_opener()),
+        })
     }
 
     /// Discard the response token immediately.
     pub fn discard(&mut self) {
         self.response_token = None;
+    }
+}
+
+/// One bounded checked response reader.
+#[wasm_bindgen(js_name = ResponseOpener)]
+pub struct WasmResponseOpener {
+    inner: Option<ResponseOpener>,
+}
+
+#[wasm_bindgen(js_class = ResponseOpener)]
+impl WasmResponseOpener {
+    /// Consume input through at most one checked record.
+    ///
+    /// # Errors
+    /// Returns a parse, limit, order, or authentication error.
+    pub fn feed(&mut self, input: &[u8]) -> Result<WasmFeed, JsValue> {
+        let inner = self.inner.as_mut().ok_or_else(consumed_error)?;
+        let (consumed, record) = inner.feed(input).map_err(js_error)?;
+        WasmFeed::new(consumed, record)
+    }
+
+    /// Check true outer-body EOF after END.
+    ///
+    /// # Errors
+    /// Returns an error when END is missing or the reader failed.
+    pub fn finish_eof(&mut self) -> Result<Option<WasmResponse>, JsValue> {
+        let inner = self.inner.as_mut().ok_or_else(consumed_error)?;
+        let response = inner.finish_eof().map_err(js_error)?;
+        self.inner = None;
+        response.map(WasmResponse::from_core).transpose()
+    }
+
+    /// Discard the state without a complete-response claim.
+    pub fn close(&mut self) {
+        self.inner = None;
+    }
+}
+
+/// One result from the bounded response record reader.
+#[wasm_bindgen(js_name = FeedResult)]
+pub struct WasmFeed {
+    consumed: usize,
+    kind: u8,
+    status: u16,
+    headers_json: String,
+    mode: u8,
+    block: Vec<u8>,
+}
+
+impl WasmFeed {
+    fn new(consumed: usize, record: Option<ResponseRecord>) -> Result<Self, JsValue> {
+        let mut result = Self {
+            consumed,
+            kind: 0,
+            status: 0,
+            headers_json: String::new(),
+            mode: 0,
+            block: Vec::new(),
+        };
+        match record {
+            Some(ResponseRecord::Start(head)) => {
+                result.kind = 1;
+                result.status = head.status;
+                result.headers_json = serialize_headers(&head.headers)?;
+                result.mode = match head.mode {
+                    ResponseMode::Finite => 1,
+                    ResponseMode::Sse => 2,
+                };
+            }
+            Some(ResponseRecord::SseData(block)) => {
+                result.kind = 2;
+                result.block = block;
+            }
+            Some(ResponseRecord::End) => result.kind = 3,
+            None => {}
+        }
+        Ok(result)
+    }
+}
+
+#[wasm_bindgen(js_class = FeedResult)]
+impl WasmFeed {
+    /// Number of input bytes consumed.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+    /// 0 means partial; 1 START, 2 SSE DATA, 3 END.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn kind(&self) -> u8 {
+        self.kind
+    }
+    /// Checked START status.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+    /// Checked START field pairs in private JSON form.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn headers_json(&self) -> String {
+        self.headers_json.clone()
+    }
+    /// Checked START mode: 1 finite, 2 SSE.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn mode(&self) -> u8 {
+        self.mode
+    }
+    /// Clear SSE block bytes, only for kind 2.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn block(&self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(self.block.as_slice())
     }
 }
 
@@ -491,7 +620,7 @@ impl WasmOpenedRequest {
     ) -> Result<Vec<u8>, JsValue> {
         let capability = self.response_capability.take().ok_or_else(consumed_error)?;
         capability
-            .protect(&Response {
+            .protect_finite(&Response {
                 status,
                 headers: parse_headers(headers_json)?,
                 body: body.to_vec(),
@@ -499,9 +628,88 @@ impl WasmOpenedRequest {
             .map_err(js_error)
     }
 
+    /// Start a response record stream with checked status and fields.
+    ///
+    /// # Errors
+    /// Returns a state, validation, entropy, or cryptographic error.
+    pub fn start_response(
+        &mut self,
+        status: u16,
+        headers_json: &str,
+    ) -> Result<WasmResponseSealer, JsValue> {
+        let capability = self.response_capability.take().ok_or_else(consumed_error)?;
+        let (inner, first) = capability
+            .into_sealer(status, parse_headers(headers_json)?, None)
+            .map_err(js_error)?;
+        Ok(WasmResponseSealer {
+            inner: Some(inner),
+            first,
+        })
+    }
+
     /// Discard the response capability immediately.
     pub fn discard_response(&mut self) {
         self.response_capability = None;
+    }
+}
+
+/// One checked response writer for a finite body or complete SSE blocks.
+#[wasm_bindgen(js_name = ResponseSealer)]
+pub struct WasmResponseSealer {
+    inner: Option<ResponseSealer>,
+    first: Vec<u8>,
+}
+
+#[wasm_bindgen(js_class = ResponseSealer)]
+impl WasmResponseSealer {
+    /// Move the response prefix and START record into JavaScript.
+    pub fn take_start(&mut self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(std::mem::take(&mut self.first).as_slice())
+    }
+
+    /// Protect a finite body once. An empty body emits no DATA record.
+    ///
+    /// # Errors
+    /// Returns a validation, limit, compression, or cryptographic error.
+    pub fn seal_finite_body(&mut self, body: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
+        self.inner
+            .as_mut()
+            .ok_or_else(consumed_error)?
+            .seal_finite_body(body)
+            .map_err(js_error)
+    }
+
+    /// Protect one complete LF-normalized SSE block.
+    ///
+    /// # Errors
+    /// Returns a shape, limit, or cryptographic error.
+    pub fn seal_sse_block(&mut self, block: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.inner
+            .as_mut()
+            .ok_or_else(consumed_error)?
+            .seal_sse_block(block)
+            .map_err(js_error)
+    }
+
+    /// Protect END. The caller then ends the outer HTTP body.
+    ///
+    /// # Errors
+    /// Returns a state or cryptographic error.
+    pub fn finish(&mut self) -> Result<Vec<u8>, JsValue> {
+        let frame = self
+            .inner
+            .as_mut()
+            .ok_or_else(consumed_error)?
+            .finish()
+            .map_err(js_error)?;
+        self.inner = None;
+        Ok(frame)
+    }
+
+    /// Discard without END.
+    pub fn close(&mut self) {
+        self.inner = None;
+        self.first.clear();
     }
 }
 

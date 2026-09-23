@@ -1,177 +1,127 @@
-//! Safe, synchronous, bounded whole-message HPKE transactions for HTTP.
+//! Bounded HPKE requests and checked response records for HTTP.
 //!
-//! This crate is the self-documenting source contract for stable protocol
-//! [`PROTOCOL_ID`]. It performs no networking and exposes no transport or
-//! framework objects. Protocol version 1 composes:
-//!
-//! - RFC 9180 HPKE in PSK mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
-//!   and ChaCha20-Poly1305;
-//! - canonical RFC 9292 known-length Binary HTTP Messages as plaintext, with
-//!   an optional authenticated body-coding extension; and
-//! - the response-secret, recipient-nonce, and `enc || response_nonce`
-//!   derivation pattern from RFC 9458 section 4.4.
-//!
-//! The protocol is not wire-compatible with RFC 9458 Oblivious HTTP. Its narrow PSK
-//! request envelope is project-specific. HTTPS remains required because the
-//! protocol does not hide its endpoint, public identifiers, sizes, or timing.
+//! This crate defines the sole wire contract, [`PROTOCOL_ID`] `hpke-http/2`.
+//! It does no network I/O. HTTP hosts must use HTTPS because this protocol
+//! does not hide endpoints, public IDs, record sizes, counts, or timing.
+//! The suite is RFC 9180 HPKE PSK mode with X25519, HKDF-SHA256, and
+//! ChaCha20-Poly1305. The request plaintext uses canonical known-length
+//! RFC 9292 Binary HTTP. This protocol is not RFC 9458 Oblivious HTTP.
 //!
 //! # Request bytes
 //!
-//! Multi-byte integers use network byte order. The authenticated HPKE `info`
-//! is `"message/hpke-http request" || 0x00 || "v1" || 0x00 || header`, where `header`
-//! ends after the PSK ID. HPKE seals the request plaintext with empty AAD.
+//! All fixed-width integers are big-endian. The request is the following
+//! byte string, with no trailing fields:
 //!
-//! | Field | Size | Value |
+//! | Field | Bytes | Value |
 //! | --- | ---: | --- |
 //! | magic | 4 | ASCII `HHRQ` |
-//! | version | 1 | `0x01` |
-//! | flags | 1 | `0x00` |
-//! | recipient key-ID length | 1 | `1..=255` |
-//! | PSK-ID length | 1 | `1..=255` |
-//! | KEM ID | 2 | `0x0020` |
-//! | KDF ID | 2 | `0x0001` |
-//! | AEAD ID | 2 | `0x0003` |
-//! | issued-at Unix seconds | 8 | unsigned network-order client time |
-//! | recipient key ID | variable | opaque public bytes |
-//! | PSK ID | variable | opaque public bytes, never the PSK |
-//! | `enc` | 32 | encoded X25519 encapsulated key |
-//! | ciphertext | variable | request plaintext plus 16-byte tag |
+//! | version, flags | 1 each | `0x02`, `0x00` |
+//! | key ID length, PSK ID length | 1 each | `1..=255` |
+//! | KEM, KDF, AEAD IDs | 2 each | `0x0020`, `0x0001`, `0x0003` |
+//! | issued-at Unix seconds | 8 | client time |
+//! | key ID, PSK ID | stated lengths | opaque public IDs |
+//! | `enc` | 32 | X25519 HPKE encapsulated key |
+//! | ciphertext | variable | request plaintext and 16-byte tag |
 //!
-//! The PSK is at least 32 bytes. Both IDs are non-empty, at most 255 bytes,
-//! and the PSK ID must not equal the PSK.
+//! `header` ends after the PSK ID. HPKE `info` is
+//! `"message/hpke-http request\0v2\0" || header`; request AEAD AAD is empty.
+//! The PSK must have at least 32 bytes and must differ from its public ID.
+//! Normal request plaintext is a canonical known-length Binary HTTP request.
+//! If the client opts into private body coding, plaintext is
+//! `0x04 || request_coding:u8 || response_coding:u8 || BHTTP_request`.
+//! Coding IDs are 0 (identity), 1 (gzip), and 2 (zstd). Only the body bytes
+//! are coded; the logical headers and `Content-Length` name clear bytes.
+//! Coding is off by default because compressed length can leak information.
 //!
-//! # Optional authenticated body coding
+//! After request authentication and parsing, the server checks the client
+//! time against [`REQUEST_LIFETIME_SECS`] and [`CLOCK_SKEW_SECS`]. The replay
+//! ID is SHA-256 of `"hpke-http/replay\0v2\0" || header || enc`.
+//! [`ReplayToken::admit`] needs one host replay decision and checks the
+//! deadline again. The host must reserve the ID through that deadline.
 //!
-//! Identity requests seal the original canonical BHTTP bytes, unchanged. A
-//! client that explicitly selects [`CompressionCoding`] instead seals
-//! `0x04 || request_coding || response_coding || BHTTP_request`, where coding
-//! IDs are 0 for identity, 1 for gzip, and 2 for zstd. `response_coding` is
-//! the client's advertised preference. `0x04` is not a BHTTP request framing
-//! indicator, so a peer without this extension rejects the request. The
-//! server must explicitly enable the extension; it never compresses a response
-//! for an identity-only client. When compression saves bytes, the server seals
-//! `0x04 || response_coding || BHTTP_response`; otherwise it seals the original
-//! canonical BHTTP response. Unadvertised response coding is rejected.
+//! # Response bytes
 //!
-//! Only the BHTTP body vector is coded. Its fields remain logical HTTP fields;
-//! in particular, `content-length` names the decoded logical body and is
-//! checked after bounded decompression. This private, authenticated transform
-//! is independent of HTTP `Content-Encoding`, which remains ordinary opaque
-//! representation metadata at the low-level API. Gzip accepts concatenated
-//! members; zstd accepts up to 16 concatenated or skippable frames without
-//! dictionaries, with history windows capped at 8 MiB. Both coded and decoded
-//! bodies have the configured body limit. The request is decompressed only after replay
-//! admission. Compression is off by default because ciphertext length can
-//! reveal information about a body containing both secrets and attacker input.
-//!
-//! # Authenticated HTTP subset
-//!
-//! Requests use the fixed `https` scheme and one of [`Method`]'s seven values.
-//! The authority and path are bounded ASCII. Authorities follow the RFC 3986
-//! host plus optional decimal-port grammar, without userinfo or normalization;
-//! IPv6 and `IPvFuture` literals require brackets. Request targets reject
-//! malformed percent escapes, backslashes, fragments, and dot segments; `*` is
-//! limited to `OPTIONS`. Headers are ordered fields with lower-case HTTP token names and
-//! canonical ASCII values without leading or trailing optional whitespace;
-//! repeated names remain ordered. Connection-specific framing, unsupported
-//! proxy semantics, and `Expect` are rejected: `connection`, `expect`, `host`,
-//! `keep-alive`, `proxy-authenticate`, `proxy-authentication-info`,
-//! `proxy-authorization`, `proxy-connection`, `te`, `trailer`,
-//! `transfer-encoding`, and `upgrade`. A single decimal `content-length` is
-//! optional. It must equal the authenticated body length on requests and normal
-//! responses, is metadata on `HEAD` and 304 responses, and is forbidden on 204.
-//! Responses contain one status from 200 through 599. `HEAD` responses and
-//! status 204, 205, or 304 responses cannot contain a body. Empty bodies remain
-//! part of an authenticated canonical message.
-//!
-//! # Replay pause and one-shot response
-//!
-//! After complete request authentication and canonical parsing, [`Server`]
-//! checks the authenticated issued-at time against [`REQUEST_LIFETIME_SECS`]
-//! and [`CLOCK_SKEW_SECS`]. It then returns
-//! `SHA-256("hpke-http/replay" || 0x00 || "v1" || 0x00 || header || enc)` and an
-//! exclusive retention deadline through [`ReplayRequest`]. The verified
-//! plaintext stays in an opaque [`ReplayToken`] until the host reports one
-//! matching atomic replay-admission decision. A provider must reserve the ID
-//! until that deadline and fail closed on an uncertain result. This crate does
-//! not provide or claim a distributed replay store. [`ReplayToken::admit`]
-//! reads the trusted clock again and refuses to release plaintext at or after
-//! the authenticated deadline, including when a provider call was delayed.
-//!
-//! Both HPKE contexts export 32 bytes with context
-//! `"message/hpke-http response" || 0x00 || "v1"`. A server samples a fresh 32-byte
-//! `response_nonce`, uses `enc || response_nonce` as HKDF-SHA256 salt, and
-//! expands the exported secret with raw info `"key"` (32 bytes) and
-//! `"nonce"` (12 bytes). The response bytes are:
+//! Each HPKE context exports 32 bytes with context
+//! `"message/hpke-http response\0v2"`. The server samples a fresh 32-byte
+//! `server_nonce`. HKDF-SHA256 uses `enc || server_nonce` as salt and the
+//! exported secret as input key material. It expands 32 bytes with info
+//! `"hpke-http/2 response key"` and 12 bytes with info
+//! `"hpke-http/2 response nonce"`. A response has this exact form:
 //!
 //! ```text
-//! response_nonce[32] || ChaCha20Poly1305(response_plaintext, empty_aad)
+//! "HHRP" || 0x02 || server_nonce[32] || records...
+//! record = ciphertext_len:u32be || ciphertext[ciphertext_len]
 //! ```
 //!
-//! [`ResponseToken`] and [`ResponseCapability`] consume ownership, so each
-//! request can open and create at most one response.
+//! The 37-byte prefix stays fixed for all records. Each record plaintext
+//! starts with a one-byte kind. `START` is `0x01 || status:u16be ||
+//! coding:u8 || fields`. `fields` is the ordered sequence of name/value
+//! pairs, each encoded as an RFC 9292 QUIC variable-length integer and that
+//! many raw bytes. There is no field count or end marker: the START record
+//! end terminates the sequence. `DATA` is `0x02 || body`; `END` is only
+//! `0x03`. The record length includes the 16-byte tag and must be at least
+//! 17. The stream has one START at sequence 0, zero or more DATA records,
+//! then one END; END must be the last record. Each sequence is a `u64`.
+//! The writer reserves `u64::MAX` for END and rejects DATA that would use
+//! it. The reader rejects a sequence overflow.
 //!
-//! # Complete transaction
+//! For record number `n`, the 12-byte nonce is the derived base nonce with
+//! its last 8 bytes combined with `n:u64be` by XOR. Its `AAD` is the exact byte string
+//! `"hpke-http/2 response record\0" || prefix[37] || n:u64be ||
+//! ciphertext_len:u32be`. ChaCha20-Poly1305 seals the kind and body under
+//! this nonce and AAD. The client checks the full tag before using any
+//! START fields or yielding a DATA block. Any bad tag, form, order, or limit
+//! closes the state. A checked END is not success until the caller reports
+//! actual outer HTTP body EOF through [`ResponseOpener::finish_eof`]. Extra
+//! bytes after END, including bytes in the same transport chunk, fail.
+//!
+//! A single checked `Content-Type` whose media type is `text/event-stream`
+//! selects SSE. SSE requires status 200, a request other than HEAD, identity
+//! private coding, and no logical `Content-Length` or `Content-Encoding`.
+//! Each SSE DATA holds exactly one complete clear SSE block: line endings
+//! are LF, and the block ends with one blank line. This includes comment
+//! and control blocks. [`SseSplitter`] maps CR, LF, and CRLF to LF as the
+//! server reads app bytes. It drops an unfinished tail at a clean end.
+//! The caller parses SSE fields; this crate returns checked block bytes.
+//! Each block has its own [`Limits::max_body_len`] bound; an SSE stream has
+//! no total-body bound. A finite response has at most one DATA and becomes
+//! public only after END and true EOF. Its body may use the one advertised
+//! private gzip or zstd coding, with bounded clear and coded lengths.
+//! HEAD and status 204, 205, or 304 have no body.
+//!
+//! # Complete finite transaction
 //!
 //! ```
-//! use hpke_http::{
-//!     Client, Limits, Method, Request, Response, Server, generate_key_pair,
-//! };
+//! use hpke_http::{Client, Limits, Method, Request, Response, Server, generate_key_pair};
 //!
-//! let key_pair = generate_key_pair()?;
-//! let (recipient_private_key, recipient_public_key) = key_pair.into_parts();
-//! let recipient_key_id = b"primary-2026-09".to_vec();
+//! let keys = generate_key_pair()?;
+//! let (private, public) = keys.into_parts();
+//! let key_id = b"primary".to_vec();
 //! let psk = vec![0x42; 32];
-//! let psk_id = b"tenant-42".to_vec();
-//! let limits = Limits::default();
-//!
-//! let client = Client::new(
-//!     &recipient_public_key,
-//!     recipient_key_id.clone(),
-//!     psk.clone(),
-//!     psk_id.clone(),
-//!     limits,
-//! )?;
-//! let server = Server::new(&recipient_private_key, recipient_key_id, limits)?;
+//! let psk_id = b"tenant".to_vec();
+//! let client = Client::new(&public, key_id.clone(), psk.clone(), psk_id.clone(), Limits::default())?;
+//! let server = Server::new(&private, key_id, Limits::default())?;
 //! let request = Request {
-//!     method: Method::Post,
-//!     authority: b"api.example.test".to_vec(),
-//!     path: b"/items".to_vec(),
-//!     headers: Vec::new(),
-//!     body: b"payload".to_vec(),
+//!     method: Method::Post, authority: b"api.example.test".to_vec(),
+//!     path: b"/items".to_vec(), headers: Vec::new(), body: b"payload".to_vec(),
 //! };
-//!
-//! let protected = client.protect(&request)?;
-//! let (request_envelope, response_token) = protected.into_parts();
-//! let preparsed = server.preparse(&request_envelope)?;
+//! let (envelope, token) = client.protect(&request)?.into_parts();
+//! let preparsed = server.preparse(&envelope)?;
 //! assert_eq!(preparsed.credential.psk_id, psk_id);
 //! let authenticated = server.authenticate(preparsed.token, &psk)?;
-//! let replay_decision = authenticated.replay.decision(true);
-//! let opened = authenticated.token.admit(replay_decision)?;
+//! let opened = authenticated.token.admit(authenticated.replay.decision(true))?;
 //! assert_eq!(opened.request, request);
-//!
-//! let expected = Response {
-//!     status: 200,
-//!     headers: Vec::new(),
-//!     body: b"ok".to_vec(),
-//! };
-//! let response_envelope = opened.response.protect(&expected)?;
-//! assert_eq!(response_token.open(&response_envelope)?, expected);
+//! let expected = Response { status: 200, headers: Vec::new(), body: b"ok".to_vec() };
+//! let response = opened.response.protect_finite(&expected)?;
+//! assert_eq!(token.open_finite(&response)?, expected);
 //! # Ok::<(), hpke_http::Error>(())
 //! ```
 //!
-//! # Limits and errors
-//!
-//! [`Limits`] defaults to an 8 MiB body, 16 KiB of header names/values, 64
-//! fields, and an 8 KiB authority-plus-path. Its documented hard ceilings are
-//! enforced before attacker-controlled lengths drive allocations. [`Error`]
-//! provides stable coarse categories and contains no credentials, plaintext,
-//! ciphertext, or parser offsets.
-//!
-//! The crate version, [`PROTOCOL_ID`], and [`BINDING_ABI_VERSION`] are distinct
-//! identities. First-party bindings call [`build_info`] before accepting
-//! credentials. Incompatible wire changes require a new protocol identifier and
-//! envelope version rather than reinterpretation of request version `0x01`.
+//! [`Limits`] defaults to an 8 MiB body, 16 KiB of header bytes, 64
+//! fields, and an 8 KiB authority plus path. Bounds apply before lengths
+//! drive allocations. [`Error`] has coarse codes and no clear or secret
+//! bytes. The crate version, [`PROTOCOL_ID`], and [`BINDING_ABI_VERSION`]
+//! are separate values; bindings check all three before accepting secrets.
 
 #![forbid(unsafe_code)]
 
@@ -183,6 +133,8 @@ mod error;
 mod limits;
 mod message;
 mod method;
+mod response;
+mod sse;
 
 pub use compression::CompressionCoding;
 pub use engine::{
@@ -198,11 +150,13 @@ pub use limits::{
 };
 pub use message::{HeaderField, Request, Response};
 pub use method::Method;
+pub use response::{ResponseHead, ResponseMode, ResponseOpener, ResponseRecord, ResponseSealer};
+pub use sse::SseSplitter;
 
 /// Language-neutral protocol identifier.
-pub const PROTOCOL_ID: &str = "hpke-http/1";
+pub const PROTOCOL_ID: &str = "hpke-http/2";
 /// Boundary ABI version used by the first-party bindings.
-pub const BINDING_ABI_VERSION: u32 = 1;
+pub const BINDING_ABI_VERSION: u32 = 2;
 /// Time for which a newly created request can be accepted (five minutes).
 pub const REQUEST_LIFETIME_SECS: u64 = 300;
 /// Maximum accepted client/server clock difference (30 seconds).

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Literal
@@ -9,7 +10,7 @@ from typing import Literal
 import httpx
 import pytest
 
-from hpke_http import Header, Limits, Response, Server, StateError, TransportError, generate_key_pair
+from hpke_http import Header, Limits, ProtocolError, Response, Server, StateError, TransportError, generate_key_pair
 from hpke_http.middleware.httpx import HPKEAsyncClient
 from hpke_http.transport import RESPONSE_MEDIA_TYPE, filter_request_headers, filter_response_headers
 
@@ -260,21 +261,27 @@ async def test_httpx_adapter_rejects_invalid_outer_responses(
 @pytest.mark.asyncio
 async def test_httpx_adapter_bounds_unannounced_outer_response_bytes() -> None:
     closed = False
+    key_pair = generate_key_pair()
+    server = Server(key_pair.private_key, KEY_ID)
 
     class OversizedStream(httpx.AsyncByteStream):
+        def __init__(self, envelope: bytes) -> None:
+            self.envelope = envelope
+
         async def __aiter__(self) -> AsyncIterator[bytes]:
-            yield b"x" * 100_000
+            yield self.envelope
 
         async def aclose(self) -> None:
             nonlocal closed
             closed = True
 
-    async def transport(_request: httpx.Request) -> httpx.Response:
-        response = httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, stream=OversizedStream())
+    async def transport(request: httpx.Request) -> httpx.Response:
+        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        envelope = opened.protect_response(Response(status=200, body=b"ab"))
+        response = httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, stream=OversizedStream(envelope))
         assert "content-length" not in response.headers
         return response
 
-    key_pair = generate_key_pair()
     async with HPKEAsyncClient(
         key_pair.public_key,
         KEY_ID,
@@ -283,10 +290,57 @@ async def test_httpx_adapter_bounds_unannounced_outer_response_bytes() -> None:
         limits=Limits(max_body_len=1),
         transport=httpx.MockTransport(transport),
     ) as adapter:
-        with pytest.raises(TransportError) as captured:
+        with pytest.raises(ProtocolError) as captured:
             await adapter.get("https://api.example.test/items")
-    assert captured.value.code == "response_too_large"
+    assert captured.value.code == "limit_exceeded"
     assert closed
+    server.close()
+
+
+@pytest.mark.asyncio
+async def test_httpx_adapter_holds_finite_body_until_outer_eof() -> None:
+    key_pair = generate_key_pair()
+    server = Server(key_pair.private_key, KEY_ID)
+    waiting_for_eof = asyncio.Event()
+    release_eof = asyncio.Event()
+
+    class HeldStream(httpx.AsyncByteStream):
+        def __init__(self, envelope: bytes) -> None:
+            self.envelope = envelope
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield self.envelope
+            waiting_for_eof.set()
+            await release_eof.wait()
+
+        async def aclose(self) -> None:
+            release_eof.set()
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        envelope = opened.protect_response(Response(status=200, body=b"complete"))
+        return httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, stream=HeldStream(envelope))
+
+    async with HPKEAsyncClient(
+        key_pair.public_key,
+        KEY_ID,
+        PSK,
+        PSK_ID,
+        transport=httpx.MockTransport(transport),
+    ) as adapter:
+        waiting = asyncio.create_task(adapter.get("https://api.example.test/items"))
+        try:
+            await asyncio.wait_for(waiting_for_eof.wait(), 2)
+            assert not waiting.done()
+            release_eof.set()
+            response = await asyncio.wait_for(waiting, 2)
+            assert response.content == b"complete"
+        finally:
+            release_eof.set()
+            if not waiting.done():
+                waiting.cancel()
+                await asyncio.gather(waiting, return_exceptions=True)
+    server.close()
 
 
 @pytest.mark.asyncio

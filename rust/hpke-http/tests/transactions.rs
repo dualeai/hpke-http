@@ -1,4 +1,4 @@
-//! End-to-end protocol version 1 transaction and rejection tests.
+//! End-to-end protocol version 2 transaction and rejection tests.
 
 use hpke_http::{
     Client, EntropySource, Error, HeaderField, Limits, Method, Request, Response, Server,
@@ -28,7 +28,7 @@ fn request(body: &[u8]) -> Request {
     Request {
         method: Method::Post,
         authority: b"api.example.test".to_vec(),
-        path: b"/v1/items?limit=2".to_vec(),
+        path: b"/v2/items?limit=2".to_vec(),
         headers: vec![HeaderField {
             name: b"content-type".to_vec(),
             value: b"application/json".to_vec(),
@@ -62,8 +62,8 @@ fn complete_request_and_response_round_trip() -> Result<(), Error> {
         .admit(authenticated.replay.decision(true))?;
     assert_eq!(opened.request, request(br#"{"name":"Ada"}"#));
 
-    let protected_response = opened.response.protect(&response())?;
-    assert_eq!(response_token.open(&protected_response)?, response());
+    let protected_response = opened.response.protect_finite(&response())?;
+    assert_eq!(response_token.open_finite(&protected_response)?, response());
     Ok(())
 }
 
@@ -79,8 +79,8 @@ fn owned_envelope_authenticates_without_changing_the_transaction() -> Result<(),
         .token
         .admit(authenticated.replay.decision(true))?;
     assert_eq!(opened.request, expected);
-    let protected_response = opened.response.protect(&response())?;
-    assert_eq!(response_token.open(&protected_response)?, response());
+    let protected_response = opened.response.protect_finite(&response())?;
+    assert_eq!(response_token.open_finite(&protected_response)?, response());
     Ok(())
 }
 
@@ -129,8 +129,8 @@ fn repeated_fields_and_exact_content_lengths_round_trip() -> Result<(), Error> {
         ],
         body: b"ok".to_vec(),
     };
-    let envelope = opened.response.protect(&expected_response)?;
-    assert_eq!(response_token.open(&envelope)?, expected_response);
+    let envelope = opened.response.protect_finite(&expected_response)?;
+    assert_eq!(response_token.open_finite(&envelope)?, expected_response);
     Ok(())
 }
 
@@ -159,8 +159,8 @@ fn head_and_not_modified_preserve_content_length_metadata() -> Result<(), Error>
             }],
             body: Vec::new(),
         };
-        let response = opened.response.protect(&expected)?;
-        assert_eq!(response_token.open(&response)?, expected);
+        let response = opened.response.protect_finite(&expected)?;
+        assert_eq!(response_token.open_finite(&response)?, expected);
     }
     Ok(())
 }
@@ -183,12 +183,12 @@ fn empty_request_and_no_content_response_are_authenticated() -> Result<(), Error
         .admit(authenticated.replay.decision(true))?;
     assert!(opened.request.body.is_empty());
 
-    let protected_response = opened.response.protect(&Response {
+    let protected_response = opened.response.protect_finite(&Response {
         status: 204,
         headers: Vec::new(),
         body: Vec::new(),
     })?;
-    let response = response_token.open(&protected_response)?;
+    let response = response_token.open_finite(&protected_response)?;
     assert_eq!(response.status, 204);
     assert!(response.body.is_empty());
     Ok(())
@@ -390,8 +390,8 @@ fn response_uses_fresh_injected_nonce_and_reports_entropy_failure() -> Result<()
     let first = first.token.admit(first.replay.decision(true))?;
     let first_response = first
         .response
-        .protect_with_entropy(&response(), &mut FixedEntropy(1))?;
-    assert_eq!(&first_response[..32], &[1; 32]);
+        .protect_finite_with_entropy(&response(), &mut FixedEntropy(1))?;
+    assert_eq!(&first_response[5..37], &[1; 32]);
 
     let second = client.protect(&request(b"two"))?;
     let (second_envelope, _) = second.into_parts();
@@ -400,8 +400,8 @@ fn response_uses_fresh_injected_nonce_and_reports_entropy_failure() -> Result<()
     let second = second.token.admit(second.replay.decision(true))?;
     let second_response = second
         .response
-        .protect_with_entropy(&response(), &mut FixedEntropy(2))?;
-    assert_eq!(&second_response[..32], &[2; 32]);
+        .protect_finite_with_entropy(&response(), &mut FixedEntropy(2))?;
+    assert_eq!(&second_response[5..37], &[2; 32]);
     assert_ne!(first_response, second_response);
 
     let third = client.protect(&request(b"three"))?;
@@ -412,7 +412,7 @@ fn response_uses_fresh_injected_nonce_and_reports_entropy_failure() -> Result<()
     assert_eq!(
         third
             .response
-            .protect_with_entropy(&response(), &mut FailingEntropy)
+            .protect_finite_with_entropy(&response(), &mut FailingEntropy)
             .err(),
         Some(Error::EntropyUnavailable)
     );
@@ -463,7 +463,7 @@ fn invalid_headers_and_content_lengths_are_rejected_before_protection() -> Resul
     assert_eq!(
         opened
             .response
-            .protect(&Response {
+            .protect_finite(&Response {
                 status: 204,
                 headers: vec![HeaderField {
                     name: b"content-length".to_vec(),

@@ -14,7 +14,7 @@ import trustme
 from aiohttp import web
 from yarl import URL
 
-from hpke_http import Header, Limits, Response, Server, StateError, TransportError, generate_key_pair
+from hpke_http import Header, Limits, ProtocolError, Response, Server, StateError, TransportError, generate_key_pair
 from hpke_http.middleware.aiohttp import HPKEClientSession, HPKEResponse
 from hpke_http.transport import REQUEST_MEDIA_TYPE, RESPONSE_MEDIA_TYPE
 
@@ -216,16 +216,20 @@ async def test_aiohttp_adapter_rejects_invalid_outer_responses(
 
 @pytest.mark.asyncio
 async def test_aiohttp_adapter_bounds_the_actual_outer_response_body() -> None:
+    key_pair = generate_key_pair()
+    server = Server(key_pair.private_key, KEY_ID)
+
     async def transport(request: web.Request) -> web.StreamResponse:
+        opened = server.preparse(await request.read()).authenticate(PSK).admit(accepted=True)
+        envelope = opened.protect_response(Response(status=200, body=b"ab"))
         response = web.StreamResponse(headers={"content-type": RESPONSE_MEDIA_TYPE})
         response.enable_chunked_encoding()
         await response.prepare(request)
         assert "content-length" not in response.headers
-        await response.write(b"x" * 100_000)
+        await response.write(envelope)
         await response.write_eof()
         return response
 
-    key_pair = generate_key_pair()
     async with _https_endpoint(transport) as (endpoint, connector):
         async with HPKEClientSession(
             key_pair.public_key,
@@ -236,9 +240,10 @@ async def test_aiohttp_adapter_bounds_the_actual_outer_response_body() -> None:
             transport_endpoint=endpoint,
             connector=connector,
         ) as session:
-            with pytest.raises(TransportError) as captured:
+            with pytest.raises(ProtocolError) as captured:
                 await session.get("https://api.example.test/items")
-    assert captured.value.code == "response_too_large"
+    assert captured.value.code == "limit_exceeded"
+    server.close()
 
 
 @pytest.mark.asyncio

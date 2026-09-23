@@ -1,4 +1,4 @@
-//! Bounded-input policy for protocol version 1.
+//! Bounded-input policy for protocol version 2.
 
 use crate::Error;
 
@@ -19,7 +19,7 @@ const BHTTP_PER_HEADER_ALLOWANCE: usize = 16;
 /// Per-engine limits. Values can become stricter but never exceed hard limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
-    /// Maximum plaintext request or response body size.
+    /// Maximum request or finite response body, and maximum one SSE block.
     pub max_body_len: usize,
     /// Maximum combined header-name and header-value bytes per message.
     pub max_header_bytes: usize,

@@ -1,7 +1,7 @@
 """Stable Python protocol API backed exclusively by the shared Rust engine.
 
-The API accepts complete bounded messages and uses one-shot continuations for
-responses and replay admission. ``ProtocolError.code`` is language-neutral and
+The API accepts complete bounded requests and checked response records.
+``ProtocolError.code`` is language-neutral and
 safe for control flow; error messages never contain credentials, plaintext,
 ciphertext, or parser offsets.
 """
@@ -18,8 +18,8 @@ from typing_extensions import Self
 
 from hpke_http import _native
 
-PROTOCOL_ID = "hpke-http/1"
-BINDING_ABI_VERSION = 1
+PROTOCOL_ID = "hpke-http/2"
+BINDING_ABI_VERSION = 2
 PACKAGE_VERSION = version("hpke_http")
 
 _HARD_LIMITS = (
@@ -217,7 +217,7 @@ class Client:
     Leave it off when a body combines secrets with attacker-controlled data.
     """
 
-    __slots__ = ("_inner", "_maximum_body", "_maximum_envelope")
+    __slots__ = ("_inner", "_maximum_body")
 
     def __init__(
         self,
@@ -240,7 +240,6 @@ class Client:
             compression,
         )
         self._maximum_body = _maximum_body_len(limits)
-        self._maximum_envelope = _maximum_envelope_len(limits)
 
     def protect(self, request: Request) -> ProtectedRequest:
         """Protect one request and return its one-shot response transaction.
@@ -260,7 +259,7 @@ class Client:
             _export_headers(request.headers),
             bytes(request.body),
         )
-        return ProtectedRequest(native, self._maximum_envelope)
+        return ProtectedRequest(native)
 
     @property
     def closed(self) -> bool:
@@ -281,18 +280,18 @@ class Client:
 
 
 class ProtectedRequest:
-    """Protected request bytes plus the one-shot response opener.
+    """Protected request bytes plus one response reader right.
 
     Call :meth:`close` in a ``finally`` block when transport can fail before
-    :meth:`open_response` consumes the continuation.
+    :meth:`open_response` or :meth:`into_opener` takes the response right.
+    After :meth:`into_opener`, close the reader instead.
     """
 
-    __slots__ = ("_envelope", "_inner", "_maximum_envelope")
+    __slots__ = ("_envelope", "_inner")
 
-    def __init__(self, inner: _native.ProtectedRequest, maximum_envelope: int) -> None:
+    def __init__(self, inner: _native.ProtectedRequest) -> None:
         self._inner = inner
         self._envelope = inner.take_envelope()
-        self._maximum_envelope = maximum_envelope
 
     @property
     def envelope(self) -> bytes:
@@ -305,12 +304,13 @@ class ProtectedRequest:
         return self._inner.consumed
 
     def open_response(self, envelope: bytes) -> Response:
-        """Consume the response continuation and authenticate one response."""
-        if len(envelope) > self._maximum_envelope:
-            self.close()
-            raise ProtocolError("limit_exceeded", "limit exceeded")
-        status, headers, body = _call(self._inner.open_response, bytes(envelope))
+        """Check a complete finite reply with the v2 record reader."""
+        status, headers, body = _call(self._inner.open_finite_response, bytes(envelope))
         return Response(status=status, headers=_import_headers(headers), body=body)
+
+    def into_opener(self) -> ResponseOpener:
+        """Transfer the one response right to a live record reader."""
+        return ResponseOpener(_call(self._inner.take_opener))
 
     def close(self) -> None:
         """Discard the response continuation now."""
@@ -501,7 +501,7 @@ class OpenedRequest:
         return self._inner.response_consumed
 
     def protect_response(self, response: Response) -> bytes:
-        """Consume the response capability and protect one response."""
+        """Protect one complete finite reply with the v2 record writer."""
         status = _bounded_integer(response.status, "response status", _MIN_STATUS, _MAX_STATUS)
         if len(response.body) > self._maximum_body:
             self.close()
@@ -513,9 +513,143 @@ class OpenedRequest:
             bytes(response.body),
         )
 
+    def into_sealer(self, status: int, headers: Sequence[Header]) -> tuple[ResponseSealer, bytes]:
+        """Start a checked reply and return its prefix and START record."""
+        checked_status = _bounded_integer(status, "response status", _MIN_STATUS, _MAX_STATUS)
+        inner, first = _call(self._inner.take_sealer, checked_status, _export_headers(headers))
+        return ResponseSealer(inner), first
+
     def close(self) -> None:
         """Discard the response capability now."""
         self._inner.discard_response()
+
+
+@dataclass(frozen=True, slots=True)
+class CheckedRecord:
+    """One checked response record. Only SSE DATA has clear block bytes."""
+
+    kind: Literal["start", "data", "end"]
+    status: int = 0
+    headers: tuple[Header, ...] = ()
+    mode: Literal["finite", "sse", ""] = ""
+    block: bytes = b""
+
+
+class ResponseOpener:
+    """One live response reader; input can end at any byte."""
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner: _native.ResponseOpener) -> None:
+        self._inner: _native.ResponseOpener | None = inner
+
+    def feed(self, data: bytes, offset: int = 0) -> tuple[int, CheckedRecord | None]:
+        """Read at most one record from ``data[offset:]``.
+
+        The byte count is relative to ``offset``; add it to ``offset`` before
+        the next call. Finite DATA stays private.
+        """
+        inner = self._inner
+        if inner is None:
+            raise StateError()
+        used, record = _call(inner.feed, bytes(data), offset)
+        if record is None:
+            return used, None
+        kind, status, headers, mode, block = record
+        return used, CheckedRecord(
+            kind=cast("Literal['start', 'data', 'end']", kind),
+            status=status,
+            headers=_import_headers(headers),
+            mode=cast("Literal['finite', 'sse', '']", mode),
+            block=block,
+        )
+
+    def finish_eof(self) -> Response | None:
+        """Check END at true outer body EOF and return a finite response."""
+        inner = self._inner
+        if inner is None:
+            raise StateError()
+        result = _call(inner.finish_eof)
+        self._inner = None
+        if result is None:
+            return None
+        status, headers, body = result
+        return Response(status=status, headers=_import_headers(headers), body=body)
+
+    def close(self) -> None:
+        """Stop the response check without claiming a complete reply."""
+        if self._inner is not None:
+            self._inner.close()
+            self._inner = None
+
+
+class ResponseSealer:
+    """One checked response writer for a finite body or clear SSE blocks."""
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner: _native.ResponseSealer) -> None:
+        self._inner: _native.ResponseSealer | None = inner
+
+    def seal_finite_body(self, body: bytes) -> bytes | None:
+        """Protect a finite body once; an empty body emits no DATA record."""
+        inner = self._inner
+        if inner is None:
+            raise StateError()
+        return _call(inner.seal_finite_body, bytes(body))
+
+    def seal_sse_block(self, block: bytes) -> bytes:
+        """Protect one complete LF-normalized SSE block."""
+        inner = self._inner
+        if inner is None:
+            raise StateError()
+        return _call(inner.seal_sse_block, bytes(block))
+
+    def finish(self) -> bytes:
+        """Protect END; the outer sender must then end its HTTP body."""
+        inner = self._inner
+        if inner is None:
+            raise StateError()
+        result = _call(inner.finish)
+        self._inner = None
+        return result
+
+    def close(self) -> None:
+        """Stop without an END record."""
+        if self._inner is not None:
+            self._inner.close()
+            self._inner = None
+
+
+class SseSplitter:
+    """Split app bytes into complete LF-normalized SSE blocks."""
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, max_block_len: int) -> None:
+        self._inner: _native.SseSplitter | None = _native.SseSplitter(max_block_len)
+
+    def feed(self, data: bytes, offset: int = 0, max_bytes: int | None = None) -> tuple[int, bytes | None]:
+        """Read at most ``max_bytes`` bytes from ``data[offset:]`` and return at most one block.
+
+        The byte count is relative to ``offset``; add it to ``offset`` before
+        the next call. Without ``max_bytes``, the input limit is the rest of
+        ``data``.
+        """
+        inner = self._inner
+        if inner is None:
+            raise StateError()
+        return _call(inner.feed, bytes(data), offset, max_bytes)
+
+    def finish(self) -> None:
+        if self._inner is not None:
+            self._inner.finish()
+            self._inner = None
+
+    def close(self) -> None:
+        if self._inner is not None:
+            self._inner.close()
+            self._inner = None
 
 
 _T = TypeVar("_T")
@@ -556,6 +690,7 @@ __all__ = [
     "PACKAGE_VERSION",
     "PROTOCOL_ID",
     "AuthenticatedRequest",
+    "CheckedRecord",
     "Client",
     "Header",
     "KeyPair",
@@ -567,7 +702,10 @@ __all__ = [
     "ProtocolError",
     "Request",
     "Response",
+    "ResponseOpener",
+    "ResponseSealer",
     "Server",
+    "SseSplitter",
     "StateError",
     "generate_key_pair",
 ]

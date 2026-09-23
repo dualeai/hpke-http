@@ -20,8 +20,32 @@ export interface NativeResponse extends NativeDisposable {
 export interface NativeProtectedRequest extends NativeDisposable {
   take_envelope(): Uint8Array;
   readonly consumed: boolean;
-  open_response(envelope: Uint8Array): NativeResponse;
+  open_finite_response(envelope: Uint8Array): NativeResponse;
+  into_opener(): NativeResponseOpener;
   discard(): void;
+}
+
+export interface NativeFeedResult extends NativeDisposable {
+  readonly consumed: number;
+  readonly kind: number;
+  readonly status: number;
+  readonly headers_json: string;
+  readonly mode: number;
+  readonly block: Uint8Array;
+}
+
+export interface NativeResponseOpener extends NativeDisposable {
+  feed(input: Uint8Array): NativeFeedResult;
+  finish_eof(): NativeResponse | undefined;
+  close(): void;
+}
+
+export interface NativeResponseSealer extends NativeDisposable {
+  take_start(): Uint8Array;
+  seal_finite_body(body: Uint8Array): Uint8Array | undefined;
+  seal_sse_block(block: Uint8Array): Uint8Array;
+  finish(): Uint8Array;
+  close(): void;
 }
 
 export interface NativeClient extends NativeDisposable {
@@ -62,6 +86,7 @@ export interface NativeOpenedRequest extends NativeDisposable {
   take_body(): Uint8Array;
   readonly response_consumed: boolean;
   protect_response(status: number, headersJson: string, body: Uint8Array): Uint8Array;
+  start_response(status: number, headersJson: string): NativeResponseSealer;
   discard_response(): void;
 }
 

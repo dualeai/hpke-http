@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Literal, NoReturn, cast
@@ -10,6 +11,7 @@ import pytest
 from starlette.types import Message, Receive, Scope, Send
 
 from hpke_http import (
+    CheckedRecord,
     Client,
     Header,
     Limits,
@@ -18,6 +20,7 @@ from hpke_http import (
     ProtocolError,
     Request,
     Response,
+    Server,
     generate_key_pair,
 )
 from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -119,6 +122,55 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
 
 
 @pytest.mark.asyncio
+async def test_asgi_sends_each_complete_normalized_block_and_drops_tail() -> None:
+    async def app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/event-stream; charset=utf-8"),
+                    (b"content-length", b"999"),
+                    (b"content-encoding", b"identity"),
+                    (b"connection", b"x-hop"),
+                    (b"x-hop", b"private"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b": keepalive\r", "more_body": True})
+        await send({"type": "http.response.body", "body": b"\n\r", "more_body": True})
+        await send({"type": "http.response.body", "body": b"\nid: 7\n\n: control\n\npartial", "more_body": False})
+
+    keys = generate_key_pair()
+    client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
+    middleware = HPKEMiddleware(app, keys.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
+    try:
+        messages = await _invoke(middleware, protected.envelope)
+        assert messages[0]["status"] == 200
+        assert (b"content-length", b"999") not in messages[0]["headers"]
+        assert (b"cache-control", b"no-store, no-transform") in messages[0]["headers"]
+        reader = protected.into_opener()
+        checked: list[CheckedRecord] = []
+        for message in messages[1:]:
+            part = cast(bytes, message["body"])
+            offset = 0
+            while offset < len(part):
+                used, record = reader.feed(part[offset:])
+                offset += used
+                if record is not None:
+                    checked.append(record)
+        assert [record.kind for record in checked] == ["start", "data", "data", "data", "end"]
+        assert checked[0].headers == (Header("content-type", "text/event-stream; charset=utf-8"),)
+        assert [record.block for record in checked[1:4]] == [b": keepalive\n\n", b"id: 7\n\n", b": control\n\n"]
+        assert reader.finish_eof() is None
+    finally:
+        protected.close()
+        client.close()
+        middleware.close()
+
+
+@pytest.mark.asyncio
 async def test_asgi_middleware_forwards_disconnect_after_the_logical_body() -> None:
     async def app(_scope: Scope, receive: Receive, send: Send) -> None:
         assert (await receive())["body"] == b"logical body"
@@ -133,11 +185,38 @@ async def test_asgi_middleware_forwards_disconnect_after_the_logical_body() -> N
         Request(method=Method.POST, authority="api.example.test", path="/items", body=b"logical body")
     )
 
-    messages = await _invoke(middleware, protected.envelope)
-    assert messages[0]["status"] == 200
-    assert protected.open_response(cast(bytes, messages[1]["body"])).body == b"ok"
+    messages = await _invoke(middleware, protected.envelope, disconnect_after_body=True)
+    assert messages[0]["status"] == 500
     client.close()
     middleware.close()
+
+
+@pytest.mark.parametrize("mode", ["finite", "sse"])
+@pytest.mark.asyncio
+async def test_asgi_receive_finishes_after_final_response_body(mode: Literal["finite", "sse"]) -> None:
+    resumed = asyncio.Event()
+
+    async def app(_scope: Scope, receive: Receive, send: Send) -> None:
+        assert (await receive())["type"] == "http.request"
+        headers = [(b"content-type", b"text/event-stream")] if mode == "sse" else []
+        body = b"data: done\n\n" if mode == "sse" else b"done"
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+        assert (await receive())["type"] == "http.disconnect"
+        resumed.set()
+
+    key_pair = generate_key_pair()
+    client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
+    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    try:
+        protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
+        messages = await asyncio.wait_for(_invoke(middleware, protected.envelope), 2)
+        assert resumed.is_set()
+        assert messages[0]["status"] == 200
+        assert messages[-1]["more_body"] is False
+    finally:
+        client.close()
+        middleware.close()
 
 
 @pytest.mark.asyncio
@@ -273,7 +352,7 @@ async def test_asgi_middleware_rejects_a_duplicate_without_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_asgi_middleware_bounds_unannounced_outer_request_bytes() -> None:
+async def test_asgi_middleware_bounds_unannounced_outer_request_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     async def app(_scope: Scope, _receive: Receive, _send: Send) -> None:
         pytest.fail("oversized envelope must not reach the application")
 
@@ -286,15 +365,26 @@ async def test_asgi_middleware_bounds_unannounced_outer_request_bytes() -> None:
         _ReplayStore().admit,
         limits=Limits(max_body_len=1),
     )
+    client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
+    protected = client.protect(
+        Request(method=Method.POST, authority="api.example.test", path="/items", body=b"x" * 100_000)
+    )
+
+    def fail_preparse(_server: Server, _envelope: bytes) -> NoReturn:
+        pytest.fail("oversized outer body must be rejected before native parsing")
+
+    monkeypatch.setattr(Server, "preparse", fail_preparse)
 
     messages = await _invoke(
         middleware,
-        b"x" * 100_000,
+        protected.envelope,
         include_content_length=False,
         incomplete_body=True,
     )
     assert messages[0]["status"] == 400
     assert messages[1]["body"] == b"invalid protected request"
+    protected.close()
+    client.close()
     middleware.close()
 
 
@@ -498,8 +588,10 @@ async def _invoke(
     outer_method: str = "POST",
     include_content_length: bool = True,
     incomplete_body: bool = False,
+    disconnect_after_body: bool = False,
 ) -> list[Message]:
     delivered = False
+    disconnect = asyncio.Event()
     messages: list[Message] = []
     headers = [
         (b"host", b"api.example.test"),
@@ -531,6 +623,8 @@ async def _invoke(
         if delivered:
             if incomplete_body:
                 pytest.fail("oversized body must be rejected before requesting another chunk")
+            if not disconnect_after_body:
+                await disconnect.wait()
             return {"type": "http.disconnect"}
         delivered = True
         return {"type": "http.request", "body": envelope, "more_body": incomplete_body}

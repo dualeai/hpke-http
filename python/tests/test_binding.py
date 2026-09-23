@@ -44,7 +44,7 @@ def _request(body: bytes = b'{"name":"Ada"}') -> Request:
     return Request(
         method=Method.POST,
         authority="api.example.test",
-        path="/v1/items?limit=2",
+        path="/v2/items?limit=2",
         headers=(Header("content-type", "application/json"),),
         body=body,
     )
@@ -119,6 +119,23 @@ def test_complete_python_transaction_and_one_shot_lifecycle() -> None:
         protected.open_response(encrypted_response)
 
 
+@pytest.mark.parametrize("body", [b"", b"finite body"])
+def test_low_level_finite_response_sealer(body: bytes) -> None:
+    client, server = _engines()
+    try:
+        protected = client.protect(_request())
+        opened = server.preparse(protected.envelope).authenticate(PSK).admit(accepted=True)
+        headers = (Header("content-type", "text/plain"),)
+        writer, start = opened.into_sealer(200, headers)
+        data = writer.seal_finite_body(body)
+        assert (data is None) == (body == b"")
+        end = writer.finish()
+        assert protected.open_response(start + (data or b"") + end) == Response(200, headers, body)
+    finally:
+        client.close()
+        server.close()
+
+
 @pytest.mark.parametrize("coding", ["gzip", "zstd"])
 def test_opt_in_body_compression_preserves_logical_http(coding: Literal["gzip", "zstd"]) -> None:
     keys = generate_key_pair()
@@ -179,12 +196,16 @@ def test_binding_size_guards_preserve_one_shot_consumption() -> None:
         opened.protect_response(Response(status=200, body=b"ab"))
     assert oversized_response.value.code == "limit_exceeded"
     assert opened.response_consumed
+    large_server = Server(keys.private_key, KEY_ID)
+    large_opened = large_server.preparse(protected.envelope).authenticate(PSK).admit(accepted=True)
+    valid_large_response = large_opened.protect_response(Response(status=200, body=b"ab"))
     with pytest.raises(ProtocolError) as oversized_protected_response:
-        protected.open_response(b"x" * 100_000)
+        protected.open_response(valid_large_response)
     assert oversized_protected_response.value.code == "limit_exceeded"
     assert protected.consumed
     client.close()
     server.close()
+    large_server.close()
 
 
 def test_replay_rejection_never_releases_plaintext() -> None:

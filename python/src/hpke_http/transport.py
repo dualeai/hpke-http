@@ -34,11 +34,11 @@ class TransportError(RuntimeError):
     """The HTTP adapter could not produce a supported logical exchange.
 
     ``code`` is stable for adapter control flow. Current codes cover invalid
-    targets, unsupported logical content coding, request or response size,
-    network failure, and invalid outer status, media type, or content coding.
+    targets, unsupported logical content coding, request body size, network
+    failure, and invalid outer status, media type, or content coding.
     ``status_code`` is set only when an invalid outer HTTP status is available.
-    Protocol authentication failures use :class:`hpke_http.ProtocolError`
-    instead.
+    Protocol failures, including response record limits, use
+    :class:`hpke_http.ProtocolError` instead.
     """
 
     def __init__(self, code: str, message: str, *, status_code: int | None = None) -> None:

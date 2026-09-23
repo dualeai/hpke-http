@@ -10,7 +10,7 @@ _T = TypeVar("_T")
 
 
 async def run_native(operation: Callable[..., _T], *args: object, **kwargs: object) -> _T:
-    """Wait for native work to finish before cancellation can close a one-shot stage."""
+    """Wait for native work to finish before cancellation can close its state."""
     task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
     try:
         return await asyncio.shield(task)

@@ -1,4 +1,4 @@
-//! Canonical RFC 9292 known-length messages used by protocol version 1.
+//! Canonical RFC 9292 requests and field pairs used by protocol version 2.
 //!
 //! This module implements only the small protocol subset that the engine uses.
 //! It does not depend on a general OHTTP/BHTTP package, accept indeterminate
@@ -11,7 +11,6 @@ use crate::{Error, Limits, Method};
 
 const HTTPS_SCHEME: &[u8] = b"https";
 const REQUEST_MODE: u64 = 0;
-const RESPONSE_MODE: u64 = 1;
 // Space for fixed framing, vector lengths, and the caller's AEAD tag.
 const ENCODING_CAPACITY_ALLOWANCE: usize = 128;
 const FORBIDDEN_HEADERS: &[&[u8]] = &[
@@ -149,93 +148,15 @@ pub(crate) fn validate_decoded_request_body(request: &Request) -> Result<(), Err
     .map_err(decode_validation_error)
 }
 
-pub(crate) fn encode_response(
-    response: &Response,
-    method: Method,
-    limits: Limits,
-) -> Result<Vec<u8>, Error> {
-    encode_response_with_body(response, &response.body, method, limits)
-}
-
-pub(crate) fn encode_response_with_body(
-    response: &Response,
-    wire_body: &[u8],
-    method: Method,
-    limits: Limits,
-) -> Result<Vec<u8>, Error> {
-    validate_response(response, method, limits)?;
-    if wire_body.len() > limits.max_body_len {
-        return Err(Error::LimitExceeded);
-    }
-    let fields = encode_fields(&response.headers)?;
-    let mut output =
-        Vec::with_capacity(wire_body.len() + fields.len() + ENCODING_CAPACITY_ALLOWANCE);
-    write_varint(&mut output, RESPONSE_MODE)?;
-    write_varint(&mut output, u64::from(response.status))?;
-    write_vector(&mut output, &fields)?;
-    write_vector(&mut output, wire_body)?;
-    write_vector(&mut output, &[])?;
-    Ok(output)
-}
-
-pub(crate) fn decode_response(
-    input: &[u8],
-    method: Method,
-    limits: Limits,
-) -> Result<Response, Error> {
-    decode_response_inner(input, method, limits, false)
-}
-
-pub(crate) fn decode_coded_response(
-    input: &[u8],
-    method: Method,
-    limits: Limits,
-) -> Result<Response, Error> {
-    decode_response_inner(input, method, limits, true)
-}
-
-fn decode_response_inner(
-    input: &[u8],
-    method: Method,
-    limits: Limits,
-    coded_body: bool,
-) -> Result<Response, Error> {
-    validate_encoded_length(input, limits)?;
-    let mut reader = SliceReader::new(input);
-    if reader.read_varint()? != RESPONSE_MODE {
-        return Err(Error::MalformedEnvelope);
-    }
-    let status = u16::try_from(reader.read_varint()?).map_err(|_| Error::MalformedEnvelope)?;
-    if !(200..=599).contains(&status) {
-        return Err(Error::MalformedEnvelope);
-    }
-    let headers = decode_fields(reader.read_vector()?, limits).map_err(decode_validation_error)?;
-    let body = reader.read_vector()?;
-    if body.len() > limits.max_body_len {
-        return Err(Error::LimitExceeded);
-    }
-    if !reader.read_vector()?.is_empty() || !reader.is_finished() {
-        return Err(Error::MalformedEnvelope);
-    }
-    let response = Response {
-        status,
-        headers,
-        body: body.to_vec(),
-    };
-    if !coded_body {
-        validate_decoded_response_body(&response, method)?;
-    }
-    Ok(response)
-}
-
 pub(crate) fn validate_decoded_response_body(
     response: &Response,
     method: Method,
 ) -> Result<(), Error> {
-    validate_content_length(
+    validate_response_content_length(
+        response.status,
         &response.headers,
         response.body.len(),
-        response_content_length_rule(method, response.status),
+        method,
     )
     .map_err(decode_validation_error)
 }
@@ -247,7 +168,7 @@ const fn decode_validation_error(error: Error) -> Error {
     }
 }
 
-fn encode_fields(headers: &[HeaderField]) -> Result<Vec<u8>, Error> {
+pub(crate) fn encode_fields(headers: &[HeaderField]) -> Result<Vec<u8>, Error> {
     let mut output = Vec::new();
     for field in headers {
         write_vector(&mut output, &field.name)?;
@@ -256,7 +177,7 @@ fn encode_fields(headers: &[HeaderField]) -> Result<Vec<u8>, Error> {
     Ok(output)
 }
 
-fn decode_fields(input: &[u8], limits: Limits) -> Result<Vec<HeaderField>, Error> {
+pub(crate) fn decode_fields(input: &[u8], limits: Limits) -> Result<Vec<HeaderField>, Error> {
     let mut reader = SliceReader::new(input);
     let mut headers: Vec<HeaderField> = Vec::new();
     let mut header_bytes = 0_usize;
@@ -299,16 +220,28 @@ fn validate_request(request: &Request, limits: Limits) -> Result<(), Error> {
     )
 }
 
-fn validate_response(response: &Response, method: Method, limits: Limits) -> Result<(), Error> {
-    if !(200..=599).contains(&response.status) {
+pub(crate) fn validate_response_content_length(
+    status: u16,
+    headers: &[HeaderField],
+    body_len: usize,
+    method: Method,
+) -> Result<(), Error> {
+    validate_content_length(
+        headers,
+        body_len,
+        response_content_length_rule(method, status),
+    )
+}
+
+pub(crate) fn validate_response_head(
+    status: u16,
+    headers: &[HeaderField],
+    limits: Limits,
+) -> Result<(), Error> {
+    if !(200..=599).contains(&status) {
         return Err(Error::InvalidConfiguration);
     }
-    validate_payload(&response.headers, &response.body, limits)?;
-    validate_content_length(
-        &response.headers,
-        response.body.len(),
-        response_content_length_rule(method, response.status),
-    )
+    validate_payload(headers, &[], limits)
 }
 
 fn validate_target(

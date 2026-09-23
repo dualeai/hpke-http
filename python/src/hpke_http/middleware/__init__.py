@@ -1,4 +1,4 @@
-"""Optional buffered HTTP adapters.
+"""Optional finite and live SSE HTTP adapters.
 
 Import adapters from their dependency-specific modules:
 
@@ -6,7 +6,6 @@ Import adapters from their dependency-specific modules:
 - ``hpke_http.middleware.aiohttp.HPKEClientSession``
 - ``hpke_http.middleware.fastapi.HPKEMiddleware`` for FastAPI and Starlette
 
-No adapter performs key discovery or incremental streaming. Recipient keys and
-PSK identities are explicit, and protocol version 1 authenticates complete
-bounded messages.
+The adapters use ``hpke-http/2``. Recipient keys and PSK identities are
+explicit; the adapters do not discover them.
 """

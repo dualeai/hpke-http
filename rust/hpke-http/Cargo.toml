@@ -1,6 +1,6 @@
 [package]
 name = "hpke-http"
-description = "Bounded whole-message HPKE engine for HTTP request and response protection"
+description = "HPKE engine for bounded HTTP requests and checked response records"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

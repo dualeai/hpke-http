@@ -22,13 +22,13 @@ when it affects an `hpke-http` release or one of its default build paths.
 
 | Release line | Status |
 | --- | --- |
-| 2.x | Supported |
+| 2.x | Supported published line |
 | 1.x and earlier | Unsupported |
 
-The 2.x package line uses protocol ID `hpke-http/1` and the Rust engine for
-every supported language binding. The removed pure-Python protocol is not a
-supported fallback. Security fixes ship as coordinated Rust, Python, and
-TypeScript releases from one source tag.
+The current source tree targets the next major release with protocol ID
+`hpke-http/2`. It has no earlier wire decoder or binding fallback. Security
+fixes ship as coordinated Rust, Python, and TypeScript releases from one
+source tag.
 
 Protocol gzip/zstd body compression is disabled by default. Enabling it can
 reveal information about mixed secret and attacker-controlled body content

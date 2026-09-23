@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import test from "node:test";
 
 import {
@@ -17,6 +18,152 @@ import {
 const KEY_ID = new TextEncoder().encode("primary-2026-09");
 const PSK = new TextEncoder().encode("a 32-byte minimum test credential!");
 const PSK_ID = new TextEncoder().encode("tenant-42");
+
+async function within(promise, milliseconds) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("response read timed out")), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("real Node Fetch yields each checked SSE block before server completion", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const serverEngine = new Server(keys.privateKey, KEY_ID);
+  const first = new TextEncoder().encode(": ready\n\n");
+  const second = new TextEncoder().encode("data: two\n\n");
+  let releaseSecond;
+  const gate = new Promise((resolve) => { releaseSecond = resolve; });
+  let releaseEnd;
+  const endGate = new Promise((resolve) => { releaseEnd = resolve; });
+  let firstSent;
+  const firstOnWire = new Promise((resolve) => { firstSent = resolve; });
+  let serverFinished = false;
+  const httpServer = createServer((request, response) => {
+    void (async () => {
+      const parts = [];
+      for await (const part of request) { parts.push(part); }
+      const envelope = Buffer.concat(parts);
+      const opened = serverEngine.preparse(envelope).authenticate(PSK).admit({ accepted: true });
+      const writer = opened.startResponse(200, [{ name: "content-type", value: "text/event-stream; charset=utf-8" }]);
+      try {
+        response.writeHead(200, { "content-type": RESPONSE_MEDIA_TYPE, "cache-control": "no-store" });
+        response.write(writer.start);
+        response.write(writer.sealSseBlock(first));
+        firstSent();
+        await gate;
+        response.write(writer.sealSseBlock(second));
+        await endGate;
+        response.end(writer.finish());
+        serverFinished = true;
+      } finally {
+        writer.close();
+      }
+    })().catch((error) => response.destroy(error));
+  });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  const address = httpServer.address();
+  assert.ok(address && typeof address !== "string");
+  const relay = `http://127.0.0.1:${address.port}/protected`;
+  const hpkeFetch = createHpkeFetch({
+    recipientPublicKey: keys.publicKey, recipientKeyId: KEY_ID, psk: PSK, pskId: PSK_ID,
+    fetch: (_input, init) => fetch(relay, init),
+  });
+  try {
+    const response = await hpkeFetch("https://api.example.test/events");
+    assert.equal(response.status, 200);
+    assert.ok(response.body);
+    const reader = response.body.getReader();
+    const firstRead = await within(reader.read(), 5000);
+    await firstOnWire;
+    assert.deepEqual(firstRead.value, first);
+    assert.equal(serverFinished, false);
+    releaseSecond();
+    assert.deepEqual((await within(reader.read(), 5000)).value, second);
+    assert.equal(serverFinished, false);
+    releaseEnd();
+    assert.equal((await within(reader.read(), 5000)).done, true);
+  } finally {
+    releaseSecond();
+    releaseEnd();
+    hpkeFetch.close();
+    serverEngine.close();
+    httpServer.closeAllConnections();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("Fetch keeps one checked block visible before a later bad record", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
+  const client = createHpkeFetch({
+    recipientPublicKey: keys.publicKey, recipientKeyId: KEY_ID, psk: PSK, pskId: PSK_ID,
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const opened = server.preparse(new Uint8Array(await request.arrayBuffer())).authenticate(PSK).admit({ accepted: true });
+      const writer = opened.startResponse(200, [{ name: "content-type", value: "text/event-stream" }]);
+      try {
+        const first = writer.sealSseBlock(new TextEncoder().encode(": ready\n\n"));
+        const badEnd = writer.finish();
+        badEnd[badEnd.length - 1] ^= 1;
+        const bytes = new Uint8Array([...writer.start, ...first, ...badEnd]);
+        return new Response(new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } }), {
+          status: 200, headers: { "content-type": RESPONSE_MEDIA_TYPE },
+        });
+      } finally { writer.close(); }
+    },
+  });
+  try {
+    const response = await client("https://api.example.test/events");
+    const reader = response.body.getReader();
+    assert.deepEqual((await reader.read()).value, new TextEncoder().encode(": ready\n\n"));
+    await assert.rejects(reader.read(), (error) => error instanceof ProtocolError && error.code === "authentication_failed");
+  } finally {
+    client.close();
+    server.close();
+  }
+});
+
+test("closing Fetch ends a pending live body read", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
+  let outerCancelled = false;
+  const client = createHpkeFetch({
+    recipientPublicKey: keys.publicKey, recipientKeyId: KEY_ID, psk: PSK, pskId: PSK_ID,
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const opened = server.preparse(new Uint8Array(await request.arrayBuffer())).authenticate(PSK).admit({ accepted: true });
+      const writer = opened.startResponse(200, [{ name: "content-type", value: "text/event-stream" }]);
+      const first = writer.sealSseBlock(new TextEncoder().encode(": ready\n\n"));
+      writer.close();
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new Uint8Array([...writer.start, ...first])); },
+        cancel() { outerCancelled = true; },
+      }), { status: 200, headers: { "content-type": RESPONSE_MEDIA_TYPE } });
+    },
+  });
+  try {
+    const response = await client("https://api.example.test/events");
+    const reader = response.body.getReader();
+    assert.deepEqual((await reader.read()).value, new TextEncoder().encode(": ready\n\n"));
+    const pending = reader.read();
+    client.close();
+    await assert.rejects(within(pending, 5000), (error) => error instanceof StateError);
+    assert.equal(outerCancelled, true);
+  } finally {
+    client.close();
+    server.close();
+  }
+});
 
 test("native Fetch adapter authenticates request and response before exposure", async () => {
   await initialize();
@@ -50,7 +197,7 @@ test("native Fetch adapter authenticates request and response before exposure", 
     });
     return new Response(protectedResponse, {
       status: 200,
-      headers: { "content-type": `${RESPONSE_MEDIA_TYPE}; version=1` },
+      headers: { "content-type": RESPONSE_MEDIA_TYPE },
     });
   };
 
@@ -512,7 +659,7 @@ test("Fetch abort cancels a pending outer response body", { timeout: 5000 }, asy
 test("Fetch adapter bounds actual bytes instead of trusting declared length", async () => {
   await initialize();
   const keys = generateKeyPair();
-  const server = new Server(keys.privateKey, KEY_ID, { maxBodyLength: 1 });
+  const server = new Server(keys.privateKey, KEY_ID);
   const hpkeFetch = createHpkeFetch({
     recipientPublicKey: keys.publicKey,
     recipientKeyId: KEY_ID,
@@ -526,10 +673,13 @@ test("Fetch adapter bounds actual bytes instead of trusting declared length", as
         .preparse(envelope)
         .authenticate(PSK)
         .admit({ accepted: true });
-      return new Response(opened.protectResponse({ status: 204 }), {
+      const large = opened.request.path === "/large";
+      return new Response(opened.protectResponse(large
+        ? { status: 200, body: new TextEncoder().encode("ab") }
+        : { status: 204 }), {
         status: 200,
         headers: {
-          "content-length": "99999999",
+          "content-length": large ? "0" : "99999999",
           "content-type": RESPONSE_MEDIA_TYPE,
         },
       });
@@ -538,11 +688,75 @@ test("Fetch adapter bounds actual bytes instead of trusting declared length", as
 
   const response = await hpkeFetch("https://api.example.test/health");
   assert.equal(response.status, 204);
+  await assert.rejects(
+    hpkeFetch("https://api.example.test/large"),
+    (error) => error instanceof ProtocolError && error.code === "limit_exceeded",
+  );
   hpkeFetch.close();
   server.close();
 });
 
-test("Fetch adapter rejects and cancels one oversized response chunk before copying it", async () => {
+test("Fetch waits for outer EOF before returning a finite response", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
+  let reachedEofRead;
+  const eofRead = new Promise((resolve) => { reachedEofRead = resolve; });
+  let releaseEof;
+  const eofGate = new Promise((resolve) => { releaseEof = resolve; });
+  const hpkeFetch = createHpkeFetch({
+    recipientPublicKey: keys.publicKey,
+    recipientKeyId: KEY_ID,
+    psk: PSK,
+    pskId: PSK_ID,
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const opened = server
+        .preparse(new Uint8Array(await request.arrayBuffer()))
+        .authenticate(PSK)
+        .admit({ accepted: true });
+      const envelope = opened.protectResponse({ status: 200, body: new TextEncoder().encode("complete") });
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(envelope); },
+        async pull(controller) {
+          reachedEofRead();
+          await eofGate;
+          controller.close();
+        },
+      }, { highWaterMark: 0 }), {
+        status: 200,
+        headers: { "content-type": RESPONSE_MEDIA_TYPE },
+      });
+    },
+  });
+  let eofReleased = false;
+  let settledBeforeEof = false;
+  const pending = hpkeFetch("https://api.example.test/finite");
+  void pending.then(
+    () => { if (!eofReleased) settledBeforeEof = true; },
+    () => { if (!eofReleased) settledBeforeEof = true; },
+  );
+  try {
+    const first = await within(Promise.race([
+      eofRead.then(() => "eof_read"),
+      pending.then(() => "returned", () => "failed"),
+    ]), 5000);
+    assert.equal(first, "eof_read");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settledBeforeEof, false);
+    eofReleased = true;
+    releaseEof();
+    const response = await within(pending, 5000);
+    assert.equal(await response.text(), "complete");
+    assert.equal(settledBeforeEof, false);
+  } finally {
+    releaseEof();
+    hpkeFetch.close();
+    server.close();
+  }
+});
+
+test("Fetch adapter rejects malformed record bytes and cancels the body", async () => {
   await initialize();
   const keys = generateKeyPair();
   let canceled = false;
@@ -569,7 +783,7 @@ test("Fetch adapter rejects and cancels one oversized response chunk before copy
 
   await assert.rejects(
     hpkeFetch("https://api.example.test/health"),
-    (error) => error instanceof FetchTransportError && error.code === "response_too_large",
+    (error) => error instanceof ProtocolError && error.code === "malformed_envelope",
   );
   assert.equal(canceled, true);
   hpkeFetch.close();

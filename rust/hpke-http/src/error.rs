@@ -20,10 +20,10 @@ pub enum Error {
     /// The envelope uses a protocol version this implementation does not support.
     #[error("unsupported protocol version")]
     UnsupportedVersion,
-    /// The envelope names a cryptographic suite outside protocol version 1.
+    /// The envelope names a cryptographic suite outside protocol version 2.
     #[error("unsupported cryptographic suite")]
     UnsupportedSuite,
-    /// The request uses an HTTP method outside protocol version 1.
+    /// The request uses an HTTP method outside protocol version 2.
     #[error("unsupported HTTP method")]
     UnsupportedMethod,
     /// The request names a recipient key that is not configured on this server.

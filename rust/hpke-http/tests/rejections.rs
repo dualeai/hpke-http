@@ -61,7 +61,7 @@ fn protect_response(
     let opened = authenticated
         .token
         .admit(authenticated.replay.decision(true))?;
-    let envelope = opened.response.protect(&response(status))?;
+    let envelope = opened.response.protect_finite(&response(status))?;
     Ok((response_token, envelope))
 }
 
@@ -101,8 +101,8 @@ fn every_supported_method_and_status_boundary_round_trips() -> Result<(), Error>
         if method == Method::Head || matches!(expected_response.status, 204 | 205 | 304) {
             expected_response.body.clear();
         }
-        let envelope = opened.response.protect(&expected_response)?;
-        assert_eq!(response_token.open(&envelope)?, expected_response);
+        let envelope = opened.response.protect_finite(&expected_response)?;
+        assert_eq!(response_token.open_finite(&envelope)?, expected_response);
     }
     Ok(())
 }
@@ -123,7 +123,7 @@ fn bodyless_http_responses_are_rejected_in_the_shared_engine() -> Result<(), Err
             .token
             .admit(authenticated.replay.decision(true))?;
         assert_eq!(
-            opened.response.protect(&response(status)).err(),
+            opened.response.protect_finite(&response(status)).err(),
             Some(Error::InvalidConfiguration)
         );
     }
@@ -192,15 +192,12 @@ fn every_response_truncation_and_single_byte_mutation_is_rejected() -> Result<()
     for length in 0..reference.len() {
         let (token, envelope) = protect_response(&client, &server, 200)?;
         assert_eq!(envelope.len(), reference.len());
-        assert!(token.open(&envelope[..length]).is_err());
+        assert!(token.open_finite(&envelope[..length]).is_err());
     }
     for offset in 0..reference.len() {
         let (token, mut envelope) = protect_response(&client, &server, 200)?;
         envelope[offset] ^= 1;
-        assert_eq!(
-            token.open(&envelope).err(),
-            Some(Error::AuthenticationFailed)
-        );
+        assert!(token.open_finite(&envelope).is_err());
     }
     Ok(())
 }
@@ -212,11 +209,11 @@ fn response_tokens_reject_cross_request_envelopes() -> Result<(), Error> {
     let (second_token, second_envelope) = protect_response(&client, &server, 201)?;
 
     assert_eq!(
-        first_token.open(&second_envelope).err(),
+        first_token.open_finite(&second_envelope).err(),
         Some(Error::AuthenticationFailed)
     );
     assert_eq!(
-        second_token.open(&first_envelope).err(),
+        second_token.open_finite(&first_envelope).err(),
         Some(Error::AuthenticationFailed)
     );
     Ok(())
@@ -449,7 +446,7 @@ fn invalid_http_values_are_rejected() -> Result<(), Error> {
         .token
         .admit(authenticated.replay.decision(true))?;
     assert_eq!(
-        opened.response.protect(&response(199)).err(),
+        opened.response.protect_finite(&response(199)).err(),
         Some(Error::InvalidConfiguration)
     );
     Ok(())

@@ -42,6 +42,36 @@
           .preparse(new Uint8Array(await outer.arrayBuffer()))
           .authenticate(psk)
           .admit({ accepted: true });
+        if (["/browser-sse", "/browser-late", "/browser-abort"].includes(opened.request.path)) {
+          const writer = opened.startResponse(200, [
+            { name: "content-type", value: "text/event-stream; charset=utf-8" },
+          ]);
+          try {
+            const first = new Uint8Array([
+              ...writer.start,
+              ...writer.sealSseBlock(text.encode(": ready\n\n")),
+            ]);
+            const nextBlock = writer.sealSseBlock(text.encode("data: two\n\n"));
+            if (opened.request.path === "/browser-late") {
+              nextBlock[nextBlock.length - 1] ^= 1;
+            }
+            const end = writer.finish();
+            const live = opened.request.path === "/browser-sse";
+            const last = live ? end : new Uint8Array([...nextBlock, ...end]);
+            return await globalThis.fetch("/relay", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                first: Array.from(first),
+                ...(live ? { middle: Array.from(nextBlock) } : {}),
+                last: Array.from(last),
+              }),
+              signal: outer.signal,
+            });
+          } finally {
+            writer.close();
+          }
+        }
         if (opened.request.path !== "/browser") {
           throw new Error(`unexpected authenticated path: ${opened.request.path}`);
         }
@@ -61,6 +91,65 @@
     if (response.status !== 200 || (await response.text()) !== "browser-ok") {
       throw new Error("authenticated browser Fetch response did not round-trip");
     }
+    const live = await hpkeFetch("https://api.example.test/browser-sse");
+    if (live.status !== 200 || live.body === null) {
+      throw new Error("browser SSE response did not expose a checked START");
+    }
+    const reader = live.body.getReader();
+    const firstRead = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("first browser SSE block timed out")), 5000)),
+    ]);
+    if (new TextDecoder().decode(firstRead.value) !== ": ready\n\n") {
+      throw new Error("first checked browser SSE block did not match");
+    }
+    // The local relay holds the second block and END as two separate parts.
+    const released = await globalThis.fetch("/relay", { method: "PUT" });
+    if (released.status !== 204) {
+      throw new Error("browser relay did not release the second block");
+    }
+    const secondRead = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("second browser SSE block timed out")), 5000)),
+    ]);
+    if (new TextDecoder().decode(secondRead.value) !== "data: two\n\n") {
+      throw new Error("second checked browser SSE block did not match");
+    }
+    const finished = await globalThis.fetch("/relay", { method: "PUT" });
+    if (finished.status !== 204 || !(await reader.read()).done) {
+      throw new Error("browser SSE reply did not finish after checked END and EOF");
+    }
+    const late = await hpkeFetch("https://api.example.test/browser-late");
+    if (late.body === null) throw new Error("late-error response has no body");
+    const lateReader = late.body.getReader();
+    if (new TextDecoder().decode((await lateReader.read()).value) !== ": ready\n\n") {
+      throw new Error("late-error response lost its first checked block");
+    }
+    await globalThis.fetch("/relay", { method: "PUT" });
+    let lateFailed = false;
+    try {
+      await lateReader.read();
+    } catch (error) {
+      lateFailed = error?.code === "authentication_failed";
+    }
+    if (!lateFailed) throw new Error("browser did not report the later bad tag");
+
+    const controller = new AbortController();
+    const aborted = await hpkeFetch("https://api.example.test/browser-abort", { signal: controller.signal });
+    if (aborted.body === null) throw new Error("abort response has no body");
+    const abortReader = aborted.body.getReader();
+    if (new TextDecoder().decode((await abortReader.read()).value) !== ": ready\n\n") {
+      throw new Error("abort response lost its first checked block");
+    }
+    controller.abort();
+    let abortFailed = false;
+    try {
+      await abortReader.read();
+    } catch {
+      abortFailed = true;
+    }
+    if (!abortFailed) throw new Error("browser body did not stop after caller abort");
+    await globalThis.fetch("/relay", { method: "PUT" });
     await report("pass");
   } catch (error) {
     const detail = error instanceof Error ? `${error.stack ?? error.message}` : String(error);

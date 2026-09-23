@@ -1,17 +1,20 @@
 # hpke-http for TypeScript
 
 `@dualeai/hpke-http` is the TypeScript binding and runtime facade for the sole
-`hpke-http/1` implementation in this repository: the shared Rust engine compiled
+`hpke-http/2` implementation in this repository: the shared Rust engine compiled
 to WebAssembly. The generated wasm-bindgen modules are private package details.
 
-The package provides a low-level one-shot protocol state machine and a buffered
-adapter for the runtime's native Fetch API. It does not contain a JavaScript
+The package provides a low-level record state machine and a Fetch adapter with
+live SSE bodies. It does not contain a JavaScript
 cryptographic fallback.
 
 ## Install and runtime support
 
+Build the `/2` TypeScript package from this checkout. From the repository root,
+run:
+
 ```sh
-npm install @dualeai/hpke-http
+make install-deps-typescript install-wasm-bindgen build-typescript
 ```
 
 Use one explicit entry point:
@@ -62,13 +65,13 @@ no longer needs them.
 
 | Limit | Default | Hard maximum |
 | --- | ---: | ---: |
-| Body bytes per message | 8 MiB | 64 MiB |
+| Request, finite body, or one SSE block | 8 MiB | 64 MiB |
 | Combined header-name and value bytes | 16 KiB | 64 KiB |
 | Header fields per message | 64 | 256 |
 | Combined authority and path bytes | 8 KiB | 8 KiB |
 
 Pass a `Limits` object to `Client`, `Server`, or `createHpkeFetch` to make a
-limit stricter. Omitted fields use the defaults.
+limit stricter. Omitted fields use the defaults. SSE has no whole-stream body cap.
 
 Protocol body compression is opt-in: pass `"gzip"` or `"zstd"` as the sixth
 `Client` constructor argument (after `Limits`), set `compression` in
@@ -77,6 +80,95 @@ engine codes only the body and applies the body limit both before and after
 decompression. An opt-in client requires an extension-capable server; there is
 no silent fallback. Ciphertext length can leak information when attacker
 input and secrets share a body, so leave compression disabled for those messages.
+SSE blocks use no private compression.
+
+## Native Fetch adapter
+
+```ts
+import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
+
+await initialize();
+const hpkeFetch = createHpkeFetch({
+  recipientPublicKey: serverPublicKey,
+  recipientKeyId: keyId,
+  psk,
+  pskId,
+});
+
+try {
+  const response = await hpkeFetch("https://api.example.test/items", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Ada" }),
+  });
+  if (!response.ok) {
+    throw new Error(`logical request failed with ${response.status}`);
+  }
+} finally {
+  hpkeFetch.close();
+}
+```
+
+The adapter uses only the URL, method, headers, body, and abort signal from the
+logical Fetch input. It buffers requests and finite replies within the configured limits, sends a
+fresh outer `POST`, uses `redirect: "error"`, omits ambient credentials, and
+performs no automatic retry. For SSE it returns a synthetic `Response` after
+checked START. Each pull on its body yields one checked clear SSE block before
+the server ends the reply. For finite replies, it waits for END and real outer
+body EOF before it returns. A complete comment block can serve as a heartbeat.
+
+```ts
+const sseFetch = createHpkeFetch({
+  recipientPublicKey: serverPublicKey,
+  recipientKeyId: keyId,
+  psk,
+  pskId,
+});
+try {
+  const response = await sseFetch("https://api.example.test/events");
+  const mediaType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  if (mediaType !== "text/event-stream") throw new Error("expected SSE response");
+  if (response.body === null) throw new Error("missing SSE body");
+  const reader = response.body.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      handleSseBlock(value); // The caller parses SSE fields and comments.
+    }
+  } finally {
+    await reader.cancel(); // Also close on an early loop exit.
+  }
+} finally {
+  sseFetch.close();
+}
+```
+
+Blocks contain raw bytes. Follow the
+[SSE parsing rules](https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream):
+decode them as UTF-8 with replacement for bad byte sequences and ignore one
+leading BOM at the start of the stream. A checked block can hold comments or
+control fields without a dispatched data event.
+
+Set `transportEndpoint` to one fixed HTTPS envelope endpoint. Otherwise, the
+logical target URL is also the outer endpoint. An injected `fetch` function must
+follow native Fetch response semantics, including delivery of decoded response
+body bytes.
+
+For cross-origin browser calls, the outer endpoint must allow the browser's
+OPTIONS check and the protected POST. The outer POST uses
+`Content-Type: message/hpke-http-request` and `Cache-Control: no-store`.
+Configure CORS for these headers and the outer response before a POST-only HPKE
+handler or at a proxy. See the [Fetch CORS rules](https://fetch.spec.whatwg.org/#http-cors-protocol).
+
+The synthetic response represents authenticated status, headers, and body. It
+does not preserve outer URL history, redirect history, timing, or a cookie-jar
+side effect. `Set-Cookie` and `Set-Cookie2` are hidden at this boundary. The
+platform `Headers` object can combine other repeated fields. The low-level
+`Client` API preserves the exact ordered authenticated field list.
+`Response.clone()` and `ReadableStream.tee()` can buffer branches that a caller
+does not read. Consume or cancel each branch. An abort after Fetch returns,
+an early body cancel, or `hpkeFetch.close()` closes the protected stream.
 
 ## Low-level client transaction
 
@@ -110,49 +202,20 @@ try {
 must not reuse the same envelope: call `Client.protect` again to create a fresh
 cryptographic attempt.
 
-## Native Fetch adapter
-
-```ts
-import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
-
-await initialize();
-const hpkeFetch = createHpkeFetch({
-  recipientPublicKey: serverPublicKey,
-  recipientKeyId: keyId,
-  psk,
-  pskId,
-});
-
-try {
-  const response = await hpkeFetch("https://api.example.test/items", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: "Ada" }),
-  });
-  if (!response.ok) {
-    throw new Error(`logical request failed with ${response.status}`);
-  }
-} finally {
-  hpkeFetch.close();
-}
-```
-
-The adapter uses only the URL, method, headers, body, and abort signal from the
-logical Fetch input. It buffers within the configured protocol limits, sends a
-fresh outer `POST`, uses `redirect: "error"`, omits ambient credentials, and
-performs no automatic retry. It returns a synthetic `Response` only after the
-complete protected response authenticates.
-
-Set `transportEndpoint` to one fixed HTTPS envelope endpoint. Otherwise, the
-logical target URL is also the outer endpoint. An injected `fetch` function must
-follow native Fetch response semantics, including delivery of decoded response
-body bytes.
-
-The synthetic response represents authenticated status, headers, and body. It
-does not preserve outer URL history, redirect history, timing, or a cookie-jar
-side effect. `Set-Cookie` and `Set-Cookie2` are hidden at this boundary. The
-platform `Headers` object can combine other repeated fields. The low-level
-`Client` API preserves the exact ordered authenticated field list.
+For a low-level live reply, call `transaction.intoOpener()`. For each network
+chunk, call `feed(chunk.subarray(offset, offset + 65536))`, add `consumed` to
+`offset`, and repeat until the whole chunk is used. This 64 KiB slice bounds
+the copy into WASM. Process each returned record; one chunk can hold several
+records. Finite DATA returns no record; `finishEof()` returns the finite response
+after END and real outer body EOF. Each `sse_data` record holds one complete
+clear block. For an SSE reply, the server calls
+`opened.startResponse(200, headers)` with one
+`text/event-stream` `Content-Type` and no logical `Content-Length` or
+`Content-Encoding`. Send `sealer.start`, then the result of `sealSseBlock(block)`
+for each complete LF-normalized block, then `finish()`. End the outer HTTP body
+after `finish()`. For a finite reply, call `sealFiniteBody(body)` once before
+`finish()`; an empty body gives no DATA record. Close both state objects on an
+early end.
 
 ## Low-level server and replay admission
 
@@ -246,8 +309,9 @@ Every live `Client`, `Server`, `ProtectedRequest`, `PreparsedRequest`,
 `close()` method. Close objects promptly; do not depend on JavaScript garbage
 collection for credential or continuation cleanup.
 
-Streaming, discovery, cookie-jar integration, Axios, TanStack
-Query, and additional framework adapters are not part of the current package.
+The package does not parse SSE fields or reconnect on its own. A reconnect
+needs a fresh protected request. Discovery, cookie-jar integration, Axios,
+TanStack Query, and more framework adapters are outside this package.
 
 ## Development
 

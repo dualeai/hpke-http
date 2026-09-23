@@ -1,8 +1,6 @@
 //! Authenticated protocol body coding, separate from HTTP `Content-Encoding`.
 //!
-//! The marker is an invalid RFC 9292 framing indicator, so peers without this
-//! extension reject it. Only body bytes are coded: HTTP fields retain their
-//! logical meaning after the engine restores and validates the decoded body.
+//! Request compression uses a marker. Response records name their body coding.
 
 use std::io::{Read, Write};
 
@@ -13,8 +11,8 @@ use ruzstd::{
 };
 
 use crate::{
-    Error, Limits, Method,
-    message::{self, Request, Response},
+    Error, Limits,
+    message::{self, Request},
 };
 
 pub(crate) const MARKER: u8 = 0x04;
@@ -120,46 +118,6 @@ pub(crate) fn finish_request(
     Ok(request)
 }
 
-pub(crate) fn encode_response(
-    response: &Response,
-    method: Method,
-    limits: Limits,
-    negotiated: Option<CompressionCoding>,
-) -> Result<Vec<u8>, Error> {
-    if let Some(coding) = negotiated {
-        if let Some(coded) = maybe_compress(&response.body, coding)? {
-            let mut output = vec![MARKER, coding.wire_id()];
-            output.extend_from_slice(&message::encode_response_with_body(
-                response, &coded, method, limits,
-            )?);
-            return Ok(output);
-        }
-    }
-    message::encode_response(response, method, limits)
-}
-
-pub(crate) fn decode_response(
-    input: &[u8],
-    method: Method,
-    limits: Limits,
-    negotiated: Option<CompressionCoding>,
-) -> Result<Response, Error> {
-    if !input.starts_with(&[MARKER]) {
-        return message::decode_response(input, method, limits);
-    }
-    if input.len() < 3 {
-        return Err(Error::MalformedEnvelope);
-    }
-    let coding = CompressionCoding::from_wire_id(input[1])?.ok_or(Error::MalformedEnvelope)?;
-    if Some(coding) != negotiated {
-        return Err(Error::MalformedEnvelope);
-    }
-    let mut response = message::decode_coded_response(&input[2..], method, limits)?;
-    response.body = decompress(&response.body, coding, limits.max_body_len)?;
-    message::validate_decoded_response_body(&response, method)?;
-    Ok(response)
-}
-
 pub(crate) fn maybe_compress(
     body: &[u8],
     coding: CompressionCoding,
@@ -167,6 +125,11 @@ pub(crate) fn maybe_compress(
     if body.len() < MIN_BODY_LEN {
         return Ok(None);
     }
+    let coded = compress(body, coding)?;
+    Ok((coded.len() < body.len()).then_some(coded))
+}
+
+pub(crate) fn compress(body: &[u8], coding: CompressionCoding) -> Result<Vec<u8>, Error> {
     let coded = match coding {
         CompressionCoding::Gzip => {
             let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -177,7 +140,7 @@ pub(crate) fn maybe_compress(
         }
         CompressionCoding::Zstd => compress_to_vec(body, CompressionLevel::Fastest),
     };
-    Ok((coded.len() < body.len()).then_some(coded))
+    Ok(coded)
 }
 
 pub(crate) fn decompress(
@@ -290,11 +253,8 @@ fn read_bounded_into(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CompressionCoding, decode_response, decompress, encode_request, encode_response,
-        maybe_compress,
-    };
-    use crate::{Error, Limits, Method, Request, Response, message};
+    use super::{CompressionCoding, decompress, encode_request, maybe_compress};
+    use crate::{Error, Limits, Method, Request};
 
     // Produced independently with `printf ... | gzip -n -c` and
     // `printf ... | zstd -q -1 -c`, not by this crate's encoders.
@@ -431,20 +391,11 @@ mod tests {
             headers: Vec::new(),
             body: vec![b'a'; 4096],
         };
-        let response = Response {
-            status: 200,
-            headers: Vec::new(),
-            body: vec![b'b'; 4096],
-        };
-        for (coding, request_prefix, response_prefix) in [
-            (CompressionCoding::Gzip, [0x04, 0x01, 0x01], [0x04, 0x01]),
-            (CompressionCoding::Zstd, [0x04, 0x02, 0x02], [0x04, 0x02]),
+        for (coding, request_prefix) in [
+            (CompressionCoding::Gzip, [0x04, 0x01, 0x01]),
+            (CompressionCoding::Zstd, [0x04, 0x02, 0x02]),
         ] {
             assert!(encode_request(&request, limits, Some(coding))?.starts_with(&request_prefix));
-            assert!(
-                encode_response(&response, Method::Post, limits, Some(coding))?
-                    .starts_with(&response_prefix)
-            );
 
             let mut small_request = request.clone();
             small_request.body.clear();
@@ -456,47 +407,6 @@ mod tests {
                 ])
             );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn compressed_response_requires_the_advertised_coding() -> Result<(), Error> {
-        let response = Response {
-            status: 200,
-            headers: Vec::new(),
-            body: vec![b'x'; 4096],
-        };
-        let coded = maybe_compress(&response.body, CompressionCoding::Gzip)?
-            .ok_or(Error::CompressionFailure)?;
-        let mut wire = vec![0x04, 0x01];
-        wire.extend_from_slice(&message::encode_response_with_body(
-            &response,
-            &coded,
-            Method::Get,
-            Limits::default(),
-        )?);
-        assert_eq!(
-            decode_response(&wire, Method::Get, Limits::default(), None),
-            Err(Error::MalformedEnvelope)
-        );
-        assert_eq!(
-            decode_response(
-                &wire,
-                Method::Get,
-                Limits::default(),
-                Some(CompressionCoding::Zstd),
-            ),
-            Err(Error::MalformedEnvelope)
-        );
-        assert_eq!(
-            decode_response(
-                &wire,
-                Method::Get,
-                Limits::default(),
-                Some(CompressionCoding::Gzip),
-            ),
-            Ok(response)
-        );
         Ok(())
     }
 }
