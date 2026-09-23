@@ -376,7 +376,7 @@ jobs:
 
   publish-crates-io:
     name: Publish crates.io
-    needs: publish-npm
+    needs: stage-release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment:
@@ -463,7 +463,7 @@ jobs:
 
   publish-pypi:
     name: Publish PyPI
-    needs: [publish-npm, publish-testpypi]
+    needs: [stage-release, publish-testpypi]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:
