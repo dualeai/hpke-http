@@ -342,7 +342,7 @@ jobs:
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: ${{ github.ref_name }}
-          name: hpke-http ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           draft: true
           body: |
             Coordinated Rust, Python, and TypeScript/WASM release from `${{ github.sha }}`.
@@ -582,15 +582,6 @@ jobs:
               exit 1
               ;;
           esac
-
-      - name: Require the one-time npm trusted-publisher bootstrap
-        env:
-          NPM_TRUSTED_PUBLISHING_CONFIGURED: ${{ vars.NPM_TRUSTED_PUBLISHING_CONFIGURED }}
-        run: |
-          if [[ "$NPM_TRUSTED_PUBLISHING_CONFIGURED" != "true" ]]; then
-            echo "::error::npm requires a package to exist before trusted publishing can be configured. If @dualeai/hpke-http is still unpublished, manually publish the exact release/npm/*.tgz candidate as a public package. Then configure its GitHub Actions trusted publisher for workflow filename release.yml, environment npm, and direct npm publish permission; set the npm-environment variable NPM_TRUSTED_PUBLISHING_CONFIGURED=true; and rerun this workflow. The rerun byte-compares an existing version before continuing."
-            exit 1
-          fi
 
       - name: Publish the npm/WASM package
         if: steps.existing.outputs.publish == 'true'
