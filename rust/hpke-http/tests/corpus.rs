@@ -177,7 +177,7 @@ fn hex_nested(
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("odd hex input".into());
     }
     value

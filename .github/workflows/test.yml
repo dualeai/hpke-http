@@ -15,11 +15,9 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: 1.87.0
+  RUST_TOOLCHAIN: 1.98.1
   PYTHON_VERSION: "3.10"
   NODE_VERSION: "24"
-  NPM_VERSION: 11.19.1
-  WASM_BINDGEN_VERSION: 0.2.128
 
 jobs:
   core-and-bindings:
@@ -63,56 +61,22 @@ jobs:
           workspaces: ". -> target"
 
       - name: Install pinned build tools and dependencies
-        run: |
-          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
-          uv sync --project python --frozen \
-            --extra dev --extra fastapi --extra aiohttp --extra httpx
-          npm install --global "npm@$NPM_VERSION"
-          npm ci --prefix typescript --ignore-scripts
+        run: make install-ci
 
       - name: Verify the Rust core and boundary crates
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace --all-targets
-          cargo test --locked --doc --package hpke-http
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --package hpke-http
-          cargo package --locked --package hpke-http
+        run: make test-rust package-rust
 
       - name: Build and verify the Python binding
-        run: |
-          uv run --project python --frozen maturin develop --locked \
-            --manifest-path python/native/Cargo.toml
-          make test-static
-          make test-func-ci
+        run: make test-python
 
       - name: Build and verify the TypeScript/WASM package
-        run: |
-          npm --prefix typescript run build
-          npm --prefix typescript run check
-          npm --prefix typescript test
+        run: make test-typescript
 
       - name: Build the distributable Python and npm artifacts
-        run: |
-          mkdir -p artifacts/python artifacts/npm
-          uv run --project python --frozen maturin build --release --locked \
-            --manifest-path python/native/Cargo.toml --out artifacts/python
-          uv run --project python --frozen maturin sdist \
-            --manifest-path python/native/Cargo.toml --out artifacts/python
-          uv run --project python --frozen twine check artifacts/python/*
-          (cd typescript && npm pack --pack-destination "$GITHUB_WORKSPACE/artifacts/npm")
+        run: make package-python-wheel package-python-sdist package-typescript check-python-package
 
       - name: Smoke-test the exact Python wheel
-        run: |
-          uv venv .artifact-smoke/python --python "$PYTHON_VERSION"
-          uv pip install --python .artifact-smoke/python/bin/python artifacts/python/*.whl
-          .artifact-smoke/python/bin/python python/tests/artifact_smoke.py
+        run: make smoke-python-wheel
 
       - name: Smoke-test the exact npm tarball
-        run: |
-          mkdir -p .artifact-smoke/npm
-          cd .artifact-smoke/npm
-          npm init --yes >/dev/null
-          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/artifacts/npm/*.tgz
-          cp "$GITHUB_WORKSPACE/typescript/test/artifact-smoke.mjs" .
-          node artifact-smoke.mjs
+        run: make smoke-typescript

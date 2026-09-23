@@ -12,18 +12,18 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: 1.87.0
+  RUST_TOOLCHAIN: 1.98.1
   PYTHON_VERSION: "3.10"
   NODE_VERSION: "24"
-  NPM_VERSION: 11.19.1
-  MATURIN_VERSION: v1.15.0
-  WASM_BINDGEN_VERSION: 0.2.128
 
 jobs:
   test-and-build-base:
     name: Test source and build portable artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      wheel_args: ${{ steps.wheel_args.outputs.value }}
+      maturin_version: ${{ steps.wheel_args.outputs.maturin_version }}
 
     steps:
       - name: Check out the tagged source
@@ -69,74 +69,41 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install pinned build tools and dependencies
-        run: |
-          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
-          uv sync --project python --frozen \
-            --extra dev --extra fastapi --extra aiohttp --extra httpx
-          npm install --global "npm@$NPM_VERSION"
-          npm ci --prefix typescript --ignore-scripts
+        run: make install-ci
 
       - name: Verify the Rust core and boundary crates
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace --all-targets
-          cargo test --locked --doc --package hpke-http
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --package hpke-http
+        run: make test-rust
 
       - name: Build and verify the Python binding
-        run: |
-          uv run --project python --frozen maturin develop --locked \
-            --manifest-path python/native/Cargo.toml
-          make test-static
-          make test-func-ci
+        run: make test-python
 
       - name: Build and verify the TypeScript/WASM package
-        run: |
-          npm --prefix typescript run build
-          npm --prefix typescript run check
-          npm --prefix typescript test
+        run: make test-typescript
 
       - name: Build the crate, Python sdist, and npm tarball once
         run: |
           version=${{ steps.version.outputs.version }}
           mkdir -p release/rust release/python release/npm
 
-          cargo package --locked --allow-dirty --package hpke-http
+          make package-rust CARGO_PACKAGE_FLAGS=--allow-dirty
           cp "target/package/hpke-http-$version.crate" release/rust/
 
-          uv run --project python --frozen maturin sdist \
-            --manifest-path python/native/Cargo.toml --out release/python
-          (cd typescript && npm pack --pack-destination "$GITHUB_WORKSPACE/release/npm")
+          make package-python-sdist package-typescript ARTIFACT_DIR=release
 
       - name: Inspect the portable artifacts
-        run: |
-          test "$(find release/rust -maxdepth 1 -name '*.crate' -type f | wc -l)" -eq 1
-          test "$(find release/python -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
-          test "$(find release/npm -maxdepth 1 -name '*.tgz' -type f | wc -l)" -eq 1
-          uv run --project python --frozen twine check release/python/*
-          tar -tzf release/npm/*.tgz > /tmp/hpke-http-npm-files.txt
-          grep -Fxq 'package/_wasm/browser/hpke_http_wasm_bg.wasm' /tmp/hpke-http-npm-files.txt
-          grep -Fxq 'package/_wasm/node/hpke_http_wasm_bg.wasm' /tmp/hpke-http-npm-files.txt
+        run: make check-release-portable-artifacts ARTIFACT_DIR=release
 
       - name: Smoke-test the exact Python source distribution
-        run: |
-          uv venv .artifact-smoke/python-sdist --python "$PYTHON_VERSION"
-          uv pip install --python .artifact-smoke/python-sdist/bin/python \
-            "maturin==${MATURIN_VERSION#v}"
-          uv pip install --python .artifact-smoke/python-sdist/bin/python \
-            --no-build-isolation release/python/*.tar.gz
-          .artifact-smoke/python-sdist/bin/python \
-            python/tests/artifact_smoke.py "${{ steps.version.outputs.version }}"
+        run: make smoke-python-sdist ARTIFACT_DIR=release EXPECTED_VERSION="${{ steps.version.outputs.version }}"
 
       - name: Smoke-test the exact npm tarball
+        run: make smoke-typescript ARTIFACT_DIR=release EXPECTED_VERSION="${{ steps.version.outputs.version }}"
+
+      - name: Set the shared wheel build options
+        id: wheel_args
         run: |
-          mkdir -p .artifact-smoke/npm
-          cd .artifact-smoke/npm
-          npm init --yes >/dev/null
-          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/release/npm/*.tgz
-          cp "$GITHUB_WORKSPACE/typescript/test/artifact-smoke.mjs" .
-          EXPECTED_VERSION="${{ steps.version.outputs.version }}" node artifact-smoke.mjs
+          echo "value=$(make --silent print-python-wheel-args PYTHON_WHEEL_OUT=dist)" >> "$GITHUB_OUTPUT"
+          echo "maturin_version=$(make --silent print-maturin-version)" >> "$GITHUB_OUTPUT"
 
       - name: Upload the tested portable artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -212,25 +179,26 @@ jobs:
           version=$(python cicd/prepare-release-version.py "$GITHUB_REF_NAME")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Install Make on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install make --version=4.4.1 --yes --no-progress
+
       - name: Build the platform wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: build
-          maturin-version: ${{ env.MATURIN_VERSION }}
+          maturin-version: ${{ needs.test-and-build-base.outputs.maturin_version }}
           rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: >-
-            --release --locked --compatibility pypi
-            --out dist --interpreter ${{ matrix.interpreter }}
-            --manifest-path python/native/Cargo.toml
+            ${{ needs.test-and-build-base.outputs.wheel_args }}
+            --interpreter ${{ matrix.interpreter }}
 
       - name: Smoke-test the exact platform wheel
         shell: bash
-        run: |
-          test "$(find dist -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 1
-          python -m pip install --disable-pip-version-check dist/*.whl
-          python python/tests/artifact_smoke.py "${{ steps.version.outputs.version }}"
+        run: make smoke-python-platform-wheel EXPECTED_VERSION="${{ steps.version.outputs.version }}"
 
       - name: Upload the tested platform wheel
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -267,15 +235,7 @@ jobs:
           merge-multiple: true
 
       - name: Verify the selected artifact set
-        run: |
-          test "$(find release/python -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 4
-          test "$(find release/python -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
-          ls release/python/*manylinux*_x86_64.whl >/dev/null
-          ls release/python/*manylinux*_aarch64.whl >/dev/null
-          ls release/python/*universal2.whl >/dev/null
-          ls release/python/*win_amd64.whl >/dev/null
-          test "$(find release/rust -maxdepth 1 -name '*.crate' -type f | wc -l)" -eq 1
-          test "$(find release/npm -maxdepth 1 -name '*.tgz' -type f | wc -l)" -eq 1
+        run: make check-release-candidate ARTIFACT_DIR=release
 
       - name: Record source, protocol ID, corpus, coordinates, and digests
         run: |
@@ -460,7 +420,7 @@ jobs:
         if: steps.existing.outputs.publish == 'true'
         run: |
           version=${{ steps.version.outputs.version }}
-          cargo package --locked --allow-dirty --package hpke-http
+          make package-rust CARGO_PACKAGE_FLAGS=--allow-dirty
           cmp "target/package/hpke-http-$version.crate" release/rust/*.crate
 
       - name: Publish the crate
@@ -555,6 +515,9 @@ jobs:
       id-token: write
 
     steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Download the tested candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -568,7 +531,7 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Install the trusted-publishing npm client
-        run: npm install --global "npm@$NPM_VERSION"
+        run: make install-ci-npm
 
       - name: Detect an already-published identical npm package
         id: existing
@@ -721,18 +684,15 @@ jobs:
       - name: Smoke-test the public Python and npm packages
         run: |
           version=${GITHUB_REF_NAME#v}
-
-          uv venv .public-smoke/python --python "$PYTHON_VERSION"
-          uv pip install --python .public-smoke/python/bin/python \
-            --only-binary :all: "hpke_http==$version"
-          .public-smoke/python/bin/python python/tests/artifact_smoke.py "$version"
-
-          mkdir -p .public-smoke/npm
-          cd .public-smoke/npm
-          npm init --yes >/dev/null
-          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/published/npm/*.tgz
-          cp "$GITHUB_WORKSPACE/typescript/test/artifact-smoke.mjs" .
-          EXPECTED_VERSION="$version" node artifact-smoke.mjs
+          make smoke-python-wheel \
+            PYTHON_SMOKE_DIR=.public-smoke/python \
+            PYTHON_WHEEL_PIP_FLAGS="--only-binary :all:" \
+            PYTHON_WHEEL_INPUT="hpke_http==$version" \
+            EXPECTED_VERSION="$version"
+          make smoke-typescript \
+            ARTIFACT_DIR=published \
+            NPM_SMOKE_DIR=.public-smoke/npm \
+            EXPECTED_VERSION="$version"
 
       - name: Record the completed coordinated publication
         run: |

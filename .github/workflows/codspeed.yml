@@ -12,8 +12,7 @@ permissions:
   id-token: write
 
 env:
-  RUST_TOOLCHAIN: 1.87.0
-  WASM_BINDGEN_VERSION: 0.2.128
+  RUST_TOOLCHAIN: 1.98.1
 
 jobs:
   rust:
@@ -29,14 +28,12 @@ jobs:
         with:
           workspaces: ". -> target"
       - name: Build CodSpeed benchmarks
-        run: |
-          cargo install cargo-codspeed --version 5.0.2 --locked
-          cargo codspeed build -p hpke-http -m simulation -m memory
+        run: make build-benchmark-rust
       - name: Measure Rust transactions
         uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
         with:
           mode: simulation,memory
-          run: cargo codspeed run -p hpke-http
+          run: make benchmark-rust
 
   python:
     name: Python binding benchmarks
@@ -58,15 +55,12 @@ jobs:
         with:
           workspaces: ". -> target"
       - name: Build the Python binding
-        run: |
-          uv sync --project python --frozen --extra dev
-          uv run --project python --frozen --no-sync maturin develop --release --locked \
-            --manifest-path python/native/Cargo.toml
+        run: make install-benchmark-python build-python PYTHON_BUILD_FLAGS=--release UV_RUN_FLAGS="--frozen --no-sync"
       - name: Measure Python transactions
         uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
         with:
           mode: simulation
-          run: uv run --project python --frozen --no-sync pytest python/benchmarks/ --codspeed -q -o addopts=
+          run: make benchmark-python
 
   typescript:
     name: Node/WASM binding benchmarks
@@ -87,12 +81,9 @@ jobs:
         with:
           workspaces: ". -> target"
       - name: Build the Node/WASM binding
-        run: |
-          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
-          npm ci --prefix typescript --ignore-scripts
-          npm --prefix typescript run build
+        run: make install-wasm-bindgen install-deps-typescript build-typescript
       - name: Measure Node/WASM transactions
         uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
         with:
           mode: simulation
-          run: npm --prefix typescript run benchmark
+          run: make benchmark-typescript
