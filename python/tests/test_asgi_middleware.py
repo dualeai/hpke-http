@@ -82,7 +82,13 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID, compression=compression_coding)
     replay_store = _ReplayStore()
     middleware = HPKEMiddleware(
-        app, key_pair.private_key, KEY_ID, _resolve_psk, replay_store.admit, compression=compression_coding is not None
+        app,
+        key_pair.private_key,
+        KEY_ID,
+        _resolve_psk,
+        replay_store.admit,
+        compression=compression_coding is not None,
+        transport_path="/protected",
     )
     protected = client.protect(
         Request(
@@ -143,7 +149,9 @@ async def test_asgi_sends_each_complete_normalized_block_and_drops_tail() -> Non
 
     keys = generate_key_pair()
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, keys.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, keys.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
     try:
         messages = await _invoke(middleware, protected.envelope)
@@ -180,7 +188,9 @@ async def test_asgi_middleware_forwards_disconnect_after_the_logical_body() -> N
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(
         Request(method=Method.POST, authority="api.example.test", path="/items", body=b"logical body")
     )
@@ -207,7 +217,9 @@ async def test_asgi_receive_finishes_after_final_response_body(mode: Literal["fi
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     try:
         protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
         messages = await asyncio.wait_for(_invoke(middleware, protected.envelope), 2)
@@ -234,7 +246,9 @@ async def test_asgi_middleware_discards_head_body_and_preserves_length_metadata(
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.HEAD, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -253,7 +267,9 @@ async def test_asgi_middleware_rejects_nonempty_bodyless_statuses(status: int) -
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -272,7 +288,9 @@ async def test_asgi_middleware_accepts_none_raw_path() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope, raw_path=None)
@@ -289,12 +307,14 @@ async def test_asgi_middleware_advertises_post_on_method_rejection() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
-    messages = await _invoke(middleware, protected.envelope, outer_method="GET")
+    messages = await _invoke(middleware, protected.envelope, outer_method="PUT")
     assert messages[0]["status"] == 405
-    assert (b"allow", b"POST") in messages[0]["headers"]
+    assert (b"allow", b"GET, POST") in messages[0]["headers"]
     protected.close()
     client.close()
     middleware.close()
@@ -313,7 +333,9 @@ async def test_asgi_middleware_fails_closed_when_replay_store_errors() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, unavailable_store)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, unavailable_store, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -337,7 +359,9 @@ async def test_asgi_middleware_rejects_a_duplicate_without_dispatch() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     first = await _invoke(middleware, protected.envelope)
@@ -364,6 +388,7 @@ async def test_asgi_middleware_bounds_unannounced_outer_request_bytes(monkeypatc
         _resolve_psk,
         _ReplayStore().admit,
         limits=Limits(max_body_len=1),
+        transport_path="/protected",
     )
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
     protected = client.protect(
@@ -398,7 +423,9 @@ async def test_asgi_middleware_hides_unknown_psk_ids() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, missing_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, missing_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -419,7 +446,9 @@ async def test_asgi_middleware_maps_psk_resolver_outages_to_503() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, unavailable_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, unavailable_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -451,7 +480,9 @@ async def test_asgi_middleware_maps_authentication_failures(
     monkeypatch.setattr(PreparsedRequest, "authenticate", fail_authenticate)
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -502,7 +533,9 @@ async def test_asgi_middleware_turns_boundary_failures_into_controlled_outer_err
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
     extra_headers = [(b"host", b"other.example.test")] if failure == "duplicate_host" else []
     messages = await _invoke(middleware, protected.envelope, extra_headers=extra_headers)
@@ -525,7 +558,9 @@ async def test_asgi_middleware_rejects_nonidentity_authenticated_request_content
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(
         Request(
             method=Method.POST,
@@ -567,7 +602,9 @@ async def test_asgi_lifespan_closes_native_server() -> None:
         sent.append(message)
 
     key_pair = generate_key_pair()
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     scope = cast(Scope, {"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.0"}})
 
     await middleware(scope, receive, send)
@@ -584,7 +621,7 @@ async def _invoke(
     envelope: bytes,
     *,
     extra_headers: list[tuple[bytes, bytes]] | None = None,
-    raw_path: bytes | None = b"/items",
+    raw_path: bytes | None = b"/protected",
     outer_method: str = "POST",
     include_content_length: bool = True,
     incomplete_body: bool = False,
@@ -608,7 +645,7 @@ async def _invoke(
             "http_version": "1.1",
             "method": outer_method,
             "scheme": "https",
-            "path": "/items",
+            "path": "/protected",
             "raw_path": raw_path,
             "query_string": b"",
             "root_path": "",

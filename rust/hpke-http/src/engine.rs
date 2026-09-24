@@ -484,6 +484,14 @@ impl Server {
         self
     }
 
+    /// Return the encoded public key for this server's private key.
+    #[must_use]
+    pub fn public_key(&self) -> Vec<u8> {
+        Kem::sk_to_pk(&self.recipient_private_key)
+            .to_bytes()
+            .to_vec()
+    }
+
     /// Parse bounded public fields without accepting credentials or plaintext.
     ///
     /// # Errors

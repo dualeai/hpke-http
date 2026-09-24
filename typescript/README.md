@@ -39,12 +39,13 @@ asset path or Content Security Policy.
 ## Credentials and limits
 
 Recipient keys use X25519 and are 32 bytes. Recipient-key and PSK identifiers
-are public opaque values from 1 through 255 bytes. A PSK is at least 32 bytes,
-and its public identifier must not equal the PSK.
+are public opaque values from 1 through 255 bytes. A PSK needs at least 32
+bytes of entropy, and its public identifier must not equal the PSK.
 
 Names such as `serverPublicKey`, `requestEnvelope`, `resolvePsk`, and
 `replayStore` in the examples are application-provided key storage, transport,
-and replay components; the package does not discover them.
+and replay components. The Fetch adapter can get a public key from a fixed
+HTTPS endpoint.
 
 ```ts
 import { generateKeyPair, initialize } from "@dualeai/hpke-http/node";
@@ -89,8 +90,8 @@ import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
 
 await initialize();
 const hpkeFetch = createHpkeFetch({
-  recipientPublicKey: serverPublicKey,
-  recipientKeyId: keyId,
+  endpoint: "https://api.example.test/protected",
+  key: { kind: "discover" },
   psk,
   pskId,
 });
@@ -110,8 +111,11 @@ try {
 ```
 
 The adapter uses only the URL, method, headers, body, and abort signal from the
-logical Fetch input. It buffers requests and finite replies within the configured limits, sends a
-fresh outer `POST`, uses `redirect: "error"`, omits ambient credentials, and
+logical Fetch input. It checks the logical HTTPS origin before it reads a body.
+Discovery sends one GET per call; `{ kind: "pin", publicKey, keyId }` sends no
+GET and keeps a reusable native client. Both modes send POST to the fixed
+endpoint. The adapter buffers requests and finite replies within the
+configured limits, uses `redirect: "error"`, omits ambient credentials, and
 performs no automatic retry. For SSE it returns a synthetic `Response` after
 checked START. Each pull on its body yields one checked clear SSE block before
 the server ends the reply. For finite replies, it waits for END and real outer
@@ -119,8 +123,8 @@ body EOF before it returns. A complete comment block can serve as a heartbeat.
 
 ```ts
 const sseFetch = createHpkeFetch({
-  recipientPublicKey: serverPublicKey,
-  recipientKeyId: keyId,
+  endpoint: "https://api.example.test/protected",
+  key: { kind: "discover" },
   psk,
   pskId,
 });
@@ -150,15 +154,31 @@ decode them as UTF-8 with replacement for bad byte sequences and ignore one
 leading BOM at the start of the stream. A checked block can hold comments or
 control fields without a dispatched data event.
 
-Set `transportEndpoint` to one fixed HTTPS envelope endpoint. Otherwise, the
-logical target URL is also the outer endpoint. An injected `fetch` function must
-follow native Fetch response semantics, including delivery of decoded response
-body bytes.
+The `endpoint` is a string HTTPS URL with no query, fragment, or credentials.
+GET and POST use that same URL. Set `targetOrigin` when a gateway endpoint has
+a different HTTPS origin from the logical request. An injected `fetch`
+function owns its TLS, abort, and retry behavior and must deliver decoded
+response body bytes like native Fetch.
 
-For cross-origin browser calls, the outer endpoint must allow the browser's
-OPTIONS check and the protected POST. The outer POST uses
+GET sends no logical authorization, cookies, or PSK ID. It uses
+`credentials: "omit"`, `redirect: "error"`, and `cache: "no-store"`.
+It accepts only status 200, `application/octet-stream`, identity content
+coding, and at most 293 decoded bytes. The exact body is
+`"HHKD" || 0x01 || id_len:u8 || id || public_key[32]`, with a 1 through 255
+byte opaque ID. Any missing or extra bytes fail before protection. There is
+no app key cache or package timer. The caller's Fetch signal sets the limit
+on a pending GET.
+
+The adapter reads the full logical request body before key GET. The body read,
+GET, and protected POST run in order, so their wait times add. Use a caller
+signal with a deadline when the full call needs one. An injected Fetch function
+must honor that signal. A pinned key skips GET when the key is known and this
+extra round trip matters.
+
+For cross-origin browser calls, the outer endpoint must allow the public GET,
+the browser's OPTIONS check, the protected POST, and fault replies. The outer POST uses
 `Content-Type: message/hpke-http-request` and `Cache-Control: no-store`.
-Configure CORS for these headers and the outer response before a POST-only HPKE
+Configure CORS for these headers and the outer response before the HPKE
 handler or at a proxy. See the [Fetch CORS rules](https://fetch.spec.whatwg.org/#http-cors-protocol).
 
 The synthetic response represents authenticated status, headers, and body. It
@@ -300,9 +320,12 @@ be zero when present on 205, and is forbidden for 204.
 
 `StateError` uses `state_consumed`. `InitializationError` reports an unavailable
 or mismatched WASM module. `FetchTransportError.code` distinguishes invalid
-targets, request/response bounds, network failure, invalid outer status or media
+targets, request body bounds, network failure, invalid outer status or media
 type, unsupported authenticated content coding, and authenticated responses
-that Web Fetch cannot represent.
+that Web Fetch cannot represent. Key GET failures use `discovery_network`,
+`discovery_status`, or `discovery_response`. Only `discovery_status` has a
+`statusCode`. A bad GET sends no POST or plaintext fallback. Protected response
+record bounds use `ProtocolError`.
 
 Every live `Client`, `Server`, `ProtectedRequest`, `PreparsedRequest`,
 `AuthenticatedRequest`, `OpenedRequest`, and `HpkeFetch` has an idempotent
@@ -310,7 +333,10 @@ Every live `Client`, `Server`, `ProtectedRequest`, `PreparsedRequest`,
 collection for credential or continuation cleanup.
 
 The package does not parse SSE fields or reconnect on its own. A reconnect
-needs a fresh protected request. Discovery, cookie-jar integration, Axios,
+needs a fresh protected request. Discovery adds one GET round trip per call.
+The server holds one key, so mixed worker keys during a change can make calls
+fail. The adapter does not retry a protected POST; after a lost reply, the
+caller does not know whether the app ran. Cookie-jar integration, Axios,
 TanStack Query, and more framework adapters are outside this package.
 
 ## Development
@@ -318,5 +344,6 @@ TanStack Query, and more framework adapters are outside this package.
 Set up Rust and the WASM target as shown in the repository README. Then run
 `make install-deps-typescript install-wasm-bindgen test-typescript` from the
 repository root. The test target builds the WASM package, runs the Node facade
-tests, and runs one real browser transaction. The browser test requires Chrome
-or Chromium; set `CHROME_BIN` when it is not in a standard path.
+tests, and runs a browser smoke test. That test covers pinned and discovered
+calls, checked SSE, aborts, and CORS over local HTTPS. It requires Chrome or
+Chromium; set `CHROME_BIN` when it is not in a standard path.

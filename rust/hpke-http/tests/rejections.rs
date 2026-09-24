@@ -1,4 +1,14 @@
-//! Boundary, mutation, and cross-context rejection tests for protocol version 1.
+//! Boundary, mutation, and cross-context rejection tests for protocol version 2.
+
+#[test]
+fn server_public_key_matches_its_private_key() -> Result<(), Error> {
+    let pair = generate_key_pair()?;
+    let expected = pair.public_key().to_vec();
+    let (private_key, _) = pair.into_parts();
+    let server = Server::new(&private_key, KEY_ID.to_vec(), Limits::default())?;
+    assert_eq!(server.public_key(), expected);
+    Ok(())
+}
 
 use hpke_http::{
     Client, EntropySource, Error, HARD_MAX_BODY_LEN, HeaderField, Limits, Method, Request,

@@ -35,8 +35,10 @@ class TransportError(RuntimeError):
 
     ``code`` is stable for adapter control flow. Current codes cover invalid
     targets, unsupported logical content coding, request body size, network
-    failure, and invalid outer status, media type, or content coding.
-    ``status_code`` is set only when an invalid outer HTTP status is available.
+    failure, and invalid outer status, media type, or content coding. Key GET
+    failures use ``discovery_network``, ``discovery_status``, or
+    ``discovery_response``. ``status_code`` is set only for an invalid outer
+    or discovery HTTP status.
     Protocol failures, including response record limits, use
     :class:`hpke_http.ProtocolError` instead.
     """

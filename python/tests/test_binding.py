@@ -59,6 +59,15 @@ def test_native_bootstrap_identity_and_extension_origin() -> None:
     assert any(_native.__file__.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
 
 
+def test_server_public_key_matches_current_private_key_and_close_blocks_access() -> None:
+    keys = generate_key_pair()
+    server = Server(keys.private_key, KEY_ID)
+    assert server.public_key == keys.public_key
+    server.close()
+    with pytest.raises(StateError):
+        _ = server.public_key
+
+
 def test_removed_python_protocol_modules_are_not_importable() -> None:
     for module in (
         "hpke_http.constants",

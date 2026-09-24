@@ -720,6 +720,7 @@ name = "hpke-http"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "idna" },
     { name = "typing-extensions" },
 ]
 
@@ -758,6 +759,7 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'aiohttp'", specifier = "~=3.13" },
     { name = "cryptography", marker = "extra == 'dev'", specifier = "~=48.0" },
     { name = "httpx", marker = "extra == 'httpx'", specifier = "~=0.28" },
+    { name = "idna", specifier = "~=3.10" },
     { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.9,<2" },
     { name = "pyright", marker = "extra == 'dev'", specifier = "~=1.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "~=8.3" },

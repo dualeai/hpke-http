@@ -10,9 +10,22 @@ from typing import Any, Literal, cast
 import httpx
 from typing_extensions import Self
 
+from hpke_http.middleware._discovery import (
+    KEY_MEDIA_TYPE,
+    Discover,
+    PinnedKey,
+    make_discovered_client,
+    protect_discovered_client,
+    read_key_record,
+    same_origin,
+    validate_client_configuration,
+    validate_endpoint,
+    validate_key_response,
+    validate_target_origin,
+)
 from hpke_http.middleware._native_async import run_native
 from hpke_http.middleware._records import CheckedStream
-from hpke_http.protocol import Client, Limits, Method, ProtocolError, Request, StateError
+from hpke_http.protocol import Client, Limits, Method, ProtectedRequest, ProtocolError, Request, StateError
 from hpke_http.transport import (
     REQUEST_MEDIA_TYPE,
     RESPONSE_MEDIA_TYPE,
@@ -38,35 +51,47 @@ class _RejectAllCookiePolicy(DefaultCookiePolicy):
 
 
 class HPKEAsyncClient:
-    """Compose ``httpx.AsyncClient`` with one explicit recipient configuration.
+    """Compose ``httpx.AsyncClient`` with one fixed key endpoint.
 
     Requests are bounded. Live SSE replies yield one checked block at a time.
     Redirects are never followed for the outer exchange.
 
-    ``base_url`` resolves logical relative targets. ``transport_endpoint`` can
-    select one fixed HTTPS envelope endpoint. ``transport`` and other accepted
-    client options configure only the dedicated outer connection pool. Default
-    and per-request logical headers are authenticated after transport fields are
-    removed. Ambient auth, cookies, event hooks, redirects, and environment
+    ``Discover()`` fetches one key per call. ``PinnedKey`` sends no key GET.
+    ``transport``, TLS, and pool options configure the dedicated outer connection.
+    Default headers and params become logical request fields and target bytes.
+    Logical headers are authenticated after transport fields are removed.
+    Ambient auth, cookies, event hooks, redirects, and environment
     credentials are rejected or disabled. ``compression`` selects optional
     Rust protocol body coding, not HTTP ``Content-Encoding``.
     """
 
     def __init__(
         self,
-        recipient_public_key: bytes,
-        recipient_key_id: bytes,
+        endpoint: str,
+        key_source: Discover | PinnedKey,
         psk: bytes,
         psk_id: bytes,
         *,
-        base_url: str | httpx.URL = "",
-        transport_endpoint: str | httpx.URL | None = None,
+        target_origin: str | None = None,
         limits: Limits = _DEFAULT_LIMITS,
         compression: Literal["gzip", "zstd"] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         **client_options: Any,
     ) -> None:
-        forbidden = {"auth", "cookies", "event_hooks", "follow_redirects", "transport"}.intersection(client_options)
+        endpoint = validate_endpoint(endpoint)
+        target_key = validate_target_origin(target_origin, endpoint)
+        validate_client_configuration(psk, psk_id, limits, compression)
+        if type(key_source) not in (Discover, PinnedKey):
+            raise TypeError("key_source must be Discover() or PinnedKey")
+        forbidden = {
+            "auth",
+            "cookies",
+            "event_hooks",
+            "follow_redirects",
+            "transport",
+            "base_url",
+            "transport_endpoint",
+        }.intersection(client_options)
         if forbidden:
             names = ", ".join(sorted(forbidden))
             msg = f"outer transport cannot use ambient request state: {names}"
@@ -75,10 +100,14 @@ class HPKEAsyncClient:
             raise ValueError("outer transport cannot use ambient proxy credentials: trust_env")
 
         with ExitStack() as cleanup:
-            client = Client(recipient_public_key, recipient_key_id, psk, psk_id, limits=limits, compression=compression)
-            cleanup.callback(client.close)
+            client = (
+                Client(key_source.public_key, key_source.key_id, psk, psk_id, limits=limits, compression=compression)
+                if isinstance(key_source, PinnedKey)
+                else None
+            )
+            if client is not None:
+                cleanup.callback(client.close)
             http = httpx.AsyncClient(
-                base_url=base_url,
                 transport=transport,
                 cookies=CookieJar(policy=_RejectAllCookiePolicy()),
                 follow_redirects=False,
@@ -88,7 +117,13 @@ class HPKEAsyncClient:
             cleanup.pop_all()
         self._http = http
         self._client = client
-        self._transport_endpoint = transport_endpoint
+        self._endpoint = httpx.URL(endpoint)
+        self._target_origin = target_key
+        self._psk = bytes(psk) if isinstance(key_source, Discover) else b""
+        self._psk_id = bytes(psk_id)
+        self._limits = limits
+        self._compression: Literal["gzip", "zstd"] | None = compression
+        self._closed = False
         self._max_request_len = max_body_len(limits)
         self._streams: set[HPKEStreamResponse] = set()
 
@@ -100,9 +135,12 @@ class HPKEAsyncClient:
 
     async def aclose(self) -> None:
         """Release credentials and close the HTTP connection pool."""
+        self._closed = True
         for stream in tuple(self._streams):
             await stream.aclose()
-        self._client.close()
+        self._psk = b""
+        if self._client is not None:
+            self._client.close()
         await self._http.aclose()
 
     def stream(self, method: str, url: str | httpx.URL, **request_options: Any) -> _StreamContext:
@@ -146,29 +184,25 @@ class HPKEAsyncClient:
         *,
         live: bool,
     ) -> HPKEStreamResponse:
+        if self._closed:
+            raise StateError("client is closed")
         logical = self._http.build_request(method, url, **request_options)
         target = _https_url(logical.url)
+        if not same_origin(str(target), self._target_origin):
+            raise TransportError("invalid_target", "logical target has the wrong HTTPS origin")
         body = await _read_request_body(logical, self._max_request_len)
         try:
             protocol_method = Method(logical.method.upper())
         except ValueError as error:
             raise ProtocolError("unsupported_method", "request method is not supported by hpke-http") from error
 
-        protected = await run_native(
-            self._client.protect,
-            Request(
-                method=protocol_method,
-                authority=target.netloc.decode("ascii"),
-                path=target.raw_path.decode("ascii"),
-                headers=filter_request_headers(logical.headers.multi_items()),
-                body=body,
-            ),
-        )
+        protected = await self._protect(logical, target, protocol_method, body)
         try:
-            endpoint = target if self._transport_endpoint is None else self._resolve(self._transport_endpoint)
+            if self._closed:
+                raise StateError("client is closed")
             outer = httpx.Request(
                 "POST",
-                endpoint,
+                self._endpoint,
                 headers={
                     "accept": RESPONSE_MEDIA_TYPE,
                     "accept-encoding": "identity",
@@ -209,6 +243,47 @@ class HPKEAsyncClient:
         finally:
             protected.close()
 
+    async def _protect(
+        self, logical: httpx.Request, target: httpx.URL, method: Method, body: bytes
+    ) -> ProtectedRequest:
+        request = Request(
+            method=method,
+            authority=target.netloc.decode("ascii"),
+            path=target.raw_path.decode("ascii"),
+            headers=filter_request_headers(logical.headers.multi_items()),
+            body=body,
+        )
+        if self._client is not None:
+            return await run_native(self._client.protect, request)
+        client = await self._discover_client(logical)
+        return await protect_discovered_client(client, request)
+
+    async def _discover_client(self, logical: httpx.Request) -> Client:
+        request = httpx.Request(
+            "GET",
+            self._endpoint,
+            headers={"accept": KEY_MEDIA_TYPE, "accept-encoding": "identity", "cache-control": "no-store"},
+        )
+        request.extensions["timeout"] = dict(logical.extensions.get("timeout", self._http.timeout.as_dict()))
+        try:
+            response = await self._http.send(request, stream=True, auth=None, follow_redirects=False)
+        except httpx.HTTPError as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        try:
+            validate_key_response(
+                response.status_code,
+                response.headers.get_list("content-type"),
+                response.headers.get_list("content-encoding"),
+            )
+            key_id, public_key = await read_key_record(_raw_chunks(response))
+            if self._closed:
+                raise StateError("client is closed")
+            return make_discovered_client(public_key, key_id, self._psk, self._psk_id, self._limits, self._compression)
+        except httpx.HTTPError as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        finally:
+            await response.aclose()
+
     async def get(self, url: str | httpx.URL, **options: Any) -> httpx.Response:
         """Send one protected ``GET`` request."""
         return await self.request("GET", url, **options)
@@ -236,15 +311,6 @@ class HPKEAsyncClient:
     async def delete(self, url: str | httpx.URL, **options: Any) -> httpx.Response:
         """Send one protected ``DELETE`` request."""
         return await self.request("DELETE", url, **options)
-
-    def _resolve(self, value: str | httpx.URL) -> httpx.URL:
-        candidate = httpx.URL(value)
-        if candidate.is_relative_url:
-            base = self._http.base_url
-            if base.is_relative_url:
-                raise TransportError("invalid_target", "transport endpoint must be an absolute HTTPS URL")
-            candidate = base.join(candidate)
-        return _https_url(candidate)
 
 
 class HPKEStreamResponse:

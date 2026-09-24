@@ -9,6 +9,8 @@ export const RESPONSE_MEDIA_TYPE = "message/hpke-http-response";
 
 const DEFAULT_MAX_BODY_LENGTH = 8 * 1024 * 1024;
 const MAX_BUFFER_CHUNK = 64 * 1024;
+const MAX_KEY_RECORD = 293;
+const KEY_MEDIA_TYPE = "application/octet-stream";
 
 const NON_FORWARDABLE_REQUEST_HEADERS = new Set([
   "accept-encoding",
@@ -51,27 +53,46 @@ export type FetchTransportErrorCode =
   | "outer_content_type"
   | "outer_content_encoding"
   | "inner_content_encoding"
-  | "invalid_inner_response";
+  | "invalid_inner_response"
+  | "discovery_network"
+  | "discovery_status"
+  | "discovery_response";
 
 /** A transport or logical-message error from the bounded Fetch adapter. */
 export class FetchTransportError extends Error {
   public readonly code: FetchTransportErrorCode;
+  public readonly statusCode?: number;
 
-  public constructor(code: FetchTransportErrorCode, message: string, options?: ErrorOptions) {
+  public constructor(code: FetchTransportErrorCode, message: string, options?: ErrorOptions, statusCode?: number) {
     super(message, options);
     this.name = "FetchTransportError";
     this.code = code;
+    if (statusCode !== undefined) { this.statusCode = statusCode; }
   }
 }
 
+/** Choose one key GET per call or one fixed key with no GET. */
+export type HpkeKeySource =
+  | { readonly kind: "discover" }
+  | { readonly kind: "pin"; readonly publicKey: Uint8Array; readonly keyId: Uint8Array };
+
 export interface HpkeFetchConfiguration {
-  /** Encoded 32-byte X25519 recipient public key. */
-  readonly recipientPublicKey: Uint8Array;
+  /** Fixed HTTPS URL for key GET and protected POST; no query, fragment, or credentials. */
+  readonly endpoint: string;
 
-  /** Non-empty public recipient-key identifier, at most 255 bytes. */
-  readonly recipientKeyId: Uint8Array;
+  /** One-key discovery or a fixed public key. */
+  readonly key: HpkeKeySource;
 
-  /** PSK of at least 32 bytes. The adapter copies but cannot clear this array. */
+  /**
+   * Logical HTTPS origin; defaults to the endpoint origin.
+   * No nonroot path, query, fragment, or credentials.
+   */
+  readonly targetOrigin?: string;
+
+  /**
+   * PSK of at least 32 bytes with at least 32 bytes of entropy.
+   * The adapter copies but cannot clear this array.
+   */
   readonly psk: Uint8Array;
 
   /** Non-empty public PSK identifier, at most 255 bytes and not equal to `psk`. */
@@ -82,12 +103,6 @@ export interface HpkeFetchConfiguration {
 
   /** Opt-in Rust-owned protocol body coding, separate from HTTP representation coding. */
   readonly compression?: CompressionCoding;
-
-  /**
-   * Fixed HTTPS endpoint that receives protected envelopes. When omitted, the
-   * original request URL is also the transport endpoint.
-   */
-  readonly transportEndpoint?: string | URL;
 
   /** Inject a Fetch-compatible transport. The default is `globalThis.fetch`. */
   readonly fetch?: FetchTransport;
@@ -117,7 +132,8 @@ export interface HpkeFetch {
  * and the shared Rust/WASM protocol engine.
  *
  * The returned function uses the URL, method, headers, body, and signal from a
- * Fetch request input. It protects the complete logical request, sends one POST
+ * Fetch request input. Discovery gets one public key from the fixed endpoint
+ * before each call; a pin sends no GET. It protects the complete logical request, sends one POST
  * envelope, checks START, and returns a live `Response` for SSE. The platform's
  * `Headers` implementation may combine repeated authenticated fields;
  * cookie-setting fields are omitted.
@@ -137,18 +153,28 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       "native Fetch is unavailable; provide configuration.fetch",
     );
   }
-  const fixedEndpoint =
-    configuration.transportEndpoint === undefined
-      ? undefined
-      : parseHttpsUrl(configuration.transportEndpoint);
-  const client = new Client(
-    configuration.recipientPublicKey,
-    configuration.recipientKeyId,
-    configuration.psk,
-    configuration.pskId,
-    limits,
-    configuration.compression,
-  );
+  const endpoint = parseKeyEndpoint(configuration.endpoint);
+  const targetOrigin = configuration.targetOrigin === undefined
+    ? endpoint.origin
+    : parseTargetOrigin(configuration.targetOrigin);
+  const psk = Uint8Array.from(configuration.psk);
+  const pskId = Uint8Array.from(configuration.pskId);
+  if (psk.byteLength < 32 || pskId.byteLength < 1 || pskId.byteLength > 255 || bytesEqual(psk, pskId)) {
+    throw new ProtocolError("invalid_configuration", "invalid PSK or PSK identity");
+  }
+  if (configuration.compression !== undefined &&
+      configuration.compression !== "gzip" && configuration.compression !== "zstd") {
+    throw new ProtocolError("invalid_configuration", "unsupported protocol body coding");
+  }
+  const pinnedClient = configuration.key.kind === "pin"
+    ? new Client(
+      configuration.key.publicKey, configuration.key.keyId,
+      psk, pskId, limits, configuration.compression,
+    )
+    : undefined;
+  if (configuration.key.kind !== "pin" && configuration.key.kind !== "discover") {
+    throw new TypeError("key must be a tagged pin or discover choice");
+  }
   const maxRequestLength = limits.maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
   const active = new Set<RecordPump>();
   let closed = false;
@@ -163,6 +189,9 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
 
     const request = new globalThis.Request(input, init);
     const target = parseHttpsUrl(request.url);
+    if (target.origin !== targetOrigin) {
+      throw new FetchTransportError("invalid_target", "logical target has the wrong HTTPS origin");
+    }
     const method = parseMethod(request.method);
     const headers = copyEndToEndHeaders(request.headers);
     const body = await readBodyBounded(request.body, maxRequestLength, request.signal);
@@ -173,16 +202,42 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       headers,
       body,
     };
-    const protectedRequest = client.protect(plaintext);
+    const discovered = pinnedClient === undefined;
+    let requestClient = pinnedClient;
+    if (requestClient === undefined) {
+      const { keyId, publicKey } = await fetchKey(transport, endpoint, request.signal);
+      if (closed) { throw new StateError(); }
+      try {
+        requestClient = new Client(publicKey, keyId, psk, pskId, limits, configuration.compression);
+      } catch (error: unknown) {
+        if (error instanceof ProtocolError) {
+          throw new FetchTransportError("discovery_response", "key endpoint returned an unusable public key");
+        }
+        throw error;
+      }
+    }
+    let protectedRequest;
+    try {
+      protectedRequest = requestClient.protect(plaintext);
+    } catch (error: unknown) {
+      if (discovered && error instanceof ProtocolError &&
+          (error.code === "invalid_configuration" || error.code === "crypto_failure")) {
+        throw new FetchTransportError("discovery_response", "key endpoint returned an unusable public key");
+      }
+      throw error;
+    } finally {
+      if (discovered) { requestClient.close(); }
+    }
 
     try {
+      if (closed) { throw new StateError(); }
       const outerResponse = await sendEnvelope(
         transport,
-        fixedEndpoint ?? target,
+        endpoint,
         protectedRequest.envelope,
         request.signal,
       );
-      await validateOuterResponse(outerResponse);
+      validateOuterResponse(outerResponse);
       if (outerResponse.body === null) {
         throw new ProtocolError("malformed_envelope", "response START is missing");
       }
@@ -202,7 +257,7 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
           if (finite === undefined) {
             throw new ProtocolError("malformed_envelope", "finite response body is missing");
           }
-          await pump.close();
+          pump.close();
           return new globalThis.Response(
             responseHasBody(method, finite.status) ? toArrayBuffer(finite.body ?? new Uint8Array()) : null,
             { status: finite.status, headers: webHeaders },
@@ -230,7 +285,7 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
                     settled = true;
                     controller.close();
                   }
-                  await pump.close();
+                  pump.close();
                   return;
                 }
                 if (record.kind === "sse_data") {
@@ -243,11 +298,11 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
               }
             } catch (error: unknown) {
               fail(error);
-              await pump.close(error);
+              pump.close(error);
             }
           },
-          async cancel(reason) {
-            await pump.close(reason);
+          cancel(reason) {
+            pump.close(reason);
           },
         });
         try {
@@ -257,7 +312,7 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
           throw error;
         }
       } catch (error: unknown) {
-        await pump.close(error);
+        pump.close(error);
         throw error;
       }
     } finally {
@@ -269,12 +324,100 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
     if (!closed) {
       closed = true;
       for (const pump of active) {
-        void pump.close(new StateError());
+        pump.close(new StateError());
       }
-      client.close();
+      pinnedClient?.close();
+      psk.fill(0);
     }
   };
   return hpkeFetch;
+}
+
+function parseKeyEndpoint(input: string): URL {
+  if (typeof input !== "string" || input.includes("?") || input.includes("#")) {
+    throw new FetchTransportError("invalid_target", "key endpoint must be one HTTPS URL without query or fragment");
+  }
+  return parseHttpsUrl(input);
+}
+
+function parseTargetOrigin(input: string): string {
+  if (typeof input !== "string" || input.includes("?") || input.includes("#")) {
+    throw new FetchTransportError("invalid_target", "logical origin must be one HTTPS origin");
+  }
+  const url = parseHttpsUrl(input);
+  if (url.pathname !== "/") {
+    throw new FetchTransportError("invalid_target", "logical origin must have no path");
+  }
+  return url.origin;
+}
+
+async function fetchKey(
+  transport: FetchTransport,
+  endpoint: URL,
+  signal: AbortSignal,
+): Promise<{ keyId: Uint8Array; publicKey: Uint8Array }> {
+  throwIfAborted(signal);
+  let response: globalThis.Response;
+  try {
+    response = await transport(endpoint, {
+      method: "GET",
+      headers: { accept: KEY_MEDIA_TYPE },
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+      signal,
+    });
+  } catch {
+    if (signal.aborted) { throw abortReason(signal); }
+    throw new FetchTransportError("discovery_network", "key GET failed");
+  }
+  if (response.status !== 200) {
+    const error = new FetchTransportError(
+      "discovery_status", "key endpoint returned an invalid status", undefined, response.status,
+    );
+    requestCancel(response.body, error);
+    throw error;
+  }
+  const type = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  const coding = response.headers.get("content-encoding");
+  if (type !== KEY_MEDIA_TYPE || (coding !== null && coding.trim().toLowerCase() !== "identity")) {
+    const error = new FetchTransportError("discovery_response", "key endpoint returned invalid key bytes");
+    requestCancel(response.body, error);
+    throw error;
+  }
+  let record: Uint8Array;
+  try {
+    record = await readBodyBounded(response.body, MAX_KEY_RECORD, signal);
+  } catch (error: unknown) {
+    if (signal.aborted) { throw abortReason(signal); }
+    if (error instanceof FetchTransportError && error.code === "request_too_large") {
+      throw new FetchTransportError("discovery_response", "key record exceeds 293 bytes");
+    }
+    throw new FetchTransportError("discovery_network", "key GET body failed");
+  }
+  return parseKeyRecord(record);
+}
+
+function parseKeyRecord(record: Uint8Array): { keyId: Uint8Array; publicKey: Uint8Array } {
+  const length = record[5];
+  if (record.byteLength < 39 || record.byteLength > MAX_KEY_RECORD ||
+      record[0] !== 0x48 || record[1] !== 0x48 || record[2] !== 0x4b || record[3] !== 0x44 ||
+      record[4] !== 1 || length === undefined || length === 0 || record.byteLength !== 38 + length) {
+    throw new FetchTransportError("discovery_response", "key endpoint returned an invalid key record");
+  }
+  return {
+    keyId: Uint8Array.from(record.subarray(6, 6 + length)),
+    publicKey: Uint8Array.from(record.subarray(6 + length)),
+  };
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) { return false; }
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) { return false; }
+  }
+  return true;
 }
 
 async function sendEnvelope(
@@ -309,13 +452,13 @@ async function sendEnvelope(
   }
 }
 
-async function validateOuterResponse(response: globalThis.Response): Promise<void> {
+function validateOuterResponse(response: globalThis.Response): void {
   if (response.status !== 200) {
     const error = new FetchTransportError(
       "outer_status",
       `protected endpoint returned outer status ${String(response.status)}`,
     );
-    await cancelBody(response.body, error);
+    requestCancel(response.body, error);
     throw error;
   }
   const contentType = response.headers.get("content-type")?.trim().toLowerCase();
@@ -324,13 +467,13 @@ async function validateOuterResponse(response: globalThis.Response): Promise<voi
       "outer_content_type",
       `protected endpoint must return ${RESPONSE_MEDIA_TYPE}`,
     );
-    await cancelBody(response.body, error);
+    requestCancel(response.body, error);
     throw error;
   }
   const contentEncoding = response.headers.get("content-encoding");
   if (contentEncoding !== null && contentEncoding.trim().toLowerCase() !== "identity") {
     const error = new FetchTransportError("outer_content_encoding", "protected envelope must not use content encoding");
-    await cancelBody(response.body, error);
+    requestCancel(response.body, error);
     throw error;
   }
 }
@@ -358,7 +501,7 @@ class RecordPump {
 
   readonly #abort = (): void => {
     const reason = abortReason(this.#signal);
-    void this.close(reason);
+    this.close(reason);
   };
 
   public async next(): Promise<CheckedRecord | undefined> {
@@ -401,16 +544,15 @@ class RecordPump {
     }
   }
 
-  public async close(reason?: unknown): Promise<void> {
+  public close(reason?: unknown): void {
     if (this.#closed) { return; }
     this.#closed = true;
     this.#registry.delete(this);
     this.#signal.removeEventListener("abort", this.#abort);
     if (reason !== undefined) { this.onAbort?.(reason); }
     this.#opener.close();
-    try { await this.#reader.cancel(reason); }
-    catch { /* The outer body can already be closed. */ }
-    finally { this.#reader.releaseLock(); }
+    requestCancel(this.#reader, reason);
+    this.#reader.releaseLock();
   }
 }
 
@@ -564,7 +706,7 @@ async function readBodyBounded(
       }
     }
   } catch (error: unknown) {
-    await reader.cancel(error).catch(() => undefined);
+    requestCancel(reader, error);
     throw error;
   } finally {
     signal.removeEventListener("abort", onAbort);
@@ -583,11 +725,14 @@ async function readBodyBounded(
   return output;
 }
 
-async function cancelBody(
-  body: ReadableStream<Uint8Array> | null,
+function requestCancel(
+  body: ReadableStream<Uint8Array> | ReadableStreamDefaultReader<Uint8Array> | null,
   reason: unknown,
-): Promise<void> {
-  await body?.cancel(reason).catch(() => undefined);
+): void {
+  if (body !== null) {
+    // A custom stream can leave its cancel promise pending; cleanup must not wait.
+    void body.cancel(reason).catch(() => undefined);
+  }
 }
 
 function throwIfAborted(signal: AbortSignal): void {

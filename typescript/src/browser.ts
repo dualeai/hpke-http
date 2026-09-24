@@ -31,6 +31,7 @@ export type {
   FetchTransportErrorCode,
   HpkeFetch,
   HpkeFetchConfiguration,
+  HpkeKeySource,
 } from "./fetch.js";
 
 /** Explicit browser WASM input accepted by `initialize`. */

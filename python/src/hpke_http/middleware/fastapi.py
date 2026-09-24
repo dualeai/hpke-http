@@ -10,6 +10,7 @@ from urllib.parse import unquote
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from hpke_http.middleware._discovery import KEY_MEDIA_TYPE, encode_key_record, https_origin
 from hpke_http.middleware._native_async import run_native
 from hpke_http.protocol import (
     Limits,
@@ -64,13 +65,13 @@ class HPKEMiddleware:
     ``psk_resolver`` raises ``LookupError`` for an unknown public ID. Other
     resolver exceptions indicate an unavailable credential source.
 
-    With ``transport_path=None`` every HTTP route is protected and the inner
-    target must equal the outer target. A fixed ``transport_path`` protects only
-    that route and dispatches the authenticated inner path inside the app.
+    ``transport_path`` must match the full ASGI ``scope["path"]``, including any
+    mount prefix. It serves a public key through GET and accepts a protected
+    request through POST. Other paths go to the host application.
 
     ``expected_authority`` fixes the authenticated authority accepted by this
     endpoint. Without it, the middleware compares the inner authority with the
-    outer ASGI ``Host`` field. Fixed-transport mode skips only the path match.
+    outer ASGI ``Host`` field.
 
     The middleware closes its native server after the application's ASGI
     lifespan ends. With a host that does not send lifespan events, construct
@@ -87,15 +88,16 @@ class HPKEMiddleware:
         psk_resolver: PSKResolver,
         replay_admitter: ReplayAdmitter,
         *,
+        transport_path: str,
         limits: Limits = _DEFAULT_LIMITS,
         compression: bool = False,
-        transport_path: str | None = None,
         expected_authority: str | None = None,
     ) -> None:
-        if transport_path is not None and not transport_path.startswith("/"):
-            raise ValueError("transport_path must start with '/'")
+        if not transport_path.startswith("/") or "?" in transport_path or "#" in transport_path:
+            raise ValueError("transport_path must be one local path")
         self.app = app
         self._server = Server(recipient_private_key, recipient_key_id, limits=limits, compression=compression)
+        self._key_record = encode_key_record(recipient_key_id, self._server.public_key)
         self._psk_resolver = psk_resolver
         self._replay_admitter = replay_admitter
         self._transport_path = transport_path
@@ -122,10 +124,20 @@ class HPKEMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if self._transport_path is not None and scope.get("path") != self._transport_path:
+        if scope.get("path") != self._transport_path:
             await self.app(scope, receive, send)
             return
         try:
+            if scope.get("query_string"):
+                raise _HTTPBoundaryError(400, b"key endpoint does not accept a query")
+            method = scope.get("method")
+            if method not in ("GET", "POST"):
+                raise _HTTPBoundaryError(405, b"key endpoint accepts GET and POST")
+            if self.closed:
+                raise _HTTPBoundaryError(503, b"key endpoint is closed")
+            if method == "GET":
+                await _send_key_record(send, self._key_record)
+                return
             headers = _validated_outer_headers(scope)
             try:
                 envelope = await _read_body(receive, headers, self._max_request_envelope_len)
@@ -194,11 +206,9 @@ class HPKEMiddleware:
             target_allowed = _target_is_allowed(
                 scope,
                 request.authority,
-                request.path,
                 self._expected_authority,
-                fixed_transport=self._transport_path is not None,
             )
-        except (UnicodeError, ValueError):
+        except (UnicodeError, ValueError, TransportError):
             target_allowed = False
         if not target_allowed:
             raise _HTTPBoundaryError(421, b"authenticated target does not match this endpoint")
@@ -385,8 +395,6 @@ def _scope_headers(scope: Scope) -> list[tuple[str, str]]:
 
 
 def _validated_outer_headers(scope: Scope) -> list[tuple[str, str]]:
-    if scope.get("method") != "POST":
-        raise _HTTPBoundaryError(405, b"protected endpoint requires POST")
     try:
         headers = _scope_headers(scope)
         content_type = _single_header(headers, "content-type")
@@ -436,25 +444,10 @@ async def _read_body(receive: Receive, headers: list[tuple[str, str]], maximum: 
 def _target_is_allowed(
     scope: Scope,
     authority: str,
-    path: str,
     expected_authority: str | None,
-    *,
-    fixed_transport: bool,
 ) -> bool:
     expected = expected_authority or _single_header(_scope_headers(scope), "host")
-    if expected is None or authority.lower() != expected.lower():
-        return False
-    if fixed_transport:
-        return True
-    if scope.get("path") is None:
-        return False
-    raw_path = scope.get("raw_path")
-    if raw_path is None:
-        raw_path = str(scope["path"]).encode()
-    outer_path = bytes(raw_path).decode("ascii")
-    query = bytes(scope.get("query_string", b"")).decode("ascii")
-    outer_target = outer_path + (f"?{query}" if query else "")
-    return outer_target == path
+    return expected is not None and https_origin(f"https://{authority}/") == https_origin(f"https://{expected}/")
 
 
 def _inner_scope(scope: Scope, request: Request) -> Scope:
@@ -513,7 +506,7 @@ async def _send_error(send: Send, status: int, body: bytes) -> None:
         (b"content-length", str(len(body)).encode()),
     ]
     if status == _METHOD_NOT_ALLOWED_STATUS:
-        headers.append((b"allow", b"POST"))
+        headers.append((b"allow", b"GET, POST"))
     await send(
         {
             "type": "http.response.start",
@@ -522,6 +515,21 @@ async def _send_error(send: Send, status: int, body: bytes) -> None:
         }
     )
     await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _send_key_record(send: Send, record: bytes) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", KEY_MEDIA_TYPE.encode()),
+                (b"cache-control", b"no-store"),
+                (b"content-length", str(len(record)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": record, "more_body": False})
 
 
 __all__ = ["HPKEMiddleware", "PSKResolver", "ReplayAdmitter"]

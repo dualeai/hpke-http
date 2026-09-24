@@ -13,6 +13,8 @@
 
   const text = new TextEncoder();
   let hpkeFetch;
+  let discoveryFetch;
+  let badDiscoveryFetch;
   let server;
   async function report(status, detail = "") {
     document.body.dataset.result = status;
@@ -32,8 +34,8 @@
     const pskId = text.encode("browser-tenant");
     server = new Server(keys.privateKey, keyId);
     hpkeFetch = createHpkeFetch({
-      recipientPublicKey: keys.publicKey,
-      recipientKeyId: keyId,
+      endpoint: "https://api.example.test/protected",
+      key: { kind: "pin", publicKey: keys.publicKey, keyId },
       psk,
       pskId,
       fetch: async (input, init) => {
@@ -150,12 +152,58 @@
     }
     if (!abortFailed) throw new Error("browser body did not stop after caller abort");
     await globalThis.fetch("/relay", { method: "PUT" });
+
+    const endpoint = new URL(location.href).searchParams.get("discovery_endpoint");
+    if (endpoint === null) throw new Error("browser key endpoint is missing");
+    const apiOrigin = new URL(endpoint).origin;
+    document.cookie = "browser-cookie=must-not-leak; Secure; SameSite=Lax";
+    discoveryFetch = createHpkeFetch({
+      endpoint,
+      key: { kind: "discover" },
+      targetOrigin: "https://api.example.test",
+      psk,
+      pskId,
+    });
+    const discovered = await discoveryFetch("https://api.example.test/items", {
+      headers: { authorization: "Bearer inner-only" },
+    });
+    if (discovered.status !== 200 || (await discovered.text()) !== "browser-discovery-ok") {
+      throw new Error("browser discovery exchange did not complete");
+    }
+    const fault = await globalThis.fetch(`${endpoint}?bad=1`, { credentials: "omit" });
+    if (fault.status !== 400 || !(await fault.text()).includes("query")) {
+      throw new Error("browser could not read a cross-origin endpoint fault");
+    }
+    badDiscoveryFetch = createHpkeFetch({
+      endpoint: `${apiOrigin}/missing`,
+      key: { kind: "discover" },
+      targetOrigin: "https://api.example.test",
+      psk,
+      pskId,
+    });
+    let badGetFailed = false;
+    try {
+      await badDiscoveryFetch("https://api.example.test/items");
+    } catch (error) {
+      badGetFailed = error?.code === "discovery_status" && error?.statusCode === 404;
+    }
+    if (!badGetFailed) throw new Error("bad key GET did not stop the protected request");
+    const statsResponse = await globalThis.fetch(`${apiOrigin}/stats`, { credentials: "omit" });
+    const stats = await statsResponse.json();
+    if (
+      statsResponse.status !== 200 || stats.key_get !== 1 || stats.preflight < 1 ||
+      stats.protected_post !== 1 || stats.bad_get !== 1 || stats.key_get_had_credentials
+    ) {
+      throw new Error(`browser discovery CORS checks failed: ${JSON.stringify(stats)}`);
+    }
     await report("pass");
   } catch (error) {
     const detail = error instanceof Error ? `${error.stack ?? error.message}` : String(error);
     await report("fail", detail);
   } finally {
     hpkeFetch?.close();
+    discoveryFetch?.close();
+    badDiscoveryFetch?.close();
     server?.close();
   }
 </script>

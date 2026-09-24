@@ -19,7 +19,7 @@ from typing_extensions import Self
 from hpke_http import _native
 
 PROTOCOL_ID = "hpke-http/2"
-BINDING_ABI_VERSION = 2
+BINDING_ABI_VERSION = 3
 PACKAGE_VERSION = version("hpke_http")
 
 _HARD_LIMITS = (
@@ -210,10 +210,11 @@ class Client:
     """Reusable client configuration for one recipient and PSK identity.
 
     The recipient public key is an encoded 32-byte X25519 key. Both public IDs
-    are non-empty and at most 255 bytes. The PSK is at least 32 bytes, and
-    ``psk_id`` must not equal it. Inputs are copied into native storage; closing
-    the client cannot clear byte strings retained by the caller. ``compression``
-    opts into Rust-owned gzip/zstd body coding and requires an enabled server.
+    are non-empty and at most 255 bytes. The PSK must be at least 32 bytes long
+    and contain at least 32 bytes of entropy; ``psk_id`` must not equal it.
+    Inputs are copied into native storage; closing the client cannot clear byte
+    strings retained by the caller. ``compression`` opts into Rust-owned
+    gzip/zstd body coding and requires an enabled server.
     Leave it off when a body combines secrets with attacker-controlled data.
     """
 
@@ -377,6 +378,11 @@ class Server:
         inner = self._state.require()
         _check_length(len(envelope), self._state.maximum_envelope)
         return PreparsedRequest(_call(inner.preparse, bytes(envelope)), self._state)
+
+    @property
+    def public_key(self) -> bytes:
+        """Return the 32-byte public key for this server's current private key."""
+        return self._state.require().public_key
 
     @property
     def closed(self) -> bool:

@@ -43,7 +43,7 @@ test("Node loader and complete hpke-http transaction", async () => {
   assert.equal(isInitialized(), true);
   assert.equal(PACKAGE_VERSION, packageMetadata.version);
   assert.equal(PROTOCOL_ID, "hpke-http/2");
-  assert.equal(BINDING_ABI_VERSION, 2);
+  assert.equal(BINDING_ABI_VERSION, 3);
 
   const keys = generateKeyPair();
   const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID);

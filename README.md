@@ -18,9 +18,10 @@ typescript/           TypeScript API, WASM boundary, and native Fetch adapter
 cicd/                 tag-derived coordinated release tooling
 ```
 
-The Rust crate owns byte encoding, HPKE operations, limits, validation, replay
-identity, and response record state. The language projects own their runtime
-lifecycle and HTTP integrations. Generated binding APIs are private.
+The Rust crate owns protected message encoding, HPKE operations, limits,
+validation, replay identity, and response record state. The language projects
+own key GET and record handling, runtime lifecycle, and HTTP integrations.
+Generated binding APIs are private.
 
 ## Install and runtime support
 
@@ -60,16 +61,44 @@ default body limit is 8 MiB per request, finite response, or SSE block; a live
 SSE stream has no total body cap. It supports opt-in gzip or zstd body compression in the Rust
 protocol layer, with bounded decompression in every binding. This is separate
 from HTTP `Content-Encoding`: high-level adapters still require identity
-logical content coding. SSE records use no private body coding. The engine does not
-implement discovery or suite negotiation. Compression can leak body information through
+logical content coding. SSE records use no private body coding. The engine does
+no network I/O; the Python and Fetch adapters can discover one key. There is
+no suite negotiation. Compression can leak body information through
 ciphertext length; enable it only when attacker-controlled data cannot be
 combined with secrets in the same body.
 
 Recipient keys use X25519. Public recipient-key and PSK identifiers are
-non-empty and at most 255 bytes; PSKs are at least 32 bytes and must not equal
-their public IDs. Native objects copy credentials. Closing them releases native
-copies, but it cannot erase caller-owned Python `bytes` or JavaScript
-`Uint8Array` values.
+non-empty and at most 255 bytes; PSKs must be at least 32 bytes long, contain
+at least 32 bytes of entropy, and differ from their public IDs. Native objects
+copy credentials. Closing them releases native copies, but it cannot erase
+caller-owned Python `bytes` or JavaScript `Uint8Array` values.
+
+## Key discovery
+
+One configured HTTPS endpoint serves the public key through GET and receives
+protected requests through POST. A client gets the key before each discovered
+call. The GET sends no logical authorization, cookies, or PSK ID. The client
+accepts no redirect and stores no app key cache. A pinned key uses the same
+POST endpoint and sends no GET. The client accepts logical requests at one
+fixed HTTPS origin; a gateway can set a different `target_origin` or
+`targetOrigin` and the ASGI server's `expected_authority`.
+Origin checks fold DNS case and IDNA names, normalize IPv6 and the default
+port 443, and keep other ports distinct. A wrong logical origin fails before
+the client reads its body or sends GET.
+
+The GET body is exactly `"HHKD" || 0x01 || id_len:u8 || id || x25519_public_key[32]`.
+The ID length is 1 through 255, so the full record is 39 through 293 bytes.
+The server sends `application/octet-stream` and `Cache-Control: no-store`.
+Clients reject any other record form or extra bytes. Version `0x01` describes
+this key record; request and response bytes still use `hpke-http/2`. There is
+no earlier discovery JSON, old route, or old client API path.
+
+The server holds one recipient key. All workers for an endpoint must use that
+key; a key change across mixed workers can make a request fail. The adapters
+do not retry a protected POST. If its reply is lost, the caller does not know
+whether the app ran. The added GET is one more network round trip on each
+discovered call. For browser calls, outer CORS must cover GET, POST preflight,
+POST, and fault replies.
 
 ## Rust
 
@@ -84,6 +113,8 @@ and live SSE adapters
 for `httpx`, `aiohttp`, and FastAPI/Starlette. See the
 [Python package README](python/README.md).
 
+The key values and `send_envelope` below come from the application.
+
 ```python
 from hpke_http import Client, Method, Request
 
@@ -92,7 +123,7 @@ with Client(server_public_key, key_id, psk, psk_id) as client:
         Request(Method.POST, "api.example.test", "/items", body=b"payload")
     )
     try:
-        # Send transaction.envelope, then authenticate the returned envelope.
+        protected_response = send_envelope(transaction.envelope)
         response = transaction.open_response(protected_response)
     finally:
         transaction.close()
@@ -109,8 +140,8 @@ import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
 
 await initialize();
 const hpkeFetch = createHpkeFetch({
-  recipientPublicKey: serverPublicKey,
-  recipientKeyId: keyId,
+  endpoint: "https://api.example.test/protected",
+  key: { kind: "discover" },
   psk,
   pskId,
 });
@@ -199,7 +230,8 @@ maintain a separate specification or architecture-decision document tree.
 
 See the [security policy](SECURITY.md)
 for supported releases and private reporting.
-Do not use a PSK as its public PSK ID. Use an atomic replay store shared by all
+Give each PSK at least 32 bytes of entropy. Do not use it as its public PSK ID.
+Use an atomic replay store shared by all
 server workers that can process the same credentials.
 
 The core standards are [RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html)

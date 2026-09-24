@@ -33,6 +33,7 @@ export type {
   FetchTransportErrorCode,
   HpkeFetch,
   HpkeFetchConfiguration,
+  HpkeKeySource,
 } from "./fetch.js";
 
 const require = createRequire(import.meta.url);

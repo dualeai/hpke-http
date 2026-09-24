@@ -179,20 +179,23 @@ package-typescript:
 
 smoke-python-wheel:
 	uv venv $(PYTHON_SMOKE_DIR) --python "$(PYTHON_VERSION)"
-	uv pip install --python $(PYTHON_SMOKE_DIR)/bin/python $(PYTHON_WHEEL_PIP_FLAGS) $(PYTHON_WHEEL_INPUT)
+	@set -- $(PYTHON_WHEEL_INPUT); test "$$#" -eq 1; \
+		uv pip install --python $(PYTHON_SMOKE_DIR)/bin/python $(PYTHON_WHEEL_PIP_FLAGS) \
+		"$$1[fastapi,aiohttp,httpx]"
 	$(PYTHON_SMOKE_DIR)/bin/python $(PYTHON_DIR)/tests/artifact_smoke.py $(if $(EXPECTED_VERSION),"$(EXPECTED_VERSION)")
 
 smoke-python-platform-wheel:
 	$(PLATFORM_PYTHON) -c "import pathlib; wheels = list(pathlib.Path('$(PLATFORM_WHEEL_DIR)').glob('*.whl')); assert len(wheels) == 1, f'expected one wheel, got {len(wheels)}'"
-	$(PLATFORM_PYTHON) -m pip install --disable-pip-version-check $(wildcard $(PLATFORM_WHEEL_DIR)/*.whl)
+	$(PLATFORM_PYTHON) -m pip install --disable-pip-version-check "$(wildcard $(PLATFORM_WHEEL_DIR)/*.whl)[fastapi,aiohttp,httpx]"
 	$(PLATFORM_PYTHON) $(PYTHON_DIR)/tests/artifact_smoke.py $(if $(EXPECTED_VERSION),"$(EXPECTED_VERSION)")
 
 smoke-python-sdist:
-	uv venv .artifact-smoke/python-sdist --python "$(PYTHON_VERSION)"
+	uv venv --clear .artifact-smoke/python-sdist --python "$(PYTHON_VERSION)"
 	uv pip install --python .artifact-smoke/python-sdist/bin/python \
 		"maturin==$(patsubst v%,%,$(MATURIN_VERSION))"
-	uv pip install --python .artifact-smoke/python-sdist/bin/python \
-		--no-build-isolation $(ARTIFACT_DIR)/python/*.tar.gz
+	@set -- $(ARTIFACT_DIR)/python/*.tar.gz; test "$$#" -eq 1; \
+		uv pip install --python .artifact-smoke/python-sdist/bin/python \
+		--no-build-isolation --no-cache "$$1[fastapi,aiohttp,httpx]"
 	.artifact-smoke/python-sdist/bin/python \
 		$(PYTHON_DIR)/tests/artifact_smoke.py $(if $(EXPECTED_VERSION),"$(EXPECTED_VERSION)")
 

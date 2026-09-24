@@ -1,19 +1,27 @@
 import { spawn } from "node:child_process";
+import { X509Certificate, createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer } from "node:https";
 import { tmpdir } from "node:os";
 import { delimiter, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
+const repositoryRoot = resolve(packageRoot, "..");
 const chrome = await findChrome();
 let resolveBrowserResult = () => {};
 let pendingRelay;
 const browserResult = new Promise((resolveResult) => {
   resolveBrowserResult = resolveResult;
 });
-const server = createServer((request, response) => {
+const profile = await mkdtemp(join(tmpdir(), "hpke-http-browser-"));
+const discovery = await startDiscoveryHost(profile);
+const certificate = await readFile(discovery.cert);
+const privateKey = await readFile(discovery.key);
+const publicKey = new X509Certificate(certificate).publicKey.export({ type: "spki", format: "der" });
+const certificatePin = createHash("sha256").update(publicKey).digest("base64");
+const server = createServer({ cert: certificate, key: privateKey }, (request, response) => {
   void serve(request, response).catch((error) => {
     if (response.headersSent) {
       response.destroy(error);
@@ -34,8 +42,7 @@ if (address === null || typeof address === "string") {
   throw new Error("browser smoke server did not expose a TCP address");
 }
 
-const profile = await mkdtemp(join(tmpdir(), "hpke-http-browser-"));
-const url = `http://127.0.0.1:${address.port}/test/browser-smoke.html`;
+const url = `https://127.0.0.1:${address.port}/test/browser-smoke.html?discovery_endpoint=${encodeURIComponent(discovery.endpoint)}`;
 let execution;
 try {
   const args = [
@@ -44,6 +51,7 @@ try {
     "--disable-dev-shm-usage",
     "--no-default-browser-check",
     "--no-first-run",
+    `--ignore-certificate-errors-spki-list=${certificatePin}`,
     `--user-data-dir=${profile}`,
     url,
   ];
@@ -81,11 +89,12 @@ try {
       error === undefined ? resolveClose() : rejectClose(error),
     );
   });
+  await stop(discovery.execution);
   await rm(profile, { recursive: true, force: true });
 }
 
 async function serve(request, response) {
-  const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+  const requestUrl = new URL(request.url ?? "/", "https://127.0.0.1");
   const pathname = decodeURIComponent(requestUrl.pathname);
   if (pathname === "/relay") {
     if (request.method === "PUT") {
@@ -178,6 +187,52 @@ async function serve(request, response) {
   response.end(body);
 }
 
+async function startDiscoveryHost(directory) {
+  let pending = "";
+  let resolveReady;
+  const ready = new Promise((resolveResult) => { resolveReady = resolveResult; });
+  const execution = run(
+    "uv",
+    [
+      "run", "--project", join(repositoryRoot, "python"), "--frozen", "--all-extras",
+      "python", join(repositoryRoot, "python/tests/browser_discovery_host.py"), directory,
+    ],
+    {
+      cwd: repositoryRoot,
+      onStdout(chunk) {
+        pending += chunk;
+        while (pending.includes("\n")) {
+          const index = pending.indexOf("\n");
+          const line = pending.slice(0, index);
+          pending = pending.slice(index + 1);
+          try {
+            const info = JSON.parse(line);
+            if (typeof info.endpoint === "string" && typeof info.cert === "string" && typeof info.key === "string") {
+              resolveReady(info);
+            }
+          } catch { /* Wait for the host's JSON line. */ }
+        }
+      },
+    },
+  );
+  try {
+    const info = await withTimeout(
+      Promise.race([
+        ready,
+        execution.completion.then((result) => {
+          throw new Error(`ASGI discovery host exited early: ${result.stderr}\n${result.stdout}`);
+        }),
+      ]),
+      15_000,
+      "ASGI discovery host did not start",
+    );
+    return { ...info, execution };
+  } catch (error) {
+    await stop(execution);
+    throw error;
+  }
+}
+
 async function findChrome() {
   const candidates = [
     process.env.CHROME_BIN,
@@ -214,14 +269,15 @@ async function findChrome() {
   );
 }
 
-function run(command, args) {
-  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+function run(command, args, options = {}) {
+  const child = spawn(command, args, { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
+    options.onStdout?.(chunk);
   });
   child.stderr.on("data", (chunk) => {
     stderr += chunk;

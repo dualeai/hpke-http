@@ -14,9 +14,22 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from typing_extensions import Self
 from yarl import URL
 
+from hpke_http.middleware._discovery import (
+    KEY_MEDIA_TYPE,
+    Discover,
+    PinnedKey,
+    make_discovered_client,
+    protect_discovered_client,
+    read_key_record,
+    same_origin,
+    validate_client_configuration,
+    validate_endpoint,
+    validate_key_response,
+    validate_target_origin,
+)
 from hpke_http.middleware._native_async import run_native
 from hpke_http.middleware._records import CheckedStream
-from hpke_http.protocol import Client, Limits, Method, ProtocolError, Request, StateError
+from hpke_http.protocol import Client, Limits, Method, ProtectedRequest, ProtocolError, Request, StateError
 from hpke_http.transport import (
     REQUEST_MEDIA_TYPE,
     RESPONSE_MEDIA_TYPE,
@@ -150,10 +163,10 @@ class _RequestContextManager:
 
 
 class HPKEClientSession:
-    """Compose a dedicated aiohttp transport with one recipient configuration.
+    """Compose a dedicated aiohttp transport with one fixed key endpoint.
 
-    ``base_url`` resolves logical relative targets. ``transport_endpoint`` can
-    select one fixed HTTPS envelope endpoint. The connector and accepted session
+    ``Discover()`` fetches one key per call. ``PinnedKey`` sends no key GET.
+    The connector and accepted session
     options configure only the dedicated outer connection pool. Session default
     credentials, cookies, headers, and environment proxy state are rejected or
     disabled. ``compression`` selects optional Rust protocol body coding, not
@@ -163,39 +176,62 @@ class HPKEClientSession:
 
     def __init__(
         self,
-        recipient_public_key: bytes,
-        recipient_key_id: bytes,
+        endpoint: str,
+        key_source: Discover | PinnedKey,
         psk: bytes,
         psk_id: bytes,
         *,
-        base_url: str | URL | None = None,
-        transport_endpoint: str | URL | None = None,
+        target_origin: str | None = None,
         limits: Limits = _DEFAULT_LIMITS,
         compression: Literal["gzip", "zstd"] | None = None,
         connector: aiohttp.BaseConnector | None = None,
         **session_options: Any,
     ) -> None:
-        sensitive_options = {"auth", "connector", "cookie_jar", "cookies", "headers"}.intersection(session_options)
+        endpoint = validate_endpoint(endpoint)
+        target_key = validate_target_origin(target_origin, endpoint)
+        validate_client_configuration(psk, psk_id, limits, compression)
+        if type(key_source) not in (Discover, PinnedKey):
+            raise TypeError("key_source must be Discover() or PinnedKey")
+        sensitive_options = {
+            "auth",
+            "connector",
+            "cookie_jar",
+            "cookies",
+            "headers",
+            "base_url",
+            "transport_endpoint",
+        }.intersection(session_options)
         if sensitive_options:
             names = ", ".join(sorted(sensitive_options))
             msg = f"outer transport session cannot use credential-bearing defaults: {names}"
             raise ValueError(msg)
-        if session_options.get("trust_env") is True:
+        if session_options.pop("trust_env", False) is not False:
             raise ValueError("outer transport session cannot use ambient proxy or netrc state: trust_env")
 
         with ExitStack() as cleanup:
-            client = Client(recipient_public_key, recipient_key_id, psk, psk_id, limits=limits, compression=compression)
-            cleanup.callback(client.close)
+            client = (
+                Client(key_source.public_key, key_source.key_id, psk, psk_id, limits=limits, compression=compression)
+                if isinstance(key_source, PinnedKey)
+                else None
+            )
+            if client is not None:
+                cleanup.callback(client.close)
             http = aiohttp.ClientSession(
                 connector=connector,
                 cookie_jar=aiohttp.DummyCookieJar(),
+                trust_env=False,
                 **session_options,
             )
             cleanup.pop_all()
         self._http = http
-        self._base_url = URL(base_url) if base_url is not None else None
-        self._transport_endpoint = transport_endpoint
+        self._endpoint = URL(endpoint)
+        self._target_origin = target_key
         self._client = client
+        self._psk = bytes(psk) if isinstance(key_source, Discover) else b""
+        self._psk_id = bytes(psk_id)
+        self._limits = limits
+        self._compression: Literal["gzip", "zstd"] | None = compression
+        self._closed = False
         self._max_request_len = max_body_len(limits)
         self._streams: set[HPKEStreamResponse] = set()
 
@@ -208,13 +244,16 @@ class HPKEClientSession:
     @property
     def closed(self) -> bool:
         """Return whether the dedicated outer connection pool is closed."""
-        return self._http.closed
+        return self._closed
 
     async def close(self) -> None:
         """Release credential copies and close the outer connection pool."""
+        self._closed = True
         for stream in tuple(self._streams):
             await stream.aclose()
-        self._client.close()
+        self._psk = b""
+        if self._client is not None:
+            self._client.close()
         await self._http.close()
 
     def stream(
@@ -329,9 +368,13 @@ class HPKEClientSession:
         timeout: aiohttp.ClientTimeout | None,
         live: bool,
     ) -> HPKEStreamResponse:
+        if self.closed:
+            raise StateError("client is closed")
         target = self._resolve(url)
         if params is not None:
             target = target.update_query(params)
+        if not same_origin(str(target), self._target_origin):
+            raise TransportError("invalid_target", "logical target has the wrong HTTPS origin")
         body, default_content_type = await _encode_body(data, json, self._max_request_len)
         fields = CIMultiDict[str](headers or ())
         if default_content_type is not None and "content-type" not in fields:
@@ -341,18 +384,10 @@ class HPKEClientSession:
         except ValueError as error:
             raise ProtocolError("unsupported_method", "request method is not supported by hpke-http") from error
 
-        protected = await run_native(
-            self._client.protect,
-            Request(
-                method=protocol_method,
-                authority=target.raw_authority,
-                path=target.raw_path_qs,
-                headers=filter_request_headers(fields.items()),
-                body=body,
-            ),
-        )
+        protected = await self._protect(target, protocol_method, fields, body, timeout)
         try:
-            endpoint = target if self._transport_endpoint is None else self._resolve(self._transport_endpoint)
+            if self.closed:
+                raise StateError("client is closed")
             outer_headers = {
                 "accept": RESPONSE_MEDIA_TYPE,
                 "accept-encoding": "identity",
@@ -370,7 +405,7 @@ class HPKEClientSession:
                 )
             try:
                 outer = await self._http.post(
-                    endpoint,
+                    self._endpoint,
                     data=protected.envelope,
                     headers=outer_headers,
                     allow_redirects=False,
@@ -408,12 +443,58 @@ class HPKEClientSession:
         finally:
             protected.close()
 
+    async def _protect(
+        self,
+        target: URL,
+        method: Method,
+        fields: CIMultiDict[str],
+        body: bytes,
+        timeout: aiohttp.ClientTimeout | None,
+    ) -> ProtectedRequest:
+        request = Request(
+            method=method,
+            authority=target.raw_authority,
+            path=target.raw_path_qs,
+            headers=filter_request_headers(fields.items()),
+            body=body,
+        )
+        if self._client is not None:
+            return await run_native(self._client.protect, request)
+        client = await self._discover_client(timeout)
+        return await protect_discovered_client(client, request)
+
+    async def _discover_client(self, timeout: aiohttp.ClientTimeout | None) -> Client:
+        try:
+            response = await self._http.get(
+                self._endpoint,
+                headers={"accept": KEY_MEDIA_TYPE, "accept-encoding": "identity", "cache-control": "no-store"},
+                allow_redirects=False,
+                auth=None,
+                auto_decompress=False,
+                raise_for_status=False,
+                timeout=timeout or self._http.timeout,
+            )
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        try:
+            validate_key_response(
+                response.status,
+                response.headers.getall("content-type", ()),
+                response.headers.getall("content-encoding", ()),
+            )
+            key_id, public_key = await read_key_record(response.content.iter_chunked(64 * 1024))
+            if self.closed:
+                raise StateError("client is closed")
+            return make_discovered_client(public_key, key_id, self._psk, self._psk_id, self._limits, self._compression)
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        finally:
+            response.close()
+
     def _resolve(self, value: str | URL) -> URL:
         candidate = URL(value)
         if not candidate.is_absolute():
-            if self._base_url is None:
-                raise TransportError("invalid_target", "protected requests require an absolute HTTPS URL")
-            candidate = self._base_url.join(candidate)
+            raise TransportError("invalid_target", "protected requests require an absolute HTTPS URL")
         if candidate.scheme != "https" or candidate.user is not None or candidate.password is not None:
             raise TransportError(
                 "invalid_target",

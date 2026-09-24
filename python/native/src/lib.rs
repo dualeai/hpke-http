@@ -190,6 +190,11 @@ impl NativeServer {
         })
     }
 
+    #[getter]
+    fn public_key(&self) -> Vec<u8> {
+        self.inner.public_key()
+    }
+
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }

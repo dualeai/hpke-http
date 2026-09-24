@@ -16,7 +16,7 @@ import { PACKAGE_VERSION } from "./_package-version.js";
 export const PROTOCOL_ID = "hpke-http/2";
 
 /** ABI version shared by the TypeScript facade and its private WASM module. */
-export const BINDING_ABI_VERSION = 2;
+export const BINDING_ABI_VERSION = 3;
 
 /** npm package version used to reject a mismatched private WASM module. */
 export { PACKAGE_VERSION };
@@ -192,7 +192,7 @@ export class Client {
    *
    * @param recipientPublicKey - Encoded 32-byte X25519 public key.
    * @param recipientKeyId - Non-empty public key identifier, at most 255 bytes.
-   * @param psk - Secret of at least 32 bytes.
+   * @param psk - Secret of at least 32 bytes with at least 32 bytes of entropy.
    * @param pskId - Non-empty public opaque identifier, at most 255 bytes and not equal to `psk`.
    * @param limits - Optional limits applied to every request and response.
    * @param compression - Optional authenticated body coding. Ciphertext size can reveal

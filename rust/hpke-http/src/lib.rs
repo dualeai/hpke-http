@@ -25,13 +25,25 @@
 //!
 //! `header` ends after the PSK ID. HPKE `info` is
 //! `"message/hpke-http request\0v2\0" || header`; request AEAD AAD is empty.
-//! The PSK must have at least 32 bytes and must differ from its public ID.
+//! The PSK must be at least 32 bytes long, contain at least 32 bytes of
+//! entropy, and differ from its public ID.
 //! Normal request plaintext is a canonical known-length Binary HTTP request.
 //! If the client opts into private body coding, plaintext is
 //! `0x04 || request_coding:u8 || response_coding:u8 || BHTTP_request`.
 //! Coding IDs are 0 (identity), 1 (gzip), and 2 (zstd). Only the body bytes
 //! are coded; the logical headers and `Content-Length` name clear bytes.
 //! Coding is off by default because compressed length can leak information.
+//!
+//! # Public key discovery
+//!
+//! The crate does no HTTP I/O. A host can call [`Server::public_key`] to
+//! publish its current X25519 public key. The Python ASGI host serves one
+//! binary record through GET at the same HTTPS URL that accepts protected
+//! POST: `"HHKD" || 0x01 || id_len:u8 || id || public_key[32]`. `id_len` is
+//! 1 through 255, and the complete record is 39 through 293 bytes. The key
+//! record version is separate from [`PROTOCOL_ID`]. Clients bind this GET and
+//! the later POST to one configured HTTPS endpoint and one logical origin.
+//! The host must keep the one Server key equal across its workers.
 //!
 //! After request authentication and parsing, the server checks the client
 //! time against [`REQUEST_LIFETIME_SECS`] and [`CLOCK_SKEW_SECS`]. The replay
@@ -92,12 +104,17 @@
 //! # Complete finite transaction
 //!
 //! ```
-//! use hpke_http::{Client, Limits, Method, Request, Response, Server, generate_key_pair};
+//! use hpke_http::{
+//!     Client, EntropySource, Limits, Method, Request, Response, Server, SystemEntropy,
+//!     generate_key_pair,
+//! };
 //!
 //! let keys = generate_key_pair()?;
 //! let (private, public) = keys.into_parts();
 //! let key_id = b"primary".to_vec();
-//! let psk = vec![0x42; 32];
+//! let mut psk = vec![0; 32];
+//! let mut entropy = SystemEntropy;
+//! entropy.fill(&mut psk)?;
 //! let psk_id = b"tenant".to_vec();
 //! let client = Client::new(&public, key_id.clone(), psk.clone(), psk_id.clone(), Limits::default())?;
 //! let server = Server::new(&private, key_id, Limits::default())?;
@@ -156,7 +173,7 @@ pub use sse::SseSplitter;
 /// Language-neutral protocol identifier.
 pub const PROTOCOL_ID: &str = "hpke-http/2";
 /// Boundary ABI version used by the first-party bindings.
-pub const BINDING_ABI_VERSION: u32 = 2;
+pub const BINDING_ABI_VERSION: u32 = 3;
 /// Time for which a newly created request can be accepted (five minutes).
 pub const REQUEST_LIFETIME_SECS: u64 = 300;
 /// Maximum accepted client/server clock difference (30 seconds).

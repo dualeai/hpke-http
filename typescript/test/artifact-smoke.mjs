@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 
 const binding = await import("@dualeai/hpke-http/node");
+const browser = await import("@dualeai/hpke-http/browser");
 await binding.initialize();
 assert.equal(binding.isInitialized(), true);
 assert.equal(binding.PROTOCOL_ID, "hpke-http/2");
-assert.equal(binding.BINDING_ABI_VERSION, 2);
+assert.equal(binding.BINDING_ABI_VERSION, 3);
+assert.equal(typeof browser.createHpkeFetch, "function");
 if (process.env.EXPECTED_VERSION !== undefined) {
   assert.equal(binding.PACKAGE_VERSION, process.env.EXPECTED_VERSION);
 }
@@ -91,4 +93,33 @@ try {
 } finally {
   liveClient.close();
   liveServer.close();
+}
+
+const discoveryServer = new binding.Server(keys.privateKey, keyId);
+const calls = [];
+const discovery = binding.createHpkeFetch({
+  endpoint: "https://artifact.example.test/protected",
+  key: { kind: "discover" },
+  psk,
+  pskId,
+  fetch: async (input, init) => {
+    const request = new Request(input, init);
+    calls.push(request.method);
+    if (request.method === "GET") {
+      const record = new Uint8Array([0x48, 0x48, 0x4b, 0x44, 1, keyId.byteLength, ...keyId, ...keys.publicKey]);
+      return new Response(record, { status: 200, headers: { "content-type": "application/octet-stream" } });
+    }
+    const opened = discoveryServer.preparse(new Uint8Array(await request.arrayBuffer()))
+      .authenticate(psk).admit({ accepted: true });
+    const body = opened.protectResponse({ status: 200, body: text.encode("artifact-discovery-ok") });
+    return new Response(body, { status: 200, headers: { "content-type": binding.RESPONSE_MEDIA_TYPE } });
+  },
+});
+try {
+  const response = await discovery("https://artifact.example.test/items");
+  assert.equal(await response.text(), "artifact-discovery-ok");
+  assert.deepEqual(calls, ["GET", "POST"]);
+} finally {
+  discovery.close();
+  discoveryServer.close();
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from importlib.metadata import version as distribution_version
 
@@ -27,10 +28,13 @@ def main() -> None:
     expected_version = sys.argv[1] if len(sys.argv) > 1 else distribution_version("hpke_http")
     if expected_version != PACKAGE_VERSION or expected_version != distribution_version("hpke_http"):
         raise RuntimeError("installed Python package version does not match the release candidate")
-    if PROTOCOL_ID != "hpke-http/2" or BINDING_ABI_VERSION != 2:
+    if PROTOCOL_ID != "hpke-http/2" or BINDING_ABI_VERSION != 3:
         raise RuntimeError("installed Python binding identity is incoherent")
 
     keys = generate_key_pair()
+    with Server(keys.private_key, KEY_ID) as key_server:
+        if key_server.public_key != keys.public_key:
+            raise RuntimeError("installed Python server returned the wrong public key")
     with (
         Client(keys.public_key, KEY_ID, PSK, PSK_ID) as client,
         Server(keys.private_key, KEY_ID) as server,
@@ -84,6 +88,48 @@ def main() -> None:
         finally:
             sealer.close()
             opener.close()
+
+    asyncio.run(check_adapter_discovery(keys.private_key))
+
+
+async def check_adapter_discovery(private_key: bytes) -> None:
+    """Use the installed HTTPX adapter and import all optional adapters."""
+    import httpx
+
+    from hpke_http.middleware import Discover
+    from hpke_http.middleware.aiohttp import HPKEClientSession
+    from hpke_http.middleware.fastapi import HPKEMiddleware
+    from hpke_http.middleware.httpx import HPKEAsyncClient
+
+    if not (
+        HPKEClientSession.__module__.startswith("hpke_http.") and HPKEMiddleware.__module__.startswith("hpke_http.")
+    ):
+        raise RuntimeError("installed Python package omitted an adapter")
+    server = Server(private_key, KEY_ID)
+    calls: list[str] = []
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            record = b"HHKD\x01" + bytes((len(KEY_ID),)) + KEY_ID + server.public_key
+            return httpx.Response(200, headers={"content-type": "application/octet-stream"}, content=record)
+        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        body = opened.protect_response(Response(status=200, body=b"artifact-discovery-ok"))
+        return httpx.Response(200, headers={"content-type": "message/hpke-http-response"}, content=body)
+
+    try:
+        async with HPKEAsyncClient(
+            "https://artifact.example.test/protected",
+            Discover(),
+            PSK,
+            PSK_ID,
+            transport=httpx.MockTransport(transport),
+        ) as client:
+            response = await client.get("https://artifact.example.test/items")
+            if response.content != b"artifact-discovery-ok" or calls != ["GET", "POST"]:
+                raise RuntimeError("installed Python discovery call failed")
+    finally:
+        server.close()
 
 
 if __name__ == "__main__":
