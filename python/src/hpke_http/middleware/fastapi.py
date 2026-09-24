@@ -4,23 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import tempfile
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from urllib.parse import unquote
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from hpke_http.middleware._discovery import KEY_MEDIA_TYPE, encode_key_record, https_origin
+from hpke_http.middleware._discovery import (
+    KEY_MEDIA_TYPE,
+    encode_key_record,
+    https_origin,
+)
 from hpke_http.middleware._native_async import run_native
 from hpke_http.protocol import (
     Limits,
-    OpenedRequest,
+    OpenedStreamRequest,
     ProtocolError,
-    Request,
+    RequestHead,
     Response,
     ResponseSealer,
     Server,
     SseSplitter,
+    StreamResponseRight,
 )
 from hpke_http.transport import (
     REQUEST_MEDIA_TYPE,
@@ -29,7 +35,6 @@ from hpke_http.transport import (
     filter_request_headers,
     filter_response_headers,
     max_body_len,
-    max_envelope_len,
     media_type,
 )
 
@@ -41,6 +46,7 @@ ReplayAdmitter = Callable[[bytes, int, Scope], bool | Awaitable[bool]]
 _DEFAULT_LIMITS = Limits()
 _OK_STATUS = 200
 _METHOD_NOT_ALLOWED_STATUS = 405
+_REQUEST_FIXED_HEADER_LEN = 21
 
 
 def _seal_next_sse_block(
@@ -51,6 +57,33 @@ def _seal_next_sse_block(
 ) -> tuple[int, bytes | None]:
     used, block = splitter.feed(chunk, offset, 64 * 1024)
     return used, None if block is None else sealer.seal_sse_block(block)
+
+
+def _store_checked_record(
+    opened: OpenedStreamRequest,
+    source: bytes,
+    offset: int,
+    spool: tempfile.SpooledTemporaryFile[bytes],
+) -> tuple[int, str | None]:
+    used, record = opened.feed(source, offset)
+    if record is None:
+        return used, None
+    kind, data = record
+    if kind == "data":
+        spool.write(data)
+    return used, kind
+
+
+def _finish_checked_request(
+    opened: OpenedStreamRequest, spool: tempfile.SpooledTemporaryFile[bytes]
+) -> StreamResponseRight:
+    response_right = opened.finish_eof()
+    try:
+        spool.seek(0)
+    except BaseException:
+        response_right.close()
+        raise
+    return response_right
 
 
 class HPKEMiddleware:
@@ -76,8 +109,12 @@ class HPKEMiddleware:
     The middleware closes its native server after the application's ASGI
     lifespan ends. With a host that does not send lifespan events, construct
     this wrapper directly so the application can retain it and call
-    :meth:`close` during host shutdown. ``compression=True`` accepts the
-    optional Rust protocol body-coding extension, not HTTP representation coding.
+    :meth:`close` during host shutdown. Rust checks each DATA tag before it
+    decodes raw or zstd bytes. This is not HTTP representation coding.
+
+    A protected request is checked through END and outer EOF before the app
+    starts. Its body moves to a temporary file after 256 KiB and then reaches
+    the app through normal ASGI request events.
     """
 
     def __init__(
@@ -90,19 +127,17 @@ class HPKEMiddleware:
         *,
         transport_path: str,
         limits: Limits = _DEFAULT_LIMITS,
-        compression: bool = False,
         expected_authority: str | None = None,
     ) -> None:
         if not transport_path.startswith("/") or "?" in transport_path or "#" in transport_path:
             raise ValueError("transport_path must be one local path")
         self.app = app
-        self._server = Server(recipient_private_key, recipient_key_id, limits=limits, compression=compression)
+        self._server = Server(recipient_private_key, recipient_key_id, limits=limits)
         self._key_record = encode_key_record(recipient_key_id, self._server.public_key)
         self._psk_resolver = psk_resolver
         self._replay_admitter = replay_admitter
         self._transport_path = transport_path
         self._expected_authority = expected_authority
-        self._max_request_envelope_len = max_envelope_len(limits)
         self._max_response_body_len = max_body_len(limits)
 
     def close(self) -> None:
@@ -138,24 +173,17 @@ class HPKEMiddleware:
             if method == "GET":
                 await _send_key_record(send, self._key_record)
                 return
-            headers = _validated_outer_headers(scope)
-            try:
-                envelope = await _read_body(receive, headers, self._max_request_envelope_len)
-            except ValueError as error:
-                raise _HTTPBoundaryError(400, b"invalid protected request") from error
-            opened = await self._open(envelope, scope)
-            try:
-                await self._run_application(opened.request, opened, scope, receive, send)
-            finally:
-                opened.close()
+            _validated_outer_headers(scope)
+            await self._run_request(scope, receive, send)
         except _HTTPBoundaryError as failure:
             await _send_error(send, failure.status, failure.body)
             return
 
-    async def _open(self, envelope: bytes, scope: Scope) -> OpenedRequest:
+    async def _run_request(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            preparsed = self._server.preparse(envelope)
-        except ProtocolError as error:
+            first, pending, pending_offset, more = await _read_stream_start(self._server, receive)
+            preparsed = self._server.preparse_stream(first)
+        except (ProtocolError, ValueError) as error:
             raise _HTTPBoundaryError(400, b"invalid protected request") from error
         try:
             try:
@@ -168,51 +196,72 @@ class HPKEMiddleware:
             try:
                 authenticated = await run_native(preparsed.authenticate, psk)
             except ProtocolError as error:
-                status, body = {
-                    "clock_unavailable": (503, b"trusted clock unavailable"),
-                    "invalid_request_time": (409, b"protected request time rejected"),
-                }.get(error.code, (400, b"invalid protected request"))
-                raise _HTTPBoundaryError(status, body) from error
+                if error.code == "clock_unavailable":
+                    raise _HTTPBoundaryError(503, b"trusted clock unavailable") from error
+                if error.code == "invalid_request_time":
+                    raise _HTTPBoundaryError(409, b"protected request time rejected") from error
+                raise _HTTPBoundaryError(400, b"invalid protected request") from error
         finally:
             preparsed.close()
-
         try:
             try:
                 admission_result = self._replay_admitter(
-                    authenticated.replay_id,
-                    authenticated.retain_until_exclusive,
-                    scope,
+                    authenticated.replay_id, authenticated.retain_until_exclusive, scope
                 )
                 accepted = await admission_result if inspect.isawaitable(admission_result) else admission_result
             except Exception as error:
                 raise _HTTPBoundaryError(503, b"replay admission unavailable") from error
             if accepted is not True:
                 raise _HTTPBoundaryError(409, b"protected request replay rejected")
-            try:
-                return authenticated.admit(accepted=True)
-            except ProtocolError as error:
-                if error.code == "clock_unavailable":
-                    raise _HTTPBoundaryError(503, b"trusted clock unavailable") from error
-                if error.code == "invalid_request_time":
-                    raise _HTTPBoundaryError(409, b"protected request expired before dispatch") from error
-                raise _HTTPBoundaryError(400, b"invalid replay admission") from error
+            opened = authenticated.admit(accepted=True)
         finally:
             authenticated.close()
+        try:
+            await self._run_checked_application(opened, pending, pending_offset, scope, receive, send, more=more)
+        finally:
+            opened.close()
 
-    async def _run_application(
-        self, request: Request, opened: OpenedRequest, scope: Scope, receive: Receive, send: Send
+    async def _run_checked_application(
+        self,
+        opened: OpenedStreamRequest,
+        pending: bytes,
+        pending_offset: int,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        more: bool,
     ) -> None:
         try:
-            target_allowed = _target_is_allowed(
-                scope,
-                request.authority,
-                self._expected_authority,
-            )
+            allowed = _target_is_allowed(scope, opened.head.authority, self._expected_authority)
         except (UnicodeError, ValueError, TransportError):
-            target_allowed = False
-        if not target_allowed:
+            allowed = False
+        if not allowed:
             raise _HTTPBoundaryError(421, b"authenticated target does not match this endpoint")
+        try:
+            with tempfile.SpooledTemporaryFile(max_size=256 * 1024, mode="w+b") as spool:
+                response_right = await _copy_checked_request(
+                    opened, receive, pending, pending_offset, more=more, spool=spool
+                )
+                try:
+                    await self._run_application(opened.head, response_right, scope, receive, send, spooled_body=spool)
+                finally:
+                    response_right.close()
+        except (ProtocolError, ValueError) as error:
+            raise _HTTPBoundaryError(400, b"invalid protected request") from error
+        except OSError as error:
+            raise _HTTPBoundaryError(503, b"request storage unavailable") from error
 
+    async def _run_application(
+        self,
+        request: RequestHead,
+        opened: StreamResponseRight,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        spooled_body: tempfile.SpooledTemporaryFile[bytes],
+    ) -> None:
         response_done = asyncio.Event()
         sink = _ResponseSink(opened, send, self._max_response_body_len, request.method.value, response_done)
         try:
@@ -220,7 +269,7 @@ class HPKEMiddleware:
         except TransportError as error:
             raise _HTTPBoundaryError(400, b"unsupported authenticated request content coding") from error
         peer_disconnected = asyncio.Event()
-        inner_receive = _checked_receive(request.body, peer_disconnected, response_done)
+        inner_receive = _spooled_receive(spooled_body, peer_disconnected, response_done)
         watcher = asyncio.create_task(_watch_disconnect(receive, peer_disconnected))
         app = asyncio.ensure_future(self.app(inner_scope, inner_receive, sink.send))
         try:
@@ -253,7 +302,7 @@ class HPKEMiddleware:
 
 class _ResponseSink:
     def __init__(
-        self, opened: OpenedRequest, outer_send: Send, maximum: int, method: str, response_done: asyncio.Event
+        self, opened: StreamResponseRight, outer_send: Send, maximum: int, method: str, response_done: asyncio.Event
     ) -> None:
         self._opened = opened
         self._outer_send = outer_send
@@ -339,11 +388,10 @@ class _ResponseSink:
             raise _ResponseCaptureError("application response exceeds the configured body limit")
         self._body.extend(chunk)
         if not more_body:
-            body = bytes(self._body)
-            if self._method == "HEAD":
-                body = b""
-            elif self._status in {204, 205, 304} and body:
+            if self._method != "HEAD" and self._status in {204, 205, 304} and self._body:
                 raise _ResponseCaptureError("application returned a forbidden response body")
+            body = b"" if self._method == "HEAD" else bytes(self._body)
+            self._body = bytearray()
             headers = tuple(filter_response_headers(self._headers))
             envelope = await run_native(
                 self._opened.protect_response,
@@ -377,6 +425,71 @@ class _ResponseSink:
             self._sealer.close()
         if self._splitter is not None:
             self._splitter.close()
+
+
+async def _read_stream_start(server: Server, receive: Receive) -> tuple[bytes, bytes, int, bool]:
+    first = bytearray()
+    pending = b""
+    pending_offset = 0
+    more = True
+    needed: int | None = None
+    while True:
+        if needed is not None and len(first) == needed:
+            return bytes(first), pending, pending_offset, more
+        if len(first) < _REQUEST_FIXED_HEADER_LEN:
+            target = _REQUEST_FIXED_HEADER_LEN
+        elif needed is None:
+            frame_header_end = _REQUEST_FIXED_HEADER_LEN + first[5] + first[6] + 32 + 4
+            if len(first) < frame_header_end:
+                target = frame_header_end
+            else:
+                needed = server.stream_start_length(bytes(first))
+                if needed is None:
+                    raise ValueError("protected START frame length is missing")
+                target = needed
+        else:
+            target = needed
+        if pending_offset == len(pending):
+            if not more:
+                raise ValueError("protected START is incomplete")
+            message = await receive()
+            if message["type"] != "http.request":
+                raise ValueError("client disconnected before START")
+            pending = bytes(message.get("body", b""))
+            pending_offset = 0
+            more = bool(message.get("more_body", False))
+            if not pending:
+                continue
+        take = min(target - len(first), len(pending) - pending_offset)
+        first.extend(pending[pending_offset : pending_offset + take])
+        pending_offset += take
+
+
+async def _copy_checked_request(
+    opened: OpenedStreamRequest,
+    receive: Receive,
+    pending: bytes,
+    offset: int,
+    *,
+    more: bool,
+    spool: tempfile.SpooledTemporaryFile[bytes],
+) -> StreamResponseRight:
+    while True:
+        if offset < len(pending):
+            used, kind = await run_native(_store_checked_record, opened, pending, offset, spool)
+            offset += used
+            if used == 0 and kind is None:
+                raise ValueError("protected request reader made no progress")
+            continue
+        pending = b""
+        offset = 0
+        if not more:
+            return await run_native(_finish_checked_request, opened, spool)
+        message = await receive()
+        if message["type"] != "http.request":
+            raise ValueError("client disconnected during upload")
+        pending = bytes(message.get("body", b""))
+        more = bool(message.get("more_body", False))
 
 
 class _ResponseCaptureError(RuntimeError):
@@ -419,28 +532,6 @@ def _single_header(fields: Iterable[tuple[str, str]], name: str) -> str | None:
     return values[0] if values else None
 
 
-async def _read_body(receive: Receive, headers: list[tuple[str, str]], maximum: int) -> bytes:
-    declared = _single_header(headers, "content-length")
-    if declared is not None and declared.isdecimal() and int(declared) > maximum:
-        raise ValueError("protected request exceeds the configured limit")
-    body = bytearray()
-    length = 0
-    more = True
-    while more:
-        message = await receive()
-        if message["type"] == "http.disconnect":
-            raise ValueError("client disconnected")
-        if message["type"] != "http.request":
-            raise ValueError("invalid ASGI request sequence")
-        chunk = bytes(message.get("body", b""))
-        length += len(chunk)
-        if length > maximum:
-            raise ValueError("protected request exceeds the configured limit")
-        body.extend(chunk)
-        more = bool(message.get("more_body", False))
-    return bytes(body)
-
-
 def _target_is_allowed(
     scope: Scope,
     authority: str,
@@ -450,12 +541,11 @@ def _target_is_allowed(
     return expected is not None and https_origin(f"https://{authority}/") == https_origin(f"https://{expected}/")
 
 
-def _inner_scope(scope: Scope, request: Request) -> Scope:
+def _inner_scope(scope: Scope, request: RequestHead) -> Scope:
     raw_path, separator, query = request.path.partition("?")
     logical_fields = filter_request_headers((field.name, field.value) for field in request.headers)
     fields = [(field.name.encode("ascii"), field.value.encode("ascii")) for field in logical_fields]
     fields.append((b"host", request.authority.encode("ascii")))
-    fields.append((b"content-length", str(len(request.body)).encode()))
     inner = dict(scope)
     inner.update(
         {
@@ -470,7 +560,9 @@ def _inner_scope(scope: Scope, request: Request) -> Scope:
     return inner
 
 
-def _checked_receive(body: bytes, peer_disconnected: asyncio.Event, response_done: asyncio.Event) -> Receive:
+def _spooled_receive(
+    spool: tempfile.SpooledTemporaryFile[bytes], peer_disconnected: asyncio.Event, response_done: asyncio.Event
+) -> Receive:
     delivered = False
 
     async def receive() -> Message:
@@ -485,8 +577,11 @@ def _checked_receive(body: bytes, peer_disconnected: asyncio.Event, response_don
                 wait_done.cancel()
                 await asyncio.gather(wait_peer, wait_done, return_exceptions=True)
             return {"type": "http.disconnect"}
+        part = await run_native(spool.read, 64 * 1024)
+        if part:
+            return {"type": "http.request", "body": part, "more_body": True}
         delivered = True
-        return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.request", "body": b"", "more_body": False}
 
     return receive
 

@@ -1,8 +1,8 @@
 //! `CodSpeed` measures the public Rust transaction without transport or fixture setup.
 
 use hpke_http::{
-    Client, CompressionCoding, Error, HeaderField, Limits, Method, Request, Response,
-    ResponseRecord, Server, generate_key_pair,
+    Client, Error, HeaderField, Limits, Method, Request, Response, ResponseRecord, Server,
+    generate_key_pair,
 };
 
 fn main() {
@@ -28,15 +28,10 @@ fn transaction(
 
 #[divan::bench(args = [0, 1024, 1024 * 1024, 8 * 1024 * 1024])]
 fn roundtrip(bencher: divan::Bencher, size: usize) {
-    bench_roundtrip(bencher, size, None);
+    bench_roundtrip(bencher, size);
 }
 
-#[divan::bench(args = [CompressionCoding::Gzip, CompressionCoding::Zstd])]
-fn compressed_roundtrip(bencher: divan::Bencher, coding: CompressionCoding) {
-    bench_roundtrip(bencher, 1024 * 1024, Some(coding));
-}
-
-fn bench_roundtrip(bencher: divan::Bencher, size: usize, compression: Option<CompressionCoding>) {
+fn bench_roundtrip(bencher: divan::Bencher, size: usize) {
     let keys = match generate_key_pair() {
         Ok(keys) => keys,
         Err(error) => {
@@ -47,7 +42,7 @@ fn bench_roundtrip(bencher: divan::Bencher, size: usize, compression: Option<Com
     let (private_key, public_key) = keys.into_parts();
     let key_id = b"benchmark-key".to_vec();
     let psk = b"a 32-byte minimum benchmark credential".to_vec();
-    let mut client = match Client::new(
+    let client = match Client::new(
         &public_key,
         key_id.clone(),
         psk.clone(),
@@ -60,17 +55,13 @@ fn bench_roundtrip(bencher: divan::Bencher, size: usize, compression: Option<Com
             std::process::exit(1);
         }
     };
-    let mut server = match Server::new(&private_key, key_id, Limits::default()) {
+    let server = match Server::new(&private_key, key_id, Limits::default()) {
         Ok(server) => server,
         Err(error) => {
             eprintln!("benchmark setup failed: {error}");
             std::process::exit(1);
         }
     };
-    if let Some(coding) = compression {
-        client = client.with_compression(coding);
-        server = server.with_compression();
-    }
     let request = Request {
         method: Method::Post,
         authority: b"api.example.test".to_vec(),
@@ -108,7 +99,7 @@ fn sse_transaction(
         name: b"content-type".to_vec(),
         value: b"text/event-stream".to_vec(),
     }];
-    let (mut writer, start) = opened.response.into_sealer(200, headers, None)?;
+    let (mut writer, start) = opened.response.into_sealer(200, headers)?;
     let mut reader = response_token.into_opener();
     if !matches!(reader.feed(&start)?.1, Some(ResponseRecord::Start(_))) {
         return Err(Error::MalformedEnvelope);

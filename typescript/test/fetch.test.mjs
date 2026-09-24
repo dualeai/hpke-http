@@ -554,10 +554,95 @@ test("Fetch uses the runtime transport when no transport is injected", async () 
   }
 });
 
-test("native Fetch opts into Rust body coding without HTTP content coding", async () => {
+test("real Node Fetch sends checked upload data before its source ends", async () => {
   await initialize();
   const keys = generateKeyPair();
-  const server = new Server(keys.privateKey, KEY_ID, {}, true);
+  const serverEngine = new Server(keys.privateKey, KEY_ID);
+  let releaseSource;
+  const sourceGate = new Promise((resolve) => { releaseSource = resolve; });
+  let sawData;
+  const dataOnWire = new Promise((resolve) => { sawData = resolve; });
+  let sourceEnded = false;
+  const source = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(64 * 1024).fill(0x41)); },
+    async pull(controller) {
+      await sourceGate;
+      controller.enqueue(new Uint8Array([0x42]));
+      controller.close();
+      sourceEnded = true;
+    },
+  });
+  const httpServer = createServer((request, response) => {
+    void (async () => {
+      assert.equal(request.method, "POST");
+      assert.equal(request.headers["content-type"], REQUEST_MEDIA_TYPE);
+      let start = Buffer.alloc(0);
+      let opened;
+      const clearParts = [];
+      for await (const part of request) {
+        let bytes = Buffer.from(part);
+        if (opened === undefined) {
+          start = Buffer.concat([start, bytes]);
+          const firstLength = serverEngine.streamStartLength(start);
+          if (firstLength === undefined || start.byteLength < firstLength) continue;
+          opened = serverEngine.preparseStream(start.subarray(0, firstLength))
+            .authenticate(PSK).admit({ accepted: true });
+          assert.equal(opened.head.path, "/stream");
+          bytes = start.subarray(firstLength);
+        }
+        for (let offset = 0; offset < bytes.byteLength;) {
+          const result = opened.feed(bytes.subarray(offset));
+          assert.ok(result.consumed > 0);
+          offset += result.consumed;
+          if (result.record?.kind === "data") {
+            clearParts.push(Buffer.from(result.record.block));
+            sawData();
+          }
+        }
+      }
+      assert.ok(opened);
+      assert.deepEqual(Buffer.concat(clearParts), Buffer.concat([
+        Buffer.alloc(64 * 1024, 0x41), Buffer.from([0x42]),
+      ]));
+      const right = opened.finishEof();
+      response.writeHead(200, { "content-type": RESPONSE_MEDIA_TYPE });
+      response.end(right.protectResponse({ status: 200, body: new TextEncoder().encode("ok") }));
+    })().catch((error) => response.destroy(error));
+  });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  const address = httpServer.address();
+  assert.ok(address && typeof address !== "string");
+  const relay = `http://127.0.0.1:${address.port}/protected`;
+  const hpkeFetch = createHpkeFetch({
+    endpoint: "https://api.example.test/protected",
+    key: { kind: "pin", publicKey: keys.publicKey, keyId: KEY_ID },
+    psk: PSK, pskId: PSK_ID,
+    fetch: (_input, init) => fetch(relay, init),
+  });
+  try {
+    const pending = hpkeFetch("https://api.example.test/stream", {
+      method: "POST", body: source, duplex: "half",
+    });
+    await within(Promise.race([
+      dataOnWire,
+      pending.then(() => { throw new Error("Fetch returned before the upload source ended"); }),
+    ]), 5000);
+    assert.equal(sourceEnded, false);
+    releaseSource();
+    assert.equal(await (await within(pending, 5000)).text(), "ok");
+  } finally {
+    releaseSource();
+    hpkeFetch.close();
+    serverEngine.close();
+    httpServer.closeAllConnections();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("native Fetch uses Rust zstd body coding without HTTP content coding", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
   const body = "a".repeat(16 * 1024);
   const transport = async (input, init) => {
     const outer = new Request(input, init);
@@ -579,7 +664,6 @@ test("native Fetch opts into Rust body coding without HTTP content coding", asyn
     endpoint: "https://api.example.test/protected", key: { kind: "pin", publicKey: keys.publicKey, keyId: KEY_ID },
     psk: PSK,
     pskId: PSK_ID,
-    compression: "zstd",
     fetch: transport,
   });
   const response = await hpkeFetch("https://api.example.test/compressed", {
@@ -795,13 +879,13 @@ test("Fetch adapter bounds bodies and never exposes a tampered response", async 
     endpoint: "https://api.example.test/protected", key: { kind: "pin", publicKey: keys.publicKey, keyId: KEY_ID },
     psk: PSK,
     pskId: PSK_ID,
-    limits: { maxBodyLength: 4 },
+    limits: { maxBodyLength: 4, maxRequestBytes: 4 },
     fetch: transport,
   });
 
   await assert.rejects(
     hpkeFetch("https://api.example.test/items", { method: "POST", body: "12345" }),
-    (error) => error instanceof FetchTransportError && error.code === "request_too_large",
+    (error) => error instanceof ProtocolError && error.code === "limit_exceeded",
   );
   await assert.rejects(
     hpkeFetch("https://api.example.test/ping", { method: "POST", body: "ping" }),
@@ -832,6 +916,7 @@ test("Fetch limits reject values that WebAssembly integer coercion could change"
     ["maxHeaderBytes", 64 * 1024 + 1],
     ["maxHeaderCount", 257],
     ["maxTargetLength", 8 * 1024 + 1],
+    ["maxRequestBytes", 4 * 1024 * 1024 * 1024 + 1],
   ]) {
     assert.throws(
       () =>
@@ -841,6 +926,17 @@ test("Fetch limits reject values that WebAssembly integer coercion could change"
           pskId: PSK_ID,
           limits: { [name]: value },
         }),
+      (error) => error instanceof ProtocolError && error.code === "invalid_configuration",
+    );
+  }
+  for (const value of [0, Number.NaN, 1.5]) {
+    assert.throws(
+      () => createHpkeFetch({
+        endpoint: "https://api.example.test/protected",
+        key: { kind: "pin", publicKey: keys.publicKey, keyId: KEY_ID },
+        psk: PSK, pskId: PSK_ID,
+        limits: { maxRequestBytes: value },
+      }),
       (error) => error instanceof ProtocolError && error.code === "invalid_configuration",
     );
   }

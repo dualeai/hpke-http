@@ -1,12 +1,35 @@
-"""One raw-byte driver for checked HTTPX and aiohttp response records."""
+"""Shared request writer and response reader for HTTPX and aiohttp."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from hpke_http.protocol import CheckedRecord, Header, ProtocolError, Response, ResponseOpener, StateError
+from hpke_http.middleware._native_async import run_native
+from hpke_http.protocol import (
+    STREAM_DATA_LEN,
+    CheckedRecord,
+    Header,
+    ProtocolError,
+    Response,
+    ResponseOpener,
+    StateError,
+    StreamRequestSealer,
+)
 from hpke_http.transport import TransportError
+
+
+async def seal_request_chunk(sealer: StreamRequestSealer, chunk: bytes) -> AsyncIterator[bytes]:
+    """Send one source chunk to the native writer and yield complete records."""
+    data = bytes(chunk)
+    offset = 0
+    while offset < len(data):
+        used, frame = await run_native(sealer.push, data[offset : offset + STREAM_DATA_LEN])
+        if used == 0 and frame is None:
+            raise RuntimeError("native request writer made no progress")
+        offset += used
+        if frame is not None:
+            yield frame
 
 
 class CheckedStream:

@@ -1,5 +1,6 @@
 import { Client, ProtocolError, ResponseOpener, StateError, normalizeLimits } from "./index.js";
-import type { CheckedRecord, CompressionCoding, Header, Limits, Method, Request as PlaintextRequest, Response as PlaintextResponse } from "./index.js";
+import type { CheckedRecord, Header, Limits, Method, ProtectedRequest, Request as PlaintextRequest, RequestHead, Response as PlaintextResponse, StreamFinishedRequest, StreamRequestSealer } from "./index.js";
+import { isMethod } from "./method.js";
 
 /** Media type of an outer protected request envelope. */
 export const REQUEST_MEDIA_TYPE = "message/hpke-http-request";
@@ -39,8 +40,10 @@ export type FetchTransport = typeof globalThis.fetch;
 /**
  * Stable failures produced by the Fetch boundary.
  *
- * Target, request-body-limit, and request content-coding failures occur before
- * an outer request. Network and `outer_*` failures occur during the envelope
+ * Target and request content-coding failures occur before an outer request.
+ * `request_too_large` comes from the bounded byte-body path. A streamed source
+ * can reach the native request limit during POST and raise `limit_exceeded`.
+ * Network and `outer_*` failures occur during the envelope
  * exchange. `inner_content_encoding` can also describe an authenticated
  * response; `invalid_inner_response` describes a response that Web Fetch
  * cannot represent.
@@ -58,7 +61,7 @@ export type FetchTransportErrorCode =
   | "discovery_status"
   | "discovery_response";
 
-/** A transport or logical-message error from the bounded Fetch adapter. */
+/** A transport or logical-message error from the Fetch adapter. */
 export class FetchTransportError extends Error {
   public readonly code: FetchTransportErrorCode;
   public readonly statusCode?: number;
@@ -101,9 +104,6 @@ export interface HpkeFetchConfiguration {
   /** Optional message limits. Omitted fields use the shared engine defaults. */
   readonly limits?: Limits;
 
-  /** Opt-in Rust-owned protocol body coding, separate from HTTP representation coding. */
-  readonly compression?: CompressionCoding;
-
   /** Inject a Fetch-compatible transport. The default is `globalThis.fetch`. */
   readonly fetch?: FetchTransport;
 }
@@ -133,8 +133,9 @@ export interface HpkeFetch {
  *
  * The returned function uses the URL, method, headers, body, and signal from a
  * Fetch request input. Discovery gets one public key from the fixed endpoint
- * before each call; a pin sends no GET. It protects the complete logical request, sends one POST
- * envelope, checks START, and returns a live `Response` for SSE. The platform's
+ * before each call; a pin sends no GET. It sends one protected POST with a
+ * byte body or a streamed body, based on the runtime and request size. It
+ * checks START and returns a live `Response` for SSE. The platform's
  * `Headers` implementation may combine repeated authenticated fields;
  * cookie-setting fields are omitted.
  * Use the low-level client when exact response field-list preservation matters.
@@ -162,14 +163,10 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
   if (psk.byteLength < 32 || pskId.byteLength < 1 || pskId.byteLength > 255 || bytesEqual(psk, pskId)) {
     throw new ProtocolError("invalid_configuration", "invalid PSK or PSK identity");
   }
-  if (configuration.compression !== undefined &&
-      configuration.compression !== "gzip" && configuration.compression !== "zstd") {
-    throw new ProtocolError("invalid_configuration", "unsupported protocol body coding");
-  }
   const pinnedClient = configuration.key.kind === "pin"
     ? new Client(
       configuration.key.publicKey, configuration.key.keyId,
-      psk, pskId, limits, configuration.compression,
+      psk, pskId, limits,
     )
     : undefined;
   if (configuration.key.kind !== "pin" && configuration.key.kind !== "discover") {
@@ -177,6 +174,7 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
   }
   const maxRequestLength = limits.maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
   const active = new Set<RecordPump>();
+  const activeUploads = new Set<(reason?: unknown) => void>();
   let closed = false;
 
   const hpkeFetch = async (
@@ -187,20 +185,20 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       throw new StateError();
     }
 
-    const request = new globalThis.Request(input, init);
+    const request = input instanceof globalThis.Request && init === undefined
+      ? input
+      : new globalThis.Request(input, init);
     const target = parseHttpsUrl(request.url);
     if (target.origin !== targetOrigin) {
       throw new FetchTransportError("invalid_target", "logical target has the wrong HTTPS origin");
     }
     const method = parseMethod(request.method);
     const headers = copyEndToEndHeaders(request.headers);
-    const body = await readBodyBounded(request.body, maxRequestLength, request.signal);
-    const plaintext: PlaintextRequest = {
+    const head: RequestHead = {
       method,
       authority: target.host,
       path: `${target.pathname}${target.search}`,
       headers,
-      body,
     };
     const discovered = pinnedClient === undefined;
     let requestClient = pinnedClient;
@@ -208,7 +206,7 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       const { keyId, publicKey } = await fetchKey(transport, endpoint, request.signal);
       if (closed) { throw new StateError(); }
       try {
-        requestClient = new Client(publicKey, keyId, psk, pskId, limits, configuration.compression);
+        requestClient = new Client(publicKey, keyId, psk, pskId, limits);
       } catch (error: unknown) {
         if (error instanceof ProtocolError) {
           throw new FetchTransportError("discovery_response", "key endpoint returned an unusable public key");
@@ -216,9 +214,29 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
         throw error;
       }
     }
-    let protectedRequest;
+    let envelope: RequestEnvelope;
     try {
-      protectedRequest = requestClient.protect(plaintext);
+      if (request.body !== null && isNodeRuntime() && supportsRequestStreaming()) {
+        envelope = makeStreamEnvelope(requestClient.beginStream(head), request.body, request.signal);
+      } else if (request.body !== null && !isNodeRuntime()) {
+        const inspected = await inspectBody(request.body, maxRequestLength, request.signal);
+        if (inspected.kind === "complete") {
+          envelope = makeFiniteEnvelope(requestClient.protect({ ...head, body: inspected.body }));
+        } else if (supportsRequestStreaming()) {
+          try {
+            envelope = makeStreamEnvelope(requestClient.beginStream(head), inspected.body, request.signal);
+          } catch (error: unknown) {
+            requestCancel(inspected.body, error);
+            throw error;
+          }
+        } else {
+          requestCancel(inspected.body, new FetchTransportError("request_too_large", "body exceeds the byte POST limit"));
+          throw new FetchTransportError("request_too_large", "body exceeds the byte POST limit");
+        }
+      } else {
+        const body = await readBodyBounded(request.body, maxRequestLength, request.signal);
+        envelope = makeFiniteEnvelope(requestClient.protect({ ...head, body }));
+      }
     } catch (error: unknown) {
       if (discovered && error instanceof ProtocolError &&
           (error.code === "invalid_configuration" || error.code === "crypto_failure")) {
@@ -229,19 +247,26 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       if (discovered) { requestClient.close(); }
     }
 
+    activeUploads.add(envelope.close);
     try {
       if (closed) { throw new StateError(); }
-      const outerResponse = await sendEnvelope(
-        transport,
-        endpoint,
-        protectedRequest.envelope,
-        request.signal,
-      );
+      let outerResponse: globalThis.Response;
+      try {
+        outerResponse = await sendEnvelope(
+          transport,
+          endpoint,
+          envelope.body,
+          request.signal,
+        );
+      } catch (error: unknown) {
+        throw envelope.failure() ?? error;
+      }
+      activeUploads.delete(envelope.close);
       validateOuterResponse(outerResponse);
       if (outerResponse.body === null) {
         throw new ProtocolError("malformed_envelope", "response START is missing");
       }
-      const pump = new RecordPump(outerResponse.body, protectedRequest.intoOpener(), request.signal, active);
+      const pump = new RecordPump(outerResponse.body, envelope.takeRight().intoOpener(), request.signal, active);
       active.add(pump);
       try {
         const first = await pump.next();
@@ -316,7 +341,8 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
         throw error;
       }
     } finally {
-      protectedRequest.close();
+      activeUploads.delete(envelope.close);
+      envelope.close();
     }
   };
 
@@ -325,6 +351,9 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       closed = true;
       for (const pump of active) {
         pump.close(new StateError());
+      }
+      for (const stop of activeUploads) {
+        stop(new StateError());
       }
       pinnedClient?.close();
       psk.fill(0);
@@ -420,28 +449,257 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
   return true;
 }
 
+interface ResponseRight {
+  intoOpener(): ResponseOpener;
+  close(): void;
+}
+
+interface RequestEnvelope {
+  readonly body: Uint8Array | ReadableStream<Uint8Array>;
+  takeRight(): ResponseRight;
+  failure(): unknown;
+  close(reason?: unknown): void;
+}
+
+function makeFiniteEnvelope(protectedRequest: ProtectedRequest): RequestEnvelope {
+  return {
+    body: protectedRequest.envelope,
+    takeRight: () => protectedRequest,
+    failure: () => undefined,
+    close: () => protectedRequest.close(),
+  };
+}
+
+function makeStreamEnvelope(
+  writer: StreamRequestSealer,
+  source: ReadableStream<Uint8Array> | null,
+  signal: AbortSignal,
+): RequestEnvelope {
+  const reader = source?.getReader();
+  let part: Uint8Array<ArrayBufferLike> = new Uint8Array();
+  let offset = 0;
+  let sourceEnded = reader === undefined;
+  let finished: StreamFinishedRequest | undefined;
+  let closed = false;
+  let streamEnded = false;
+  let failed: unknown;
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const close = (reason?: unknown): void => {
+    if (closed) { return; }
+    closed = true;
+    signal.removeEventListener("abort", onAbort);
+    writer.close();
+    finished?.close();
+    if (reader !== undefined && !sourceEnded) {
+      requestCancel(reader, reason);
+    }
+    if (!streamEnded && reason !== undefined) {
+      controllerRef?.error(reason);
+    }
+  };
+  const onAbort = (): void => close(abortReason(signal));
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller;
+      controller.enqueue(writer.start);
+    },
+    async pull(controller) {
+      try {
+        while (true) {
+          if (closed) { throw new StateError(); }
+          throwIfAborted(signal);
+          if (offset < part.byteLength) {
+            const remaining = part.subarray(offset);
+            const result = writer.push(remaining);
+            if (result.consumed > remaining.byteLength ||
+                (result.consumed === 0 && result.record === undefined)) {
+              throw new ProtocolError("malformed_envelope", "request writer made no progress");
+            }
+            offset += result.consumed;
+            if (result.record !== undefined) {
+              controller.enqueue(result.record);
+              return;
+            }
+            continue;
+          }
+          if (sourceEnded) {
+            finished = writer.finish();
+            controller.enqueue(finished.end);
+            streamEnded = true;
+            controller.close();
+            reader?.releaseLock();
+            return;
+          }
+          const next = await reader?.read();
+          if (next === undefined || next.done) {
+            sourceEnded = true;
+          } else {
+            part = next.value;
+            offset = 0;
+          }
+        }
+      } catch (error: unknown) {
+        failed = error;
+        close(error);
+      }
+    },
+    cancel: close,
+  }, { highWaterMark: 0 });
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) { onAbort(); }
+  return {
+    body,
+    failure: () => failed,
+    takeRight() {
+      if (finished === undefined) {
+        throw new FetchTransportError("network_error", "outer transport ended before the request body");
+      }
+      return finished;
+    },
+    close,
+  };
+}
+
+function supportsRequestStreaming(): boolean {
+  try {
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
+    const options: RequestInit & { duplex: "half" } = { method: "POST", body, duplex: "half" };
+    new globalThis.Request("https://hpke-http.invalid/", options);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isNodeRuntime(): boolean {
+  return typeof process !== "undefined" && typeof process.versions?.node === "string";
+}
+
+async function inspectBody(
+  body: ReadableStream<Uint8Array>,
+  maximum: number,
+  signal: AbortSignal,
+): Promise<{ readonly kind: "complete"; readonly body: Uint8Array } |
+           { readonly kind: "stream"; readonly body: ReadableStream<Uint8Array> }> {
+  throwIfAborted(signal);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let partial: Uint8Array | undefined;
+  let partialLength = 0;
+  let nextChunkSize = 1024;
+  let length = 0;
+  let transferred = false;
+  let rejectAbort: ((reason?: unknown) => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const onAbort = (): void => rejectAbort?.(abortReason(signal));
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    while (true) {
+      const next = await Promise.race([reader.read(), aborted]);
+      if (next.done) {
+        const bytes = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        if (partial !== undefined) {
+          bytes.set(partial.subarray(0, partialLength), offset);
+        }
+        return { kind: "complete", body: bytes };
+      }
+      if (next.value.byteLength > maximum - length) {
+        const pending = partial === undefined
+          ? [...chunks, next.value]
+          : [...chunks, partial.subarray(0, partialLength), next.value];
+        let pendingIndex = 0;
+        let done = false;
+        transferred = true;
+        const stream = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (pendingIndex < pending.length) {
+              const queued = pending[pendingIndex++];
+              if (queued === undefined) { throw new StateError(); }
+              controller.enqueue(queued);
+              return;
+            }
+            try {
+              const part = await reader.read();
+              if (part.done) {
+                done = true;
+                controller.close();
+                reader.releaseLock();
+              } else {
+                controller.enqueue(part.value);
+              }
+            } catch (error: unknown) {
+              controller.error(error);
+              reader.releaseLock();
+            }
+          },
+          cancel(reason) {
+            if (!done) { requestCancel(reader, reason); }
+            reader.releaseLock();
+          },
+        }, { highWaterMark: 0 });
+        return { kind: "stream", body: stream };
+      }
+      const chunk = next.value;
+      length += chunk.byteLength;
+      let offset = 0;
+      while (offset < chunk.byteLength) {
+        if (partial === undefined && chunk.byteLength - offset >= MAX_BUFFER_CHUNK) {
+          chunks.push(Uint8Array.from(chunk.subarray(offset)));
+          break;
+        }
+        if (partial === undefined) {
+          partial = new Uint8Array(nextChunkSize);
+          nextChunkSize = Math.min(nextChunkSize * 2, MAX_BUFFER_CHUNK);
+        }
+        const count = Math.min(partial.byteLength - partialLength, chunk.byteLength - offset);
+        partial.set(chunk.subarray(offset, offset + count), partialLength);
+        partialLength += count;
+        offset += count;
+        if (partialLength === partial.byteLength) {
+          chunks.push(partial);
+          partial = undefined;
+          partialLength = 0;
+        }
+      }
+    }
+  } catch (error: unknown) {
+    requestCancel(reader, error);
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    if (!transferred) { reader.releaseLock(); }
+  }
+}
+
 async function sendEnvelope(
   transport: FetchTransport,
   endpoint: URL,
-  envelope: Uint8Array,
+  envelope: Uint8Array | ReadableStream<Uint8Array>,
   signal: AbortSignal,
 ): Promise<globalThis.Response> {
   throwIfAborted(signal);
   try {
-    return await transport(endpoint, {
+    const options: RequestInit & { duplex?: "half" } = {
       method: "POST",
       headers: {
         accept: RESPONSE_MEDIA_TYPE,
         "cache-control": "no-store",
         "content-type": REQUEST_MEDIA_TYPE,
       },
-      body: toArrayBuffer(envelope),
+      body: envelope instanceof ReadableStream ? envelope : toArrayBuffer(envelope),
       cache: "no-store",
       credentials: "omit",
       redirect: "error",
       referrerPolicy: "no-referrer",
       signal,
-    });
+    };
+    if (envelope instanceof ReadableStream) { options.duplex = "half"; }
+    return await transport(endpoint, options);
   } catch (error: unknown) {
     if (signal.aborted) {
       throw abortReason(signal);
@@ -615,18 +873,10 @@ function requireIdentityContentCoding(value: string | null, message: string): vo
 }
 
 function parseMethod(value: string): Method {
-  switch (value) {
-    case "GET":
-    case "POST":
-    case "PUT":
-    case "PATCH":
-    case "DELETE":
-    case "HEAD":
-    case "OPTIONS":
-      return value;
-    default:
-      throw new ProtocolError("unsupported_method", "request method is not supported by hpke-http");
+  if (isMethod(value)) {
+    return value;
   }
+  throw new ProtocolError("unsupported_method", "request method is not supported by hpke-http");
 }
 
 function parseHttpsUrl(input: string | URL): URL {
@@ -657,72 +907,13 @@ async function readBodyBounded(
   if (body === null) {
     return new Uint8Array();
   }
-
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let partial: Uint8Array | undefined;
-  let partialLength = 0;
-  let nextChunkSize = 1024;
-  let length = 0;
-  let rejectAbort: ((reason?: unknown) => void) | undefined;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    rejectAbort = reject;
-  });
-  const onAbort = (): void => {
-    rejectAbort?.(abortReason(signal));
-  };
-  signal.addEventListener("abort", onAbort, { once: true });
-
-  try {
-    while (true) {
-      const result = await Promise.race([reader.read(), aborted]);
-      if (result.done) {
-        break;
-      }
-      if (result.value.byteLength > maximum - length) {
-        throw new FetchTransportError("request_too_large", "buffered Fetch body exceeds the configured limit");
-      }
-      const chunk = result.value;
-      length += chunk.byteLength;
-      let offset = 0;
-      while (offset < chunk.byteLength) {
-        if (partial === undefined && chunk.byteLength - offset >= MAX_BUFFER_CHUNK) {
-          chunks.push(Uint8Array.from(chunk.subarray(offset)));
-          break;
-        }
-        if (partial === undefined) {
-          partial = new Uint8Array(nextChunkSize);
-          nextChunkSize = Math.min(nextChunkSize * 2, MAX_BUFFER_CHUNK);
-        }
-        const count = Math.min(partial.byteLength - partialLength, chunk.byteLength - offset);
-        partial.set(chunk.subarray(offset, offset + count), partialLength);
-        partialLength += count;
-        offset += count;
-        if (partialLength === partial.byteLength) {
-          chunks.push(partial);
-          partial = undefined;
-          partialLength = 0;
-        }
-      }
-    }
-  } catch (error: unknown) {
-    requestCancel(reader, error);
-    throw error;
-  } finally {
-    signal.removeEventListener("abort", onAbort);
-    reader.releaseLock();
+  const inspected = await inspectBody(body, maximum, signal);
+  if (inspected.kind === "complete") {
+    return inspected.body;
   }
-
-  const output = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  if (partial !== undefined) {
-    output.set(partial.subarray(0, partialLength), offset);
-  }
-  return output;
+  const error = new FetchTransportError("request_too_large", "buffered Fetch body exceeds the configured limit");
+  requestCancel(inspected.body, error);
+  throw error;
 }
 
 function requestCancel(
@@ -746,5 +937,8 @@ function abortReason(signal: AbortSignal): unknown {
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
   return Uint8Array.from(bytes).buffer;
 }

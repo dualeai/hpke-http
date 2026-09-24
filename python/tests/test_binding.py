@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.machinery
 import time
-from typing import Literal, cast
+from typing import cast
 
 import pytest
 
@@ -19,9 +19,11 @@ from hpke_http import (
     Method,
     ProtocolError,
     Request,
+    RequestHead,
     Response,
     Server,
     StateError,
+    StreamResponseRight,
     _native,
     generate_key_pair,
 )
@@ -44,7 +46,7 @@ def _request(body: bytes = b'{"name":"Ada"}') -> Request:
     return Request(
         method=Method.POST,
         authority="api.example.test",
-        path="/v2/items?limit=2",
+        path="/items?limit=2",
         headers=(Header("content-type", "application/json"),),
         body=body,
     )
@@ -128,6 +130,23 @@ def test_complete_python_transaction_and_one_shot_lifecycle() -> None:
         protected.open_response(encrypted_response)
 
 
+def test_stream_completion_returns_response_right_without_request_body() -> None:
+    client, server = _engines()
+    writer, first = client.begin_stream(RequestHead(Method.POST, "api.example.test", "/items"))
+    end, opener = writer.finish()
+    opened = server.preparse_stream(first).authenticate(PSK).admit(accepted=True)
+    used, record = opened.feed(end)
+    assert used == len(end)
+    assert record == ("end", b"")
+    response_right = opened.finish_eof()
+    assert isinstance(response_right, StreamResponseRight)
+    assert not hasattr(response_right, "request")
+    expected = Response(status=200, body=b"ok")
+    assert opener.open_response(response_right.protect_response(expected)) == expected
+    client.close()
+    server.close()
+
+
 @pytest.mark.parametrize("body", [b"", b"finite body"])
 def test_low_level_finite_response_sealer(body: bytes) -> None:
     client, server = _engines()
@@ -145,11 +164,10 @@ def test_low_level_finite_response_sealer(body: bytes) -> None:
         server.close()
 
 
-@pytest.mark.parametrize("coding", ["gzip", "zstd"])
-def test_opt_in_body_compression_preserves_logical_http(coding: Literal["gzip", "zstd"]) -> None:
+def test_native_body_coding_preserves_logical_http() -> None:
     keys = generate_key_pair()
-    client = Client(keys.public_key, KEY_ID, PSK, PSK_ID, compression=coding)
-    server = Server(keys.private_key, KEY_ID, compression=True)
+    client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
+    server = Server(keys.private_key, KEY_ID)
     body = b"request-data-" * 1024
     expected_request = Request(
         method=Method.POST,
@@ -175,21 +193,9 @@ def test_opt_in_body_compression_preserves_logical_http(coding: Literal["gzip", 
     server.close()
 
 
-def test_opt_in_compression_is_rejected_by_identity_server() -> None:
-    keys = generate_key_pair()
-    client = Client(keys.public_key, KEY_ID, PSK, PSK_ID, compression="gzip")
-    server = Server(keys.private_key, KEY_ID)
-    protected = client.protect(_request(b""))
-    with pytest.raises(ProtocolError) as captured:
-        server.preparse(protected.envelope).authenticate(PSK)
-    assert captured.value.code == "malformed_envelope"
-    client.close()
-    server.close()
-
-
 def test_binding_size_guards_preserve_one_shot_consumption() -> None:
     keys = generate_key_pair()
-    limits = Limits(max_body_len=1)
+    limits = Limits(max_body_len=1, max_request_bytes=1)
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID, limits=limits)
     server = Server(keys.private_key, KEY_ID, limits=limits)
     with pytest.raises(ProtocolError) as oversized_request:

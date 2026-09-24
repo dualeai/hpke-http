@@ -3,9 +3,10 @@
 #![forbid(unsafe_code)]
 
 use hpke_http::{
-    Client, CompressionCoding, Error, HeaderField, Limits, Method, ReplayRequest, ReplayToken,
-    Request, Response, ResponseCapability, ResponseMode, ResponseOpener, ResponseRecord,
-    ResponseSealer, ResponseToken, Server, SseSplitter, StartToken, build_info, generate_key_pair,
+    Client, Error, HeaderField, Limits, Method, ReplayRequest, ReplayToken, Request, RequestHead,
+    Response, ResponseCapability, ResponseMode, ResponseOpener, ResponseRecord, ResponseSealer,
+    ResponseToken, Server, SseSplitter, StartToken, StreamReplayToken, StreamRequestOpener,
+    StreamRequestRecord, StreamRequestSealer, StreamStartToken, build_info, generate_key_pair,
 };
 use pyo3::{
     create_exception,
@@ -22,10 +23,17 @@ create_exception!(
     "Stable error reported by the native hpke-http engine."
 );
 
-type NativeLimitTuple = (Option<usize>, Option<usize>, Option<usize>, Option<usize>);
+type NativeLimitTuple = (
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<u64>,
+);
 type NativeHeaders = Vec<(String, String)>;
 type NativeResponse = (u16, NativeHeaders, Vec<u8>);
 type NativeRecord = (String, u16, NativeHeaders, String, Vec<u8>);
+type NativeStreamRecord = (String, Vec<u8>);
 
 #[pyfunction]
 fn native_build_info() -> (&'static str, &'static str, u32) {
@@ -48,21 +56,17 @@ struct NativeClient {
 #[pymethods]
 impl NativeClient {
     #[new]
-    #[pyo3(signature = (recipient_public_key, recipient_key_id, psk, psk_id, limits, compression=None))]
+    #[pyo3(signature = (recipient_public_key, recipient_key_id, psk, psk_id, limits))]
     fn new(
         recipient_public_key: &[u8],
         recipient_key_id: Vec<u8>,
         psk: Vec<u8>,
         psk_id: Vec<u8>,
         limits: NativeLimitTuple,
-        compression: Option<&str>,
     ) -> PyResult<Self> {
         let limits = make_limits(limits)?;
-        let mut inner = Client::new(recipient_public_key, recipient_key_id, psk, psk_id, limits)
+        let inner = Client::new(recipient_public_key, recipient_key_id, psk, psk_id, limits)
             .map_err(native_error)?;
-        if let Some(coding) = compression {
-            inner = inner.with_compression(parse_compression(coding)?);
-        }
         Ok(Self { inner })
     }
 
@@ -92,8 +96,62 @@ impl NativeClient {
         })
     }
 
+    fn begin_stream(
+        &self,
+        py: Python<'_>,
+        method: &str,
+        authority: Vec<u8>,
+        path: Vec<u8>,
+        headers: NativeHeaders,
+    ) -> PyResult<(NativeStreamRequestSealer, Vec<u8>)> {
+        let head = RequestHead {
+            method: parse_method(method)?,
+            authority,
+            path,
+            headers: import_headers(headers),
+        };
+        let (inner, first) = py
+            .detach(|| self.inner.begin_stream(&head))
+            .map_err(native_error)?;
+        Ok((NativeStreamRequestSealer { inner: Some(inner) }, first))
+    }
+
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
+    }
+}
+
+#[pyclass(name = "StreamRequestSealer", module = "hpke_http._native")]
+struct NativeStreamRequestSealer {
+    inner: Option<StreamRequestSealer>,
+}
+
+#[pymethods]
+impl NativeStreamRequestSealer {
+    #[allow(clippy::needless_pass_by_value)]
+    fn push(&mut self, py: Python<'_>, part: PyBackedBytes) -> PyResult<(usize, Option<Vec<u8>>)> {
+        let inner = self.inner.as_mut().ok_or_else(continuation_consumed)?;
+        let result = py.detach(|| inner.push(&part)).map_err(native_error);
+        if result.is_err() {
+            self.inner = None;
+        }
+        result
+    }
+
+    fn finish(&mut self, py: Python<'_>) -> PyResult<(Vec<u8>, NativeProtectedRequest)> {
+        let inner = self.inner.take().ok_or_else(continuation_consumed)?;
+        let (end, response_token) = py.detach(|| inner.finish()).map_err(native_error)?;
+        Ok((
+            end,
+            NativeProtectedRequest {
+                envelope: Vec::new(),
+                response_token: Some(response_token),
+            },
+        ))
+    }
+
+    fn close(&mut self) {
+        self.inner = None;
     }
 }
 
@@ -160,19 +218,15 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (recipient_private_key, recipient_key_id, limits, compression=false))]
+    #[pyo3(signature = (recipient_private_key, recipient_key_id, limits))]
     fn new(
         recipient_private_key: &[u8],
         recipient_key_id: Vec<u8>,
         limits: NativeLimitTuple,
-        compression: bool,
     ) -> PyResult<Self> {
         let limits = make_limits(limits)?;
-        let mut inner =
+        let inner =
             Server::new(recipient_private_key, recipient_key_id, limits).map_err(native_error)?;
-        if compression {
-            inner = inner.with_compression();
-        }
         Ok(Self { inner })
     }
 
@@ -190,6 +244,22 @@ impl NativeServer {
         })
     }
 
+    fn max_complete_envelope_len(&self) -> PyResult<usize> {
+        self.inner.max_complete_envelope_len().map_err(native_error)
+    }
+
+    fn stream_start_length(&self, input: &[u8]) -> PyResult<Option<usize>> {
+        self.inner.stream_start_length(input).map_err(native_error)
+    }
+
+    fn preparse_stream(&self, first: &[u8]) -> PyResult<NativePreparsedStreamRequest> {
+        let preparsed = self.inner.preparse_stream(first).map_err(native_error)?;
+        Ok(NativePreparsedStreamRequest {
+            psk_id: preparsed.credential.psk_id,
+            token: Some(preparsed.token),
+        })
+    }
+
     #[getter]
     fn public_key(&self) -> Vec<u8> {
         self.inner.public_key()
@@ -197,6 +267,150 @@ impl NativeServer {
 
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
+    }
+}
+
+#[pyclass(name = "PreparsedStreamRequest", module = "hpke_http._native")]
+struct NativePreparsedStreamRequest {
+    psk_id: Vec<u8>,
+    token: Option<StreamStartToken>,
+}
+
+#[pymethods]
+impl NativePreparsedStreamRequest {
+    #[getter]
+    fn psk_id(&self) -> Vec<u8> {
+        self.psk_id.clone()
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn authenticate(
+        &mut self,
+        py: Python<'_>,
+        server: &NativeServer,
+        psk: PyBackedBytes,
+    ) -> PyResult<NativeAuthenticatedStreamRequest> {
+        let token = self.token.take().ok_or_else(continuation_consumed)?;
+        let authenticated = py
+            .detach(|| server.inner.authenticate_stream(token, &psk))
+            .map_err(native_error)?;
+        Ok(NativeAuthenticatedStreamRequest {
+            replay: authenticated.replay,
+            token: Some(authenticated.token),
+        })
+    }
+
+    fn discard(&mut self) {
+        self.token = None;
+    }
+}
+
+#[pyclass(name = "AuthenticatedStreamRequest", module = "hpke_http._native")]
+struct NativeAuthenticatedStreamRequest {
+    replay: ReplayRequest,
+    token: Option<StreamReplayToken>,
+}
+
+#[pymethods]
+impl NativeAuthenticatedStreamRequest {
+    #[getter]
+    fn replay_id(&self) -> Vec<u8> {
+        self.replay.id.to_vec()
+    }
+
+    #[getter]
+    fn retain_until_exclusive(&self) -> u64 {
+        self.replay.retain_until_exclusive
+    }
+
+    fn admit(&mut self, admitted: bool) -> PyResult<NativeOpenedStreamRequest> {
+        let token = self.token.take().ok_or_else(continuation_consumed)?;
+        let opened = token
+            .admit(self.replay.decision(admitted))
+            .map_err(native_error)?;
+        Ok(NativeOpenedStreamRequest {
+            method: opened.head.method.as_str(),
+            authority: opened.head.authority,
+            path: opened.head.path,
+            headers: export_headers(opened.head.headers)?,
+            reader: Some(opened.reader),
+        })
+    }
+
+    fn discard(&mut self) {
+        self.token = None;
+    }
+}
+
+#[pyclass(name = "OpenedStreamRequest", module = "hpke_http._native")]
+struct NativeOpenedStreamRequest {
+    method: &'static str,
+    authority: Vec<u8>,
+    path: Vec<u8>,
+    headers: NativeHeaders,
+    reader: Option<StreamRequestOpener>,
+}
+
+#[pymethods]
+impl NativeOpenedStreamRequest {
+    #[getter]
+    fn method(&self) -> &'static str {
+        self.method
+    }
+    #[getter]
+    fn authority(&self) -> Vec<u8> {
+        self.authority.clone()
+    }
+    #[getter]
+    fn path(&self) -> Vec<u8> {
+        self.path.clone()
+    }
+    #[getter]
+    fn headers(&self) -> NativeHeaders {
+        self.headers.clone()
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (input, offset=0))]
+    fn feed(
+        &mut self,
+        py: Python<'_>,
+        input: PyBackedBytes,
+        offset: usize,
+    ) -> PyResult<(usize, Option<NativeStreamRecord>)> {
+        let reader = self.reader.as_mut().ok_or_else(continuation_consumed)?;
+        let input = input
+            .get(offset..)
+            .ok_or_else(|| PyValueError::new_err("offset exceeds input length"))?;
+        let result = py.detach(|| reader.feed(input)).map_err(native_error);
+        if result.is_err() {
+            self.reader = None;
+        }
+        let (used, record) = result?;
+        Ok((
+            used,
+            record.map(|record| match record {
+                StreamRequestRecord::Data(part) => ("data".to_owned(), part),
+                StreamRequestRecord::End => ("end".to_owned(), Vec::new()),
+            }),
+        ))
+    }
+
+    fn finish_eof(&mut self, py: Python<'_>) -> PyResult<NativeOpenedRequest> {
+        let reader = self.reader.take().ok_or_else(continuation_consumed)?;
+        let response_capability = py.detach(|| reader.finish_eof()).map_err(native_error)?;
+        Ok(NativeOpenedRequest {
+            method: self.method,
+            authority: self.authority.clone(),
+            path: self.path.clone(),
+            headers: self.headers.clone(),
+            body: None,
+            response_capability: Some(response_capability),
+        })
+    }
+
+    fn close(&mut self) {
+        self.reader = None;
     }
 }
 
@@ -263,11 +477,11 @@ impl NativeAuthenticatedRequest {
             .admit(self.replay.decision(admitted))
             .map_err(native_error)?;
         Ok(NativeOpenedRequest {
-            method: method_name(opened.request.method),
+            method: opened.request.method.as_str(),
             authority: opened.request.authority,
             path: opened.request.path,
             headers: export_headers(opened.request.headers)?,
-            body: opened.request.body,
+            body: Some(opened.request.body),
             response_capability: Some(opened.response),
         })
     }
@@ -288,7 +502,7 @@ struct NativeOpenedRequest {
     authority: Vec<u8>,
     path: Vec<u8>,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: Option<Vec<u8>>,
     response_capability: Option<ResponseCapability>,
 }
 
@@ -314,28 +528,25 @@ impl NativeOpenedRequest {
         self.headers.clone()
     }
 
-    fn take_body<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let body = std::mem::take(&mut self.body);
-        PyBytes::new(py, &body)
+    fn take_body<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let body = self.body.take().ok_or_else(continuation_consumed)?;
+        Ok(PyBytes::new(py, &body))
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn protect_response(
         &mut self,
         py: Python<'_>,
         status: u16,
         headers: Vec<(String, String)>,
-        body: Vec<u8>,
+        body: PyBackedBytes,
     ) -> PyResult<Vec<u8>> {
         let capability = self
             .response_capability
             .take()
             .ok_or_else(continuation_consumed)?;
-        let response = Response {
-            status,
-            headers: import_headers(headers),
-            body,
-        };
-        py.detach(|| capability.protect_finite(&response))
+        let headers = import_headers(headers);
+        py.detach(|| capability.protect_finite_parts(status, headers, &body))
             .map_err(native_error)
     }
 
@@ -350,7 +561,7 @@ impl NativeOpenedRequest {
             .take()
             .ok_or_else(continuation_consumed)?;
         let (inner, first) = py
-            .detach(|| capability.into_sealer(status, import_headers(headers), None))
+            .detach(|| capability.into_sealer(status, import_headers(headers)))
             .map_err(native_error)?;
         Ok((NativeResponseSealer { inner: Some(inner) }, first))
     }
@@ -505,49 +716,23 @@ impl NativeSseSplitter {
 }
 
 fn make_limits(values: NativeLimitTuple) -> PyResult<Limits> {
-    let (max_body_len, max_header_bytes, max_header_count, max_target_len) = values;
+    let (max_body_len, max_header_bytes, max_header_count, max_target_len, max_request_bytes) =
+        values;
     let defaults = Limits::default();
     Limits {
         max_body_len: max_body_len.unwrap_or(defaults.max_body_len),
         max_header_bytes: max_header_bytes.unwrap_or(defaults.max_header_bytes),
         max_header_count: max_header_count.unwrap_or(defaults.max_header_count),
         max_target_len: max_target_len.unwrap_or(defaults.max_target_len),
+        max_request_bytes: max_request_bytes.unwrap_or(defaults.max_request_bytes),
     }
     .validate()
     .map_err(native_error)
 }
 
-fn parse_compression(value: &str) -> PyResult<CompressionCoding> {
-    match value {
-        "gzip" => Ok(CompressionCoding::Gzip),
-        "zstd" => Ok(CompressionCoding::Zstd),
-        _ => Err(native_error(Error::InvalidConfiguration)),
-    }
-}
-
 fn parse_method(value: &str) -> PyResult<Method> {
-    match value {
-        "GET" => Ok(Method::Get),
-        "POST" => Ok(Method::Post),
-        "PUT" => Ok(Method::Put),
-        "PATCH" => Ok(Method::Patch),
-        "DELETE" => Ok(Method::Delete),
-        "HEAD" => Ok(Method::Head),
-        "OPTIONS" => Ok(Method::Options),
-        _ => Err(PyValueError::new_err("unsupported HTTP method")),
-    }
-}
-
-const fn method_name(method: Method) -> &'static str {
-    match method {
-        Method::Get => "GET",
-        Method::Post => "POST",
-        Method::Put => "PUT",
-        Method::Patch => "PATCH",
-        Method::Delete => "DELETE",
-        Method::Head => "HEAD",
-        Method::Options => "OPTIONS",
-    }
+    Method::from_bytes(value.as_bytes())
+        .map_err(|_| PyValueError::new_err("unsupported HTTP method"))
 }
 
 fn import_headers(headers: Vec<(String, String)>) -> Vec<HeaderField> {
@@ -598,7 +783,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(native_generate_key_pair, module)?)?;
     module.add_class::<NativeClient>()?;
     module.add_class::<NativeProtectedRequest>()?;
+    module.add_class::<NativeStreamRequestSealer>()?;
     module.add_class::<NativeServer>()?;
+    module.add_class::<NativePreparsedStreamRequest>()?;
+    module.add_class::<NativeAuthenticatedStreamRequest>()?;
+    module.add_class::<NativeOpenedStreamRequest>()?;
     module.add_class::<NativePreparsedRequest>()?;
     module.add_class::<NativeAuthenticatedRequest>()?;
     module.add_class::<NativeOpenedRequest>()?;

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from hpke_http.protocol import Header, Limits
 
@@ -10,8 +10,7 @@ REQUEST_MEDIA_TYPE = "message/hpke-http-request"
 RESPONSE_MEDIA_TYPE = "message/hpke-http-response"
 
 _DEFAULT_MAX_BODY_LEN = 8 * 1024 * 1024
-_DEFAULT_MAX_HEADER_BYTES = 16 * 1024
-_ENVELOPE_OVERHEAD = 64 * 1024
+_OUTER_OK_STATUS = 200
 _NON_FORWARDABLE_FIELDS = frozenset(
     {
         "connection",
@@ -27,7 +26,7 @@ _NON_FORWARDABLE_FIELDS = frozenset(
         "upgrade",
     }
 )
-_REQUEST_ONLY_NON_FORWARDABLE_FIELDS = frozenset({"accept-encoding", "content-length", "expect"})
+_REQUEST_ONLY_NON_FORWARDABLE_FIELDS = frozenset({"accept-encoding", "expect"})
 
 
 class TransportError(RuntimeError):
@@ -85,11 +84,22 @@ def media_type(value: str | None) -> str:
     return value.partition(";")[0].strip().lower()
 
 
-def max_envelope_len(limits: Limits) -> int:
-    """Bound an outer envelope before passing it to the native parser."""
-    body = limits.max_body_len if limits.max_body_len is not None else _DEFAULT_MAX_BODY_LEN
-    headers = limits.max_header_bytes if limits.max_header_bytes is not None else _DEFAULT_MAX_HEADER_BYTES
-    return body + headers + _ENVELOPE_OVERHEAD
+def validate_outer_response(
+    status_code: int,
+    content_types: Sequence[str],
+    content_encodings: Sequence[str],
+) -> None:
+    """Check the outer reply before reading protected response records."""
+    if status_code != _OUTER_OK_STATUS:
+        raise TransportError(
+            "outer_status",
+            f"protected endpoint returned outer status {status_code}",
+            status_code=status_code,
+        )
+    if len(content_types) != 1 or media_type(content_types[0]) != RESPONSE_MEDIA_TYPE:
+        raise TransportError("outer_content_type", f"protected endpoint must return {RESPONSE_MEDIA_TYPE}")
+    if len(content_encodings) > 1 or (content_encodings and content_encodings[0].lower() != "identity"):
+        raise TransportError("outer_content_encoding", "protected envelope must not use content encoding")
 
 
 def max_body_len(limits: Limits) -> int:

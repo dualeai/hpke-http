@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator
 from contextlib import ExitStack
 from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
-from typing import Any, Literal, cast
+from typing import Any
 
 import httpx
 from typing_extensions import Self
@@ -15,7 +15,6 @@ from hpke_http.middleware._discovery import (
     Discover,
     PinnedKey,
     make_discovered_client,
-    protect_discovered_client,
     read_key_record,
     same_origin,
     validate_client_configuration,
@@ -24,20 +23,27 @@ from hpke_http.middleware._discovery import (
     validate_target_origin,
 )
 from hpke_http.middleware._native_async import run_native
-from hpke_http.middleware._records import CheckedStream
-from hpke_http.protocol import Client, Limits, Method, ProtectedRequest, ProtocolError, Request, StateError
+from hpke_http.middleware._records import CheckedStream, seal_request_chunk
+from hpke_http.protocol import (
+    Client,
+    Limits,
+    Method,
+    ProtectedRequest,
+    ProtocolError,
+    RequestHead,
+    StateError,
+    StreamRequestSealer,
+)
 from hpke_http.transport import (
     REQUEST_MEDIA_TYPE,
     RESPONSE_MEDIA_TYPE,
     TransportError,
     filter_request_headers,
     filter_response_headers,
-    max_body_len,
-    media_type,
+    validate_outer_response,
 )
 
 _DEFAULT_LIMITS = Limits()
-_OUTER_OK_STATUS = 200
 
 
 class _RejectAllCookiePolicy(DefaultCookiePolicy):
@@ -56,13 +62,12 @@ class HPKEAsyncClient:
     Requests are bounded. Live SSE replies yield one checked block at a time.
     Redirects are never followed for the outer exchange.
 
-    ``Discover()`` fetches one key per call. ``PinnedKey`` sends no key GET.
+    ``Discover()`` fetches one key per call. ``PinnedKey`` uses its fixed key.
     ``transport``, TLS, and pool options configure the dedicated outer connection.
     Default headers and params become logical request fields and target bytes.
     Logical headers are authenticated after transport fields are removed.
     Ambient auth, cookies, event hooks, redirects, and environment
-    credentials are rejected or disabled. ``compression`` selects optional
-    Rust protocol body coding, not HTTP ``Content-Encoding``.
+    credentials are rejected or disabled. Every body uses protected records.
     """
 
     def __init__(
@@ -74,13 +79,12 @@ class HPKEAsyncClient:
         *,
         target_origin: str | None = None,
         limits: Limits = _DEFAULT_LIMITS,
-        compression: Literal["gzip", "zstd"] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         **client_options: Any,
     ) -> None:
         endpoint = validate_endpoint(endpoint)
         target_key = validate_target_origin(target_origin, endpoint)
-        validate_client_configuration(psk, psk_id, limits, compression)
+        validate_client_configuration(psk, psk_id, limits)
         if type(key_source) not in (Discover, PinnedKey):
             raise TypeError("key_source must be Discover() or PinnedKey")
         forbidden = {
@@ -101,7 +105,7 @@ class HPKEAsyncClient:
 
         with ExitStack() as cleanup:
             client = (
-                Client(key_source.public_key, key_source.key_id, psk, psk_id, limits=limits, compression=compression)
+                Client(key_source.public_key, key_source.key_id, psk, psk_id, limits=limits)
                 if isinstance(key_source, PinnedKey)
                 else None
             )
@@ -122,9 +126,7 @@ class HPKEAsyncClient:
         self._psk = bytes(psk) if isinstance(key_source, Discover) else b""
         self._psk_id = bytes(psk_id)
         self._limits = limits
-        self._compression: Literal["gzip", "zstd"] | None = compression
         self._closed = False
-        self._max_request_len = max_body_len(limits)
         self._streams: set[HPKEStreamResponse] = set()
 
     async def __aenter__(self) -> Self:
@@ -155,7 +157,7 @@ class HPKEAsyncClient:
     ) -> httpx.Response:
         """Protect one logical request and authenticate its complete response.
 
-        The method must be supported by ``hpke-http/2`` and the resolved target
+        The method must be supported by ``hpke-http/3`` and the resolved target
         must be absolute HTTPS without embedded credentials. The returned
         ``httpx.Response`` is fully buffered and authenticated. ``TransportError``
         reports target, network, outer-response, content-coding, and request-body
@@ -176,7 +178,7 @@ class HPKEAsyncClient:
         finally:
             await stream.aclose()
 
-    async def _open_stream(
+    async def _open_stream(  # noqa: PLR0912, PLR0915
         self,
         method: str,
         url: str | httpx.URL,
@@ -190,13 +192,61 @@ class HPKEAsyncClient:
         target = _https_url(logical.url)
         if not same_origin(str(target), self._target_origin):
             raise TransportError("invalid_target", "logical target has the wrong HTTPS origin")
-        body = await _read_request_body(logical, self._max_request_len)
         try:
             protocol_method = Method(logical.method.upper())
         except ValueError as error:
             raise ProtocolError("unsupported_method", "request method is not supported by hpke-http") from error
+        logical_headers = filter_request_headers(logical.headers.multi_items())
 
-        protected = await self._protect(logical, target, protocol_method, body)
+        protected: ProtectedRequest | None = None
+        sealer: StreamRequestSealer | None = None
+        response_right: list[ProtectedRequest] = []
+        discovered: Client | None = None
+        try:
+            client = self._client
+            if client is None:
+                discovered = await self._discover_client(logical)
+                client = discovered
+            try:
+                sealer, first = await run_native(
+                    client.begin_stream,
+                    RequestHead(
+                        method=protocol_method,
+                        authority=target.netloc.decode("ascii"),
+                        path=target.raw_path.decode("ascii"),
+                        headers=logical_headers,
+                    ),
+                )
+            except ProtocolError as error:
+                if discovered is not None and error.code in {"invalid_configuration", "crypto_failure"}:
+                    raise TransportError(
+                        "discovery_response", "key endpoint returned an unusable public key"
+                    ) from error
+                raise
+            writer = sealer
+            source = logical.stream
+
+            async def encoded_request() -> AsyncIterator[bytes]:
+                try:
+                    yield first
+                    async for chunk in _request_chunks(source):
+                        async for frame in seal_request_chunk(writer, chunk):
+                            yield frame
+                    end, right = await run_native(writer.finish)
+                    response_right.append(right)
+                    yield end
+                finally:
+                    writer.close()
+
+            outer_content: AsyncIterator[bytes] = encoded_request()
+        except BaseException:
+            await _close_request_stream(logical.stream)
+            if sealer is not None:
+                sealer.close()
+            raise
+        finally:
+            if discovered is not None:
+                discovered.close()
         try:
             if self._closed:
                 raise StateError("client is closed")
@@ -209,7 +259,7 @@ class HPKEAsyncClient:
                     "cache-control": "no-store",
                     "content-type": REQUEST_MEDIA_TYPE,
                 },
-                content=protected.envelope,
+                content=outer_content,
             )
             timeout = dict(logical.extensions.get("timeout", self._http.timeout.as_dict()))
             if live and "timeout" not in request_options:
@@ -222,6 +272,9 @@ class HPKEAsyncClient:
             driver: CheckedStream | None = None
             try:
                 _check_outer(response)
+                if not response_right:
+                    raise TransportError("network_error", "request ended before its protected END")
+                protected = response_right.pop()
                 driver = CheckedStream(protected.into_opener(), _raw_chunks(response), response.aclose)
                 await driver.start()
                 headers = filter_response_headers((field.name, field.value) for field in driver.headers)
@@ -241,24 +294,18 @@ class HPKEAsyncClient:
                     await response.aclose()
                 raise
         finally:
-            protected.close()
-
-    async def _protect(
-        self, logical: httpx.Request, target: httpx.URL, method: Method, body: bytes
-    ) -> ProtectedRequest:
-        request = Request(
-            method=method,
-            authority=target.netloc.decode("ascii"),
-            path=target.raw_path.decode("ascii"),
-            headers=filter_request_headers(logical.headers.multi_items()),
-            body=body,
-        )
-        if self._client is not None:
-            return await run_native(self._client.protect, request)
-        client = await self._discover_client(logical)
-        return await protect_discovered_client(client, request)
+            sealer.close()
+            if protected is not None:
+                protected.close()
+            for right in response_right:
+                right.close()
+            await _close_request_stream(logical.stream)
 
     async def _discover_client(self, logical: httpx.Request) -> Client:
+        key_id, public_key = await self._discover_peer(logical)
+        return make_discovered_client(public_key, key_id, self._psk, self._psk_id, self._limits)
+
+    async def _discover_peer(self, logical: httpx.Request) -> tuple[bytes, bytes]:
         request = httpx.Request(
             "GET",
             self._endpoint,
@@ -278,7 +325,7 @@ class HPKEAsyncClient:
             key_id, public_key = await read_key_record(_raw_chunks(response))
             if self._closed:
                 raise StateError("client is closed")
-            return make_discovered_client(public_key, key_id, self._psk, self._psk_id, self._limits, self._compression)
+            return key_id, public_key
         except httpx.HTTPError as error:
             raise TransportError("discovery_network", "key GET failed") from error
         finally:
@@ -364,18 +411,11 @@ class _StreamContext:
 
 
 def _check_outer(response: httpx.Response) -> None:
-    if response.status_code != _OUTER_OK_STATUS:
-        raise TransportError(
-            "outer_status",
-            f"protected endpoint returned outer status {response.status_code}",
-            status_code=response.status_code,
-        )
-    content_types = response.headers.get_list("content-type")
-    if len(content_types) != 1 or media_type(content_types[0]) != RESPONSE_MEDIA_TYPE:
-        raise TransportError("outer_content_type", f"protected endpoint must return {RESPONSE_MEDIA_TYPE}")
-    content_encodings = response.headers.get_list("content-encoding")
-    if len(content_encodings) > 1 or (content_encodings and content_encodings[0].lower() != "identity"):
-        raise TransportError("outer_content_encoding", "protected envelope must not use content encoding")
+    validate_outer_response(
+        response.status_code,
+        response.headers.get_list("content-type"),
+        response.headers.get_list("content-encoding"),
+    )
 
 
 async def _raw_chunks(response: httpx.Response) -> AsyncIterator[bytes]:
@@ -386,44 +426,20 @@ async def _raw_chunks(response: httpx.Response) -> AsyncIterator[bytes]:
             yield chunk
 
 
-async def _read_request_body(request: httpx.Request, maximum: int) -> bytes:
-    _reject_declared_oversize(request.headers, maximum, "request_too_large")
-    try:
-        body = request.content
-    except httpx.RequestNotRead:
-        body = await _collect_stream(request.stream, maximum, "request_too_large")
-    if len(body) > maximum:
-        raise TransportError("request_too_large", "buffered request body exceeds the configured limit")
-    return body
-
-
-async def _collect_stream(stream: object, maximum: int, code: str) -> bytes:
-    body = bytearray()
-    length = 0
-    if isinstance(stream, AsyncIterable):
-        iterator = cast(AsyncIterable[bytes], stream)
-        async for chunk in iterator:
-            data = bytes(chunk)
-            length += len(data)
-            if length > maximum:
-                raise TransportError(code, "buffered request body exceeds the configured limit")
-            body.extend(data)
-    elif isinstance(stream, Iterable):
-        for chunk in cast(Iterable[bytes], stream):
-            data = bytes(chunk)
-            length += len(data)
-            if length > maximum:
-                raise TransportError(code, "buffered request body exceeds the configured limit")
-            body.extend(data)
+async def _request_chunks(source: httpx.SyncByteStream | httpx.AsyncByteStream) -> AsyncIterator[bytes]:
+    if isinstance(source, httpx.AsyncByteStream):
+        async for chunk in source:
+            yield chunk
     else:
-        raise TypeError("httpx request body is not iterable")
-    return bytes(body)
+        for chunk in source:
+            yield chunk
 
 
-def _reject_declared_oversize(headers: Mapping[str, str], maximum: int, code: str) -> None:
-    declared = headers.get("content-length")
-    if declared is not None and declared.isdecimal() and int(declared) > maximum:
-        raise TransportError(code, "buffered HTTP body exceeds the configured limit")
+async def _close_request_stream(source: httpx.SyncByteStream | httpx.AsyncByteStream) -> None:
+    if isinstance(source, httpx.AsyncByteStream):
+        await source.aclose()
+    else:
+        source.close()
 
 
 def _https_url(value: httpx.URL) -> httpx.URL:

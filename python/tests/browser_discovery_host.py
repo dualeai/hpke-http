@@ -10,6 +10,7 @@ from pathlib import Path
 import trustme
 import uvicorn
 from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request as StarletteRequest
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from hpke_http import generate_key_pair
@@ -59,7 +60,7 @@ async def main(directory: Path) -> None:
     ca.cert_pem.write_to_path(ca_path)
     probe: Probe
 
-    async def app(scope: Scope, _receive: Receive, send: Send) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("path") == "/stats":
             body = json.dumps(
                 {
@@ -73,8 +74,14 @@ async def main(directory: Path) -> None:
             status = 200
             headers = [(b"content-type", b"application/json")]
         elif scope.get("path") == "/items":
-            body = b"browser-discovery-ok"
-            status = 200
+            if scope.get("method") == "POST":
+                request = StarletteRequest(scope, receive)
+                async with request.form(max_files=0, max_fields=1) as form:
+                    body = b"browser-form-upload-ok" if form.get("note") == "browser-form-upload" else b"invalid form"
+                status = 200 if body == b"browser-form-upload-ok" else 422
+            else:
+                body = b"browser-discovery-ok"
+                status = 200
             headers = [(b"content-type", b"text/plain")]
         else:
             body = b"not found"

@@ -3,9 +3,10 @@
 #![forbid(unsafe_code)]
 
 use hpke_http::{
-    Client as CoreClient, CompressionCoding, Error, HeaderField, Limits, Method, ReplayRequest,
-    ReplayToken, Request, Response, ResponseCapability, ResponseMode, ResponseOpener,
-    ResponseRecord, ResponseSealer, ResponseToken, Server as CoreServer, StartToken,
+    Client as CoreClient, Error, HeaderField, Limits, Method, ReplayRequest, ReplayToken, Request,
+    RequestHead, Response, ResponseCapability, ResponseMode, ResponseOpener, ResponseRecord,
+    ResponseSealer, ResponseToken, Server as CoreServer, StartToken, StreamReplayToken,
+    StreamRequestOpener, StreamRequestRecord, StreamRequestSealer, StreamStartToken, SystemEntropy,
     generate_key_pair,
 };
 use wasm_bindgen::prelude::*;
@@ -51,6 +52,7 @@ impl WasmLimits {
         max_header_bytes: Option<u32>,
         max_header_count: Option<u32>,
         max_target_len: Option<u32>,
+        max_request_bytes: Option<f64>,
     ) -> Result<WasmLimits, JsValue> {
         let defaults = Limits::default();
         let limits = Limits {
@@ -58,6 +60,10 @@ impl WasmLimits {
             max_header_bytes: usize_from_option(max_header_bytes, defaults.max_header_bytes)?,
             max_header_count: usize_from_option(max_header_count, defaults.max_header_count)?,
             max_target_len: usize_from_option(max_target_len, defaults.max_target_len)?,
+            max_request_bytes: request_limit_from_js(
+                max_request_bytes,
+                defaults.max_request_bytes,
+            )?,
         }
         .validate()
         .map_err(js_error)?;
@@ -124,9 +130,8 @@ impl WasmClient {
         psk: &[u8],
         psk_id: &[u8],
         limits: &WasmLimits,
-        compression: u8,
     ) -> Result<WasmClient, JsValue> {
-        let mut inner = CoreClient::new(
+        let inner = CoreClient::new(
             recipient_public_key,
             recipient_key_id.to_vec(),
             psk.to_vec(),
@@ -134,13 +139,39 @@ impl WasmClient {
             limits.0,
         )
         .map_err(js_error)?;
-        inner = match compression {
-            0 => inner,
-            1 => inner.with_compression(CompressionCoding::Gzip),
-            2 => inner.with_compression(CompressionCoding::Zstd),
-            _ => return Err(js_error(Error::InvalidConfiguration)),
-        };
         Ok(Self { inner })
+    }
+
+    /// Start a protected request without reading body bytes.
+    ///
+    /// # Errors
+    /// Returns a validation, entropy, or cryptographic error.
+    pub fn begin_stream(
+        &self,
+        method: &str,
+        authority: &str,
+        path: &str,
+        headers_json: &str,
+        now_unix_s: f64,
+    ) -> Result<WasmStreamRequestSealer, JsValue> {
+        let head = RequestHead {
+            method: parse_method(method)?,
+            authority: authority.as_bytes().to_vec(),
+            path: path.as_bytes().to_vec(),
+            headers: parse_headers(headers_json)?,
+        };
+        let (inner, first) = self
+            .inner
+            .begin_stream_at_with_entropy(
+                &head,
+                unix_seconds_from_js(now_unix_s)?,
+                &mut SystemEntropy,
+            )
+            .map_err(js_error)?;
+        Ok(WasmStreamRequestSealer {
+            inner: Some(inner),
+            first,
+        })
     }
 
     /// Protect one complete bounded request.
@@ -174,6 +205,80 @@ impl WasmClient {
             envelope,
             response_token: Some(response_token),
         })
+    }
+}
+
+/// Native request writer. START, DATA, and END stay in the Rust engine.
+#[wasm_bindgen(js_name = StreamRequestSealer)]
+pub struct WasmStreamRequestSealer {
+    inner: Option<StreamRequestSealer>,
+    first: Vec<u8>,
+}
+
+#[wasm_bindgen(js_class = StreamRequestSealer)]
+impl WasmStreamRequestSealer {
+    /// Move the protected START into one owned JavaScript byte array.
+    #[must_use]
+    pub fn take_start(&mut self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(std::mem::take(&mut self.first).as_slice())
+    }
+
+    /// Accept some clear bytes and return at most one protected DATA record.
+    ///
+    /// # Errors
+    /// Returns a state, length, compression, or cryptographic error.
+    pub fn push(&mut self, input: &[u8]) -> Result<WasmStreamPush, JsValue> {
+        let (consumed, record) = self
+            .inner
+            .as_mut()
+            .ok_or_else(consumed_error)?
+            .push(input)
+            .map_err(js_error)?;
+        Ok(WasmStreamPush { consumed, record })
+    }
+
+    /// Flush the last DATA part, seal END, and transfer the response right.
+    ///
+    /// # Errors
+    /// Returns a state, length, compression, or cryptographic error.
+    pub fn finish(&mut self) -> Result<WasmProtectedRequest, JsValue> {
+        let inner = self.inner.take().ok_or_else(consumed_error)?;
+        let (envelope, response_token) = inner.finish().map_err(js_error)?;
+        Ok(WasmProtectedRequest {
+            envelope,
+            response_token: Some(response_token),
+        })
+    }
+
+    /// Discard the writer without END.
+    pub fn close(&mut self) {
+        self.inner = None;
+        self.first.clear();
+    }
+}
+
+/// One incremental request write result.
+#[wasm_bindgen(js_name = StreamPush)]
+pub struct WasmStreamPush {
+    consumed: usize,
+    record: Option<Vec<u8>>,
+}
+
+#[wasm_bindgen(js_class = StreamPush)]
+impl WasmStreamPush {
+    /// Number of clear source bytes accepted by this call.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    /// Move the protected DATA record, if any.
+    #[must_use]
+    pub fn take_record(&mut self) -> Option<js_sys::Uint8Array> {
+        self.record
+            .take()
+            .map(|record| js_sys::Uint8Array::from(record.as_slice()))
     }
 }
 
@@ -407,13 +512,9 @@ impl WasmServer {
         recipient_private_key: &[u8],
         recipient_key_id: &[u8],
         limits: &WasmLimits,
-        compression: bool,
     ) -> Result<WasmServer, JsValue> {
-        let mut inner = CoreServer::new(recipient_private_key, recipient_key_id.to_vec(), limits.0)
+        let inner = CoreServer::new(recipient_private_key, recipient_key_id.to_vec(), limits.0)
             .map_err(js_error)?;
-        if compression {
-            inner = inner.with_compression();
-        }
         Ok(Self { inner })
     }
 
@@ -428,6 +529,292 @@ impl WasmServer {
             psk_id: preparsed.credential.psk_id,
             token: Some(preparsed.token),
         })
+    }
+
+    /// Return the largest complete envelope accepted by `preparse`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a size error if the limit cannot fit in memory.
+    pub fn max_complete_envelope_len(&self) -> Result<usize, JsValue> {
+        self.inner.max_complete_envelope_len().map_err(js_error)
+    }
+
+    /// Return the total public prefix and START length when enough bytes arrived.
+    ///
+    /// # Errors
+    /// Returns a parse, version, suite, or size error.
+    pub fn stream_start_length(&self, input: &[u8]) -> Result<Option<usize>, JsValue> {
+        self.inner.stream_start_length(input).map_err(js_error)
+    }
+
+    /// Parse one exact public prefix and START before credential lookup.
+    ///
+    /// # Errors
+    /// Returns a parse, limit, or recipient-key error.
+    pub fn preparse_stream(&self, first: &[u8]) -> Result<WasmPreparsedStreamRequest, JsValue> {
+        let preparsed = self.inner.preparse_stream(first).map_err(js_error)?;
+        Ok(WasmPreparsedStreamRequest {
+            psk_id: preparsed.credential.psk_id,
+            token: Some(preparsed.token),
+        })
+    }
+}
+
+/// A checked public START waiting for one PSK lookup.
+#[wasm_bindgen(js_name = PreparsedStreamRequest)]
+pub struct WasmPreparsedStreamRequest {
+    psk_id: Vec<u8>,
+    token: Option<StreamStartToken>,
+}
+
+#[wasm_bindgen(js_class = PreparsedStreamRequest)]
+impl WasmPreparsedStreamRequest {
+    /// Public PSK identifier.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn psk_id(&self) -> Vec<u8> {
+        self.psk_id.clone()
+    }
+
+    /// Whether this one-use stage was consumed.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn consumed(&self) -> bool {
+        self.token.is_none()
+    }
+
+    /// Authenticate START with the host-resolved PSK.
+    ///
+    /// # Errors
+    /// Returns a credential, time, authentication, or parse error.
+    pub fn authenticate(
+        &mut self,
+        server: &WasmServer,
+        psk: &[u8],
+        now_unix_s: f64,
+    ) -> Result<WasmAuthenticatedStreamRequest, JsValue> {
+        let token = self.token.take().ok_or_else(consumed_error)?;
+        let authenticated = server
+            .inner
+            .authenticate_stream_at(token, psk, unix_seconds_from_js(now_unix_s)?)
+            .map_err(js_error)?;
+        Ok(WasmAuthenticatedStreamRequest {
+            replay: authenticated.replay,
+            token: Some(authenticated.token),
+        })
+    }
+
+    /// Discard this stage.
+    pub fn discard(&mut self) {
+        self.token = None;
+    }
+}
+
+/// Authenticated START waiting for one atomic replay decision.
+#[wasm_bindgen(js_name = AuthenticatedStreamRequest)]
+pub struct WasmAuthenticatedStreamRequest {
+    replay: ReplayRequest,
+    token: Option<StreamReplayToken>,
+}
+
+#[wasm_bindgen(js_class = AuthenticatedStreamRequest)]
+impl WasmAuthenticatedStreamRequest {
+    /// Stable replay identifier.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn replay_id(&self) -> Vec<u8> {
+        self.replay.id.to_vec()
+    }
+
+    /// Exclusive replay reservation deadline.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn retain_until_exclusive(&self) -> f64 {
+        self.replay.retain_until_exclusive as f64
+    }
+
+    /// Whether this one-use stage was consumed.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn consumed(&self) -> bool {
+        self.token.is_none()
+    }
+
+    /// Apply the host's atomic replay decision.
+    ///
+    /// # Errors
+    /// Returns a replay or time error.
+    pub fn admit(
+        &mut self,
+        accepted: bool,
+        now_unix_s: f64,
+    ) -> Result<WasmOpenedStreamRequest, JsValue> {
+        let token = self.token.take().ok_or_else(consumed_error)?;
+        let opened = token
+            .admit_at(
+                self.replay.decision(accepted),
+                unix_seconds_from_js(now_unix_s)?,
+            )
+            .map_err(js_error)?;
+        WasmOpenedStreamRequest::from_core(opened.head, opened.reader)
+    }
+
+    /// Discard this stage.
+    pub fn discard(&mut self) {
+        self.token = None;
+    }
+}
+
+/// Checked request head and incremental DATA reader.
+#[wasm_bindgen(js_name = OpenedStreamRequest)]
+pub struct WasmOpenedStreamRequest {
+    head: Option<RequestHead>,
+    method: &'static str,
+    authority: String,
+    path: String,
+    headers_json: String,
+    reader: Option<StreamRequestOpener>,
+}
+
+impl WasmOpenedStreamRequest {
+    fn from_core(head: RequestHead, reader: StreamRequestOpener) -> Result<Self, JsValue> {
+        let method = head.method.as_str();
+        let authority = String::from_utf8(head.authority.clone())
+            .map_err(|_| malformed_text_error("authority"))?;
+        let path =
+            String::from_utf8(head.path.clone()).map_err(|_| malformed_text_error("path"))?;
+        let headers_json = serialize_headers(&head.headers)?;
+        Ok(Self {
+            head: Some(head),
+            method,
+            authority,
+            path,
+            headers_json,
+            reader: Some(reader),
+        })
+    }
+}
+
+#[wasm_bindgen(js_class = OpenedStreamRequest)]
+impl WasmOpenedStreamRequest {
+    /// Authenticated method.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn method(&self) -> String {
+        self.method.to_owned()
+    }
+
+    /// Authenticated authority.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn authority(&self) -> String {
+        self.authority.clone()
+    }
+
+    /// Authenticated path.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn path(&self) -> String {
+        self.path.clone()
+    }
+
+    /// Authenticated headers in private JSON boundary form.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn headers_json(&self) -> String {
+        self.headers_json.clone()
+    }
+
+    /// Feed any byte cut and release at most one checked DATA part or END.
+    ///
+    /// # Errors
+    /// Returns a parse, order, limit, or authentication error.
+    pub fn feed(&mut self, input: &[u8]) -> Result<WasmRequestFeed, JsValue> {
+        let reader = self.reader.as_mut().ok_or_else(consumed_error)?;
+        let (consumed, record) = reader.feed(input).map_err(js_error)?;
+        Ok(WasmRequestFeed::new(consumed, record))
+    }
+
+    /// Check true outer EOF after END, then grant the response right.
+    ///
+    /// # Errors
+    /// Returns an error when END is absent or a record is partial.
+    pub fn finish_eof(&mut self) -> Result<WasmOpenedRequest, JsValue> {
+        let reader = self.reader.take().ok_or_else(consumed_error)?;
+        let capability = reader.finish_eof().map_err(js_error)?;
+        let head = self.head.take().ok_or_else(consumed_error)?;
+        WasmOpenedRequest::from_core(
+            Request {
+                method: head.method,
+                authority: head.authority,
+                path: head.path,
+                headers: head.headers,
+                body: Vec::new(),
+            },
+            capability,
+        )
+    }
+
+    /// Discard the reader before EOF.
+    pub fn close(&mut self) {
+        self.reader = None;
+        self.head = None;
+    }
+}
+
+/// One result from the checked DATA reader.
+#[wasm_bindgen(js_name = RequestFeed)]
+pub struct WasmRequestFeed {
+    consumed: usize,
+    kind: u8,
+    block: Vec<u8>,
+}
+
+impl WasmRequestFeed {
+    fn new(consumed: usize, record: Option<StreamRequestRecord>) -> Self {
+        match record {
+            None => Self {
+                consumed,
+                kind: 0,
+                block: Vec::new(),
+            },
+            Some(StreamRequestRecord::Data(block)) => Self {
+                consumed,
+                kind: 1,
+                block,
+            },
+            Some(StreamRequestRecord::End) => Self {
+                consumed,
+                kind: 2,
+                block: Vec::new(),
+            },
+        }
+    }
+}
+
+#[wasm_bindgen(js_class = RequestFeed)]
+impl WasmRequestFeed {
+    /// Number of protected source bytes accepted.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    /// 0 means partial, 1 means DATA, and 2 means END.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn kind(&self) -> u8 {
+        self.kind
+    }
+
+    /// Checked clear DATA part, present for kind 1.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn block(&self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(self.block.as_slice())
     }
 }
 
@@ -555,7 +942,7 @@ impl WasmOpenedRequest {
             String::from_utf8(request.authority).map_err(|_| malformed_text_error("authority"))?;
         let path = String::from_utf8(request.path).map_err(|_| malformed_text_error("path"))?;
         Ok(Self {
-            method: method_name(request.method),
+            method: request.method.as_str(),
             authority,
             path,
             headers_json: serialize_headers(&request.headers)?,
@@ -620,11 +1007,7 @@ impl WasmOpenedRequest {
     ) -> Result<Vec<u8>, JsValue> {
         let capability = self.response_capability.take().ok_or_else(consumed_error)?;
         capability
-            .protect_finite(&Response {
-                status,
-                headers: parse_headers(headers_json)?,
-                body: body.to_vec(),
-            })
+            .protect_finite_parts(status, parse_headers(headers_json)?, body)
             .map_err(js_error)
     }
 
@@ -639,7 +1022,7 @@ impl WasmOpenedRequest {
     ) -> Result<WasmResponseSealer, JsValue> {
         let capability = self.response_capability.take().ok_or_else(consumed_error)?;
         let (inner, first) = capability
-            .into_sealer(status, parse_headers(headers_json)?, None)
+            .into_sealer(status, parse_headers(headers_json)?)
             .map_err(js_error)?;
         Ok(WasmResponseSealer {
             inner: Some(inner),
@@ -720,6 +1103,24 @@ fn usize_from_option(value: Option<u32>, default: usize) -> Result<usize, JsValu
     })
 }
 
+fn request_limit_from_js(value: Option<f64>, default: u64) -> Result<u64, JsValue> {
+    match value {
+        None => Ok(default),
+        Some(value)
+            if value.is_finite()
+                && value.fract() == 0.0
+                && (1.0..=4_294_967_296.0).contains(&value) =>
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Ok(value as u64)
+        }
+        Some(_) => Err(js_message(
+            "invalid_configuration",
+            "invalid request byte limit",
+        )),
+    }
+}
+
 fn unix_seconds_from_js(value: f64) -> Result<u64, JsValue> {
     const MAX_SAFE_WITH_DEADLINE: f64 = 9_007_199_254_740_631.0;
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE_WITH_DEADLINE {
@@ -734,28 +1135,8 @@ fn unix_seconds_from_js(value: f64) -> Result<u64, JsValue> {
 }
 
 fn parse_method(value: &str) -> Result<Method, JsValue> {
-    match value {
-        "GET" => Ok(Method::Get),
-        "POST" => Ok(Method::Post),
-        "PUT" => Ok(Method::Put),
-        "PATCH" => Ok(Method::Patch),
-        "DELETE" => Ok(Method::Delete),
-        "HEAD" => Ok(Method::Head),
-        "OPTIONS" => Ok(Method::Options),
-        _ => Err(js_message("unsupported_method", "unsupported HTTP method")),
-    }
-}
-
-const fn method_name(method: Method) -> &'static str {
-    match method {
-        Method::Get => "GET",
-        Method::Post => "POST",
-        Method::Put => "PUT",
-        Method::Patch => "PATCH",
-        Method::Delete => "DELETE",
-        Method::Head => "HEAD",
-        Method::Options => "OPTIONS",
-    }
+    Method::from_bytes(value.as_bytes())
+        .map_err(|_| js_message("unsupported_method", "unsupported HTTP method"))
 }
 
 fn parse_headers(input: &str) -> Result<Vec<HeaderField>, JsValue> {

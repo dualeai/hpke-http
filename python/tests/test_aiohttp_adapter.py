@@ -3,24 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
+import os
 import socket
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 import aiohttp
 import pytest
 import trustme
 from aiohttp import web
+from starlette.datastructures import UploadFile
+from starlette.requests import Request as StarletteRequest
+from starlette.types import Receive, Scope, Send
 from yarl import URL
 
 from hpke_http import Header, Limits, ProtocolError, Response, Server, StateError, TransportError, generate_key_pair
 from hpke_http.middleware import Discover, PinnedKey
 from hpke_http.middleware.aiohttp import HPKEClientSession, HPKEResponse
+from hpke_http.middleware.fastapi import HPKEMiddleware
 from hpke_http.transport import REQUEST_MEDIA_TYPE, RESPONSE_MEDIA_TYPE
+from tests.stream_request import open_stream_request
+from tests.test_live_sse import live_host
 
 KEY_ID = b"primary-2026-09"
 PSK = b"a 32-byte minimum test credential!"
@@ -60,10 +69,9 @@ async def _https_endpoint(handler: _Handler) -> AsyncIterator[tuple[URL, aiohttp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("compression", [None, "gzip", "zstd"])
-async def test_aiohttp_adapter_protects_buffered_json_exchange(compression: Literal["gzip", "zstd"] | None) -> None:
+async def test_aiohttp_adapter_protects_buffered_json_exchange() -> None:
     key_pair = generate_key_pair()
-    server = Server(key_pair.private_key, KEY_ID, compression=compression is not None)
+    server = Server(key_pair.private_key, KEY_ID)
     request_name = "Ada" * 1024
     request_body = b'{"name":"' + request_name.encode() + b'"}'
     response_value = "yes" * 1024
@@ -78,11 +86,7 @@ async def test_aiohttp_adapter_protects_buffered_json_exchange(compression: Lite
         assert "authorization" not in request.headers
         assert "cookie" not in request.headers
         outer_envelope = await request.read()
-        if compression is not None:
-            assert len(outer_envelope) < len(request_body)
-        preparsed = server.preparse(outer_envelope)
-        assert preparsed.psk_id == PSK_ID
-        opened = preparsed.authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, outer_envelope, PSK)
         assert opened.request.path == "/items"
         assert opened.request.body == request_body
         assert Header("content-type", "application/json") in opened.request.headers
@@ -98,8 +102,6 @@ async def test_aiohttp_adapter_protects_buffered_json_exchange(compression: Lite
                 body=response_body,
             )
         )
-        if compression is not None:
-            assert len(envelope) < len(response_body)
         return web.Response(body=envelope, headers={"content-type": RESPONSE_MEDIA_TYPE})
 
     try:
@@ -111,7 +113,6 @@ async def test_aiohttp_adapter_protects_buffered_json_exchange(compression: Lite
                 PSK_ID,
                 target_origin="https://api.example.test",
                 connector=connector,
-                compression=compression,
             )
             async with session:
                 async with session.post("https://api.example.test/items", json={"name": request_name}) as response:
@@ -122,6 +123,150 @@ async def test_aiohttp_adapter_protects_buffered_json_exchange(compression: Lite
             assert session.closed
             with pytest.raises(StateError):
                 await session.get("https://api.example.test/after-close")
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_formdata_stream_upload_over_tls(tmp_path: Path) -> None:
+    keys = generate_key_pair()
+    seen: list[tuple[str, str, bytes]] = []
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        assert scope["path"] == "/upload"
+        request = StarletteRequest(scope, receive)
+        async with request.form(max_files=1, max_fields=1) as form:
+            upload = form["upload"]
+            assert isinstance(upload, UploadFile)
+            assert upload.filename is not None
+            seen.append((cast(str, form["note"]), upload.filename, await upload.read()))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    middleware = HPKEMiddleware(
+        app,
+        keys.private_key,
+        KEY_ID,
+        lambda _id, _scope: PSK,
+        lambda _id, _deadline, _scope: True,
+        transport_path="/protected",
+        expected_authority="api.example.test",
+    )
+    async with live_host(middleware, tmp_path) as (endpoint, tls):
+        connector = aiohttp.TCPConnector(ssl=tls)
+        async with HPKEClientSession(
+            endpoint,
+            PinnedKey(keys.public_key, KEY_ID),
+            PSK,
+            PSK_ID,
+            target_origin="https://api.example.test",
+            connector=connector,
+        ) as session:
+            form = aiohttp.FormData()
+            form.add_field("note", "one")
+            form.add_field("upload", io.BytesIO(b"file-content"), filename="one.bin")
+            async with session.post("https://api.example.test/upload", data=form) as response:
+                assert await response.read() == b"ok"
+    assert seen == [("one", "one.bin", b"file-content")]
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_file_form_over_8_mib_over_tls(tmp_path: Path) -> None:
+    keys = generate_key_pair()
+    source_path = tmp_path / "form-upload.bin"
+    expected_hash = hashlib.sha256()
+    with source_path.open("wb") as output:
+        for _ in range(9):
+            chunk = os.urandom(1024 * 1024)
+            expected_hash.update(chunk)
+            output.write(chunk)
+    seen: list[tuple[str, int, bytes]] = []
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        assert scope["path"] == "/upload"
+        request = StarletteRequest(scope, receive)
+        async with request.form(max_files=1, max_fields=0) as form:
+            upload = form["file"]
+            assert isinstance(upload, UploadFile)
+            assert upload.filename is not None
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := await upload.read(64 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
+            seen.append((upload.filename, size, digest.digest()))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    middleware = HPKEMiddleware(
+        app,
+        keys.private_key,
+        KEY_ID,
+        lambda _id, _scope: PSK,
+        lambda _id, _deadline, _scope: True,
+        transport_path="/protected",
+        expected_authority="api.example.test",
+    )
+    async with live_host(middleware, tmp_path) as (endpoint, tls):
+        connector = aiohttp.TCPConnector(ssl=tls)
+        async with HPKEClientSession(
+            endpoint,
+            PinnedKey(keys.public_key, KEY_ID),
+            PSK,
+            PSK_ID,
+            target_origin="https://api.example.test",
+            connector=connector,
+        ) as session:
+            form = aiohttp.FormData()
+            with source_path.open("rb") as source:
+                form.add_field("file", source, filename="form-upload.bin")
+                async with session.post("https://api.example.test/upload", data=form) as response:
+                    assert await response.read() == b"ok"
+    assert seen == [("form-upload.bin", 9 * 1024 * 1024, expected_hash.digest())]
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_pinned_form_and_async_data_use_one_post() -> None:
+    keys = generate_key_pair()
+    server = Server(keys.private_key, KEY_ID)
+    bodies: list[bytes] = []
+    methods: list[str] = []
+
+    async def source() -> AsyncIterator[bytes]:
+        yield b"raw-"
+        yield b"body"
+
+    async def transport(request: web.Request) -> web.Response:
+        methods.append(request.method)
+        assert request.method == "POST"
+        assert request.headers["content-type"] == REQUEST_MEDIA_TYPE
+        opened = open_stream_request(server, await request.read(), PSK)
+        bodies.append(opened.request.body)
+        return web.Response(
+            body=opened.protect_response(Response(200, (), b"ok")),
+            headers={"content-type": RESPONSE_MEDIA_TYPE},
+        )
+
+    try:
+        async with _https_endpoint(transport) as (endpoint, connector):
+            async with HPKEClientSession(
+                str(endpoint),
+                PinnedKey(keys.public_key, KEY_ID),
+                PSK,
+                PSK_ID,
+                target_origin="https://api.example.test",
+                connector=connector,
+            ) as session:
+                form = aiohttp.FormData()
+                form.add_field("upload", io.BytesIO(b"file-content"), filename="one.bin")
+                async with session.post("https://api.example.test/upload", data=form) as response:
+                    assert await response.read() == b"ok"
+                async with session.post("https://api.example.test/upload", data=source()) as response:
+                    assert await response.read() == b"ok"
+        assert methods == ["POST", "POST"]
+        assert b'filename="one.bin"' in bodies[0]
+        assert b"file-content" in bodies[0]
+        assert bodies[1] == b"raw-body"
     finally:
         server.close()
 
@@ -142,7 +287,7 @@ async def test_buffered_aiohttp_response_accessors() -> None:
     assert await response.read() == b'{"detail":"missing"}'
     assert await response.text() == '{"detail":"missing"}'
     assert await response.json() == {"detail": "missing"}
-    with pytest.raises(Exception, match="Not Found"):
+    with pytest.raises(aiohttp.ClientResponseError, match="Not Found"):
         response.raise_for_status()
     async with response as entered:
         assert entered is response
@@ -156,7 +301,7 @@ async def test_aiohttp_adapter_rejects_nonidentity_authenticated_content() -> No
     server = Server(key_pair.private_key, KEY_ID)
 
     async def transport(request: web.Request) -> web.Response:
-        opened = server.preparse(await request.read()).authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, await request.read(), PSK)
         envelope = opened.protect_response(
             Response(
                 status=200,
@@ -225,7 +370,7 @@ async def test_aiohttp_adapter_bounds_the_actual_outer_response_body() -> None:
     server = Server(key_pair.private_key, KEY_ID)
 
     async def transport(request: web.Request) -> web.StreamResponse:
-        opened = server.preparse(await request.read()).authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, await request.read(), PSK)
         envelope = opened.protect_response(Response(status=200, body=b"ab"))
         response = web.StreamResponse(headers={"content-type": RESPONSE_MEDIA_TYPE})
         response.enable_chunked_encoding()
@@ -288,7 +433,7 @@ async def test_aiohttp_json_accepts_structured_suffix_but_not_substring_match() 
         url=URL("https://api.example.test/not-json"),
         method="GET",
     )
-    with pytest.raises(Exception, match="unexpected content type"):
+    with pytest.raises(aiohttp.ContentTypeError, match="unexpected content type"):
         await not_json.json()
 
 

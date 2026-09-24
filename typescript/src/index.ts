@@ -1,31 +1,33 @@
 import type {
   NativeAuthenticatedRequest,
+  NativeAuthenticatedStreamRequest,
   NativeClient,
   NativeModule,
   NativeOpenedRequest,
+  NativeOpenedStreamRequest,
   NativePreparsedRequest,
+  NativePreparsedStreamRequest,
   NativeProtectedRequest,
   NativeResponse,
   NativeResponseOpener,
   NativeResponseSealer,
   NativeServer,
+  NativeStreamRequestSealer,
 } from "./native.js";
 import { PACKAGE_VERSION } from "./_package-version.js";
+import { isMethod } from "./method.js";
+import type { Method } from "./method.js";
 
 /** Stable language-neutral wire-protocol identifier. */
-export const PROTOCOL_ID = "hpke-http/2";
+export const PROTOCOL_ID = "hpke-http/3";
 
 /** ABI version shared by the TypeScript facade and its private WASM module. */
-export const BINDING_ABI_VERSION = 3;
+export const BINDING_ABI_VERSION = 7;
 
 /** npm package version used to reject a mismatched private WASM module. */
 export { PACKAGE_VERSION };
 
-/** HTTP methods accepted by protocol version 2. */
-export type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
-
-/** Opt-in protocol body coding, independent of HTTP `Content-Encoding`. */
-export type CompressionCoding = "gzip" | "zstd";
+export type { Method } from "./method.js";
 
 /** One ordered end-to-end HTTP field. Repeated names remain separate entries. */
 export interface Header {
@@ -54,6 +56,9 @@ export interface Request {
   readonly body?: Uint8Array;
 }
 
+/** Request fields without a body. Client input or checked server output after admission. */
+export type RequestHead = Omit<Request, "body">;
+
 /** One complete bounded HTTP response before protection or after authentication. */
 export interface Response {
   /** Final status from 200 through 599. */
@@ -69,7 +74,7 @@ export interface Response {
 /** Optional per-engine limits. An omitted value selects the documented default. */
 export interface Limits {
   /**
-   * Request or finite response body bytes, or one SSE block.
+   * One-shot request or finite response body bytes, or one SSE block.
    * An SSE stream has no total body limit. Default: 8 MiB. Hard maximum: 64 MiB.
    */
   readonly maxBodyLength?: number;
@@ -82,6 +87,9 @@ export interface Limits {
 
   /** Combined authority and path bytes. Default and hard maximum: 8 KiB. */
   readonly maxTargetLength?: number;
+
+  /** Total clear request body bytes. Default: 1 GiB. Hard maximum: 4 GiB. */
+  readonly maxRequestBytes?: number;
 }
 
 /**
@@ -134,10 +142,6 @@ export class InitializationError extends Error {
 let nativeModule: NativeModule | undefined;
 const serverHandles = new WeakMap<Server, NativeServer>();
 const serverLimits = new WeakMap<Server, { body: number; envelope: number }>();
-let createProtectedRequest: (native: NativeProtectedRequest) => ProtectedRequest;
-let createPreparsedRequest: (native: NativePreparsedRequest, server: Server) => PreparsedRequest;
-let createAuthenticatedRequest: (native: NativeAuthenticatedRequest, maximumBody: number) => AuthenticatedRequest;
-let createOpenedRequest: (native: NativeOpenedRequest, maximumBody: number) => OpenedRequest;
 
 /** @internal */
 export function installNative(module: NativeModule): void {
@@ -195,8 +199,6 @@ export class Client {
    * @param psk - Secret of at least 32 bytes with at least 32 bytes of entropy.
    * @param pskId - Non-empty public opaque identifier, at most 255 bytes and not equal to `psk`.
    * @param limits - Optional limits applied to every request and response.
-   * @param compression - Optional authenticated body coding. Ciphertext size can reveal
-   * compression ratio, so do not mix attacker input and secrets in one body.
    * @throws {@link ProtocolError} with `invalid_configuration` for invalid input.
    */
   public constructor(
@@ -205,7 +207,6 @@ export class Client {
     psk: Uint8Array,
     pskId: Uint8Array,
     limits: Limits = {},
-    compression?: CompressionCoding,
   ) {
     const module = requireNative();
     const normalized = normalizeLimits(limits);
@@ -220,12 +221,23 @@ export class Client {
             ownedBytes(psk),
             ownedBytes(pskId),
             nativeLimits,
-            compression === undefined ? 0 : compression === "gzip" ? 1 : compression === "zstd" ? 2 : 255,
           ),
       );
     } finally {
       nativeLimits.free();
     }
+  }
+
+  /** Start one v3 request. The body can arrive in any byte cuts. */
+  public beginStream(head: RequestHead): StreamRequestSealer {
+    const native = requireHandle(this.#native);
+    return new StreamRequestSealer(callNative(() => native.begin_stream(
+      head.method,
+      head.authority,
+      head.path,
+      encodeHeaders(head.headers),
+      currentUnixSeconds(),
+    )));
   }
 
   /**
@@ -242,11 +254,11 @@ export class Client {
         request.authority,
         request.path,
         encodeHeaders(request.headers),
-        ownedBytes(request.body ?? EMPTY_BYTES),
+        request.body ?? EMPTY_BYTES,
         currentUnixSeconds(),
       ),
     );
-    return createProtectedRequest(protectedRequest);
+    return new ProtectedRequest(protectedRequest);
   }
 
   /**
@@ -266,11 +278,7 @@ export class ProtectedRequest {
   /** Owned copy of the complete protected request envelope. */
   public readonly envelope: Uint8Array;
 
-  static {
-    createProtectedRequest = (native) => new ProtectedRequest(native);
-  }
-
-  private constructor(native: NativeProtectedRequest) {
+  public constructor(native: NativeProtectedRequest) {
     this.#native = native;
     this.envelope = native.take_envelope();
   }
@@ -280,7 +288,7 @@ export class ProtectedRequest {
     return this.#native === undefined || this.#native.consumed;
   }
 
-  /** Check one complete finite response through the v2 record reader. */
+  /** Check one complete finite response through the record reader. */
   public openResponse(envelope: Uint8Array): Response {
     const opener = this.intoOpener();
     try {
@@ -325,6 +333,83 @@ export class ProtectedRequest {
   }
 }
 
+/** One checked v3 request writer. Rust owns all record and compression state. */
+export class StreamRequestSealer {
+  #native: NativeStreamRequestSealer | undefined;
+  /** Protected prefix and START bytes. Send these first. */
+  public readonly start: Uint8Array;
+
+  public constructor(native: NativeStreamRequestSealer) {
+    this.#native = native;
+    this.start = native.take_start();
+  }
+
+  /**
+   * Accept clear body bytes and return at most one protected DATA record.
+   * Pass `input.subarray(consumed)` to the next call until all bytes are used.
+   */
+  public push(input: Uint8Array): { readonly consumed: number; readonly record?: Uint8Array } {
+    // The WASM boundary copies input. Keep that copy to one record at most.
+    const result = callNative(() => requireHandle(this.#native).push(input.subarray(0, 64 * 1024)));
+    try {
+      const record = result.take_record();
+      return record === undefined ? { consumed: result.consumed } : { consumed: result.consumed, record };
+    } finally {
+      result.free();
+    }
+  }
+
+  /** Seal final DATA and END, then receive the one-use response right. */
+  public finish(): StreamFinishedRequest {
+    const native = requireHandle(this.#native);
+    try {
+      return new StreamFinishedRequest(callNative(() => native.finish()));
+    } finally {
+      this.close();
+    }
+  }
+
+  /** Discard the writer without END. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.close();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
+/** Final DATA and END bytes, with the one-use response right. */
+export class StreamFinishedRequest {
+  #native: NativeProtectedRequest | undefined;
+  /** Final DATA, if any, and END bytes. Send these before outer EOF. */
+  public readonly end: Uint8Array;
+
+  public constructor(native: NativeProtectedRequest) {
+    this.#native = native;
+    this.end = native.take_envelope();
+  }
+
+  /** Transfer the response right to a checked record reader. */
+  public intoOpener(): ResponseOpener {
+    const native = requireHandle(this.#native);
+    try {
+      return new ResponseOpener(callNative(() => native.into_opener()));
+    } finally {
+      this.close();
+    }
+  }
+
+  /** Discard the response right. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.discard();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
 /** One checked response record. SSE DATA holds one clear complete block. */
 export type CheckedRecord =
   | { readonly kind: "start"; readonly status: number; readonly headers: readonly Header[]; readonly mode: "finite" | "sse" }
@@ -337,7 +422,10 @@ export class ResponseOpener {
 
   public constructor(native: NativeResponseOpener) { this.#native = native; }
 
-  /** Consume at most one record; finite DATA returns no public record. */
+  /**
+   * Consume at most one record. Pass `input.subarray(consumed)` to the next
+   * call until all bytes are used. Finite DATA returns no public record.
+   */
   public feed(input: Uint8Array): { readonly consumed: number; readonly record?: CheckedRecord } {
     const native = requireHandle(this.#native);
     const result = callNative(() => native.feed(input));
@@ -386,13 +474,11 @@ export class Server {
    * @param recipientPrivateKey - Encoded 32-byte X25519 private key.
    * @param recipientKeyId - Non-empty public key identifier, at most 255 bytes.
    * @param limits - Optional limits applied to every request and response.
-   * @param compression - Accept gzip/zstd protocol body coding when advertised by a client.
    */
   public constructor(
     recipientPrivateKey: Uint8Array,
     recipientKeyId: Uint8Array,
     limits: Limits = {},
-    compression = false,
   ) {
     const module = requireNative();
     const normalized = normalizeLimits(limits);
@@ -404,13 +490,13 @@ export class Server {
             ownedBytes(recipientPrivateKey),
             ownedBytes(recipientKeyId),
             nativeLimits,
-            compression,
           ),
       );
+      const envelope = callNative(() => native.max_complete_envelope_len());
       serverHandles.set(this, native);
       serverLimits.set(this, {
         body: maximumBodyLength(normalized),
-        envelope: maximumEnvelopeLength(normalized),
+        envelope,
       });
     } finally {
       nativeLimits.free();
@@ -421,8 +507,22 @@ export class Server {
   public preparse(envelope: Uint8Array): PreparsedRequest {
     const native = requireServerHandle(this);
     checkLength(envelope.byteLength, requireServerLimits(this).envelope);
-    return createPreparsedRequest(
+    return new PreparsedRequest(
       callNative(() => native.preparse(ownedBytes(envelope))),
+      this,
+    );
+  }
+
+  /** Return the exact public prefix and START length when enough bytes arrived. */
+  public streamStartLength(input: Uint8Array): number | undefined {
+    return callNative(() => requireServerHandle(this).stream_start_length(input.subarray(0, 128 * 1024)));
+  }
+
+  /** Read one exact START before the host resolves its public PSK ID. */
+  public preparseStream(first: Uint8Array): PreparsedStreamRequest {
+    checkLength(first.byteLength, 128 * 1024);
+    return new PreparsedStreamRequest(
+      callNative(() => requireServerHandle(this).preparse_stream(ownedBytes(first))),
       this,
     );
   }
@@ -439,6 +539,199 @@ export class Server {
   }
 }
 
+/** Parsed START waiting for the host's PSK lookup and tag check. */
+export class PreparsedStreamRequest {
+  #native: NativePreparsedStreamRequest | undefined;
+  readonly #server: Server;
+  /** Public PSK ID for host credential lookup; this is not the PSK. */
+  public readonly pskId: Uint8Array;
+
+  public constructor(native: NativePreparsedStreamRequest, server: Server) {
+    this.#native = native;
+    this.#server = server;
+    this.pskId = ownedBytes(native.psk_id);
+  }
+
+  /** Authenticate START with the PSK resolved for `pskId`. */
+  public authenticate(psk: Uint8Array): AuthenticatedStreamRequest {
+    const native = requireHandle(this.#native);
+    try {
+      return new AuthenticatedStreamRequest(callNative(() => native.authenticate(
+        requireServerHandle(this.#server), ownedBytes(psk), currentUnixSeconds(),
+      )), requireServerLimits(this.#server).body);
+    } finally {
+      this.close();
+    }
+  }
+
+  /** Discard this stage. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.discard();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
+/**
+ * Authenticated START waiting for atomic replay admission.
+ * The host must reserve `replayId` atomically if absent and keep it until
+ * `retainUntilExclusive`. The reservation may expire at that Unix second.
+ * Report an uncertain store result as `accepted: false`.
+ */
+export class AuthenticatedStreamRequest {
+  #native: NativeAuthenticatedStreamRequest | undefined;
+  readonly #maximumBody: number;
+  /** Stable 32-byte key for one replay reservation. */
+  public readonly replayId: Uint8Array;
+  /** Unix second when the replay reservation may expire. */
+  public readonly retainUntilExclusive: number;
+
+  public constructor(native: NativeAuthenticatedStreamRequest, maximumBody: number) {
+    this.#native = native;
+    this.#maximumBody = maximumBody;
+    this.replayId = ownedBytes(native.replay_id);
+    this.retainUntilExclusive = native.retain_until_exclusive;
+  }
+
+  /** Apply the replay result before its deadline and release checked fields on success. */
+  public admit(options: { readonly accepted: boolean }): OpenedStreamRequest {
+    const native = requireHandle(this.#native);
+    try {
+      return new OpenedStreamRequest(callNative(() => native.admit(
+        options.accepted, currentUnixSeconds(),
+      )), this.#maximumBody);
+    } finally {
+      this.close();
+    }
+  }
+
+  /** Discard this stage. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.discard();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
+/** One checked upload record. Clear DATA must be stored until END and EOF. */
+export type CheckedRequestRecord =
+  | { readonly kind: "data"; readonly block: Uint8Array }
+  | { readonly kind: "end" };
+
+/** Checked START and an incremental DATA reader. */
+export class OpenedStreamRequest {
+  #native: NativeOpenedStreamRequest | undefined;
+  readonly #maximumBody: number;
+  /** Authenticated request fields, available after replay admission. */
+  public readonly head: RequestHead;
+
+  public constructor(native: NativeOpenedStreamRequest, maximumBody: number) {
+    this.#native = native;
+    this.#maximumBody = maximumBody;
+    this.head = {
+      method: parseMethod(native.method),
+      authority: native.authority,
+      path: native.path,
+      headers: decodeHeaders(native.headers_json),
+    };
+  }
+
+  /**
+   * Check at most one DATA or END record from any byte cut. Pass
+   * `input.subarray(consumed)` again until all bytes are used.
+   */
+  public feed(input: Uint8Array): { readonly consumed: number; readonly record?: CheckedRequestRecord } {
+    const result = callNative(() => requireHandle(this.#native).feed(input.subarray(0, 64 * 1024)));
+    try {
+      let record: CheckedRequestRecord | undefined;
+      if (result.kind === 1) { record = { kind: "data", block: result.block }; }
+      if (result.kind === 2) { record = { kind: "end" }; }
+      return record === undefined ? { consumed: result.consumed } : { consumed: result.consumed, record };
+    } finally {
+      result.free();
+    }
+  }
+
+  /** Check true outer EOF after END and grant the one-use response right. */
+  public finishEof(): StreamResponseRight {
+    const native = requireHandle(this.#native);
+    try {
+      return new StreamResponseRight(callNative(() => native.finish_eof()), this.#maximumBody);
+    } finally {
+      this.close();
+    }
+  }
+
+  /** Discard the upload and its response right. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.close();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
+class ResponseRight {
+  #native: NativeOpenedRequest | undefined;
+  readonly #maximumBody: number;
+
+  protected constructor(native: NativeOpenedRequest, maximumBody: number) {
+    this.#native = native;
+    this.#maximumBody = maximumBody;
+  }
+
+  /** Return whether the response right was used or discarded. */
+  public get responseConsumed(): boolean {
+    return this.#native === undefined || this.#native.response_consumed;
+  }
+
+  /** Protect a complete finite response. */
+  public protectResponse(response: Response): Uint8Array {
+    const native = requireHandle(this.#native);
+    validateResponseStatus(response.status);
+    try {
+      checkLength((response.body ?? EMPTY_BYTES).byteLength, this.#maximumBody);
+      return callNative(() => native.protect_response(
+        response.status, encodeHeaders(response.headers), response.body ?? EMPTY_BYTES,
+      ));
+    } finally {
+      this.close();
+    }
+  }
+
+  /** Start a checked response stream. */
+  public startResponse(status: number, headers: readonly Header[]): ResponseSealer {
+    const native = requireHandle(this.#native);
+    validateResponseStatus(status);
+    try {
+      return new ResponseSealer(callNative(() => native.start_response(status, encodeHeaders(headers))));
+    } finally {
+      this.close();
+    }
+  }
+
+  /** Discard the response right. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.discard_response();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
+/** Response right granted only after checked request END and true outer EOF. */
+export class StreamResponseRight extends ResponseRight {
+  public constructor(native: NativeOpenedRequest, maximumBody: number) {
+    super(native, maximumBody);
+  }
+}
+
 /** One-shot server stage waiting for host PSK resolution. */
 export class PreparsedRequest {
   #native: NativePreparsedRequest | undefined;
@@ -446,11 +739,7 @@ export class PreparsedRequest {
   /** Owned copy of the public opaque PSK identifier. It is not the PSK. */
   public readonly pskId: Uint8Array;
 
-  static {
-    createPreparsedRequest = (native, server) => new PreparsedRequest(native, server);
-  }
-
-  private constructor(native: NativePreparsedRequest, server: Server) {
+  public constructor(native: NativePreparsedRequest, server: Server) {
     this.#native = native;
     this.#server = server;
     this.pskId = ownedBytes(native.psk_id);
@@ -469,7 +758,7 @@ export class PreparsedRequest {
   public authenticate(psk: Uint8Array): AuthenticatedRequest {
     const native = requireHandle(this.#native);
     try {
-      return createAuthenticatedRequest(
+      return new AuthenticatedRequest(
         callNative(() =>
           native.authenticate(
             requireServerHandle(this.#server),
@@ -501,14 +790,10 @@ export class AuthenticatedRequest {
   /** Stable 32-byte key for one atomic reserve-if-absent operation. */
   public readonly replayId: Uint8Array;
 
-  /** Exclusive Unix-second deadline through which the replay reservation must remain. */
+  /** Unix second when the replay reservation may expire. */
   public readonly retainUntilExclusive: number;
 
-  static {
-    createAuthenticatedRequest = (native, maximumBody) => new AuthenticatedRequest(native, maximumBody);
-  }
-
-  private constructor(native: NativeAuthenticatedRequest, maximumBody: number) {
+  public constructor(native: NativeAuthenticatedRequest, maximumBody: number) {
     this.#native = native;
     this.#maximumBody = maximumBody;
     this.replayId = ownedBytes(native.replay_id);
@@ -529,7 +814,7 @@ export class AuthenticatedRequest {
   public admit(options: { readonly accepted: boolean }): OpenedRequest {
     const native = requireHandle(this.#native);
     try {
-      return createOpenedRequest(
+      return new OpenedRequest(
         callNative(() => native.admit(options.accepted, currentUnixSeconds())),
         this.#maximumBody,
       );
@@ -549,19 +834,12 @@ export class AuthenticatedRequest {
 }
 
 /** Verified plaintext request plus its one-shot response protector. */
-export class OpenedRequest {
-  #native: NativeOpenedRequest | undefined;
-  readonly #maximumBody: number;
+export class OpenedRequest extends ResponseRight {
   /** Owned authenticated request data that is safe for application dispatch. */
   public readonly request: Required<Request>;
 
-  static {
-    createOpenedRequest = (native, maximumBody) => new OpenedRequest(native, maximumBody);
-  }
-
-  private constructor(native: NativeOpenedRequest, maximumBody: number) {
-    this.#native = native;
-    this.#maximumBody = maximumBody;
+  public constructor(native: NativeOpenedRequest, maximumBody: number) {
+    super(native, maximumBody);
     this.request = {
       method: parseMethod(native.method),
       authority: native.authority,
@@ -570,61 +848,12 @@ export class OpenedRequest {
       body: native.take_body(),
     };
   }
-
-  /** Return whether the response capability was used or discarded. */
-  public get responseConsumed(): boolean {
-    return this.#native === undefined || this.#native.response_consumed;
-  }
-
-  /** Consume the capability and protect one complete response. */
-  public protectResponse(response: Response): Uint8Array {
-    const native = requireHandle(this.#native);
-    if (!Number.isSafeInteger(response.status) || response.status < 200 || response.status > 599) {
-      throw new ProtocolError(
-        "invalid_configuration",
-        "response status must be an integer from 200 through 599",
-      );
-    }
-    try {
-      checkLength((response.body ?? EMPTY_BYTES).byteLength, this.#maximumBody);
-      return callNative(() =>
-        native.protect_response(
-          response.status,
-          encodeHeaders(response.headers),
-          ownedBytes(response.body ?? EMPTY_BYTES),
-        ),
-      );
-    } finally {
-      this.close();
-    }
-  }
-
-  /** Start a checked response stream and transfer its one-use writer right. */
-  public startResponse(status: number, headers: readonly Header[]): ResponseSealer {
-    const native = requireHandle(this.#native);
-    if (!Number.isSafeInteger(status) || status < 200 || status > 599) {
-      throw new ProtocolError("invalid_configuration", "response status must be 200 through 599");
-    }
-    try {
-      return new ResponseSealer(callNative(() => native.start_response(status, encodeHeaders(headers))));
-    } finally {
-      this.close();
-    }
-  }
-
-  /** Discard the response capability. This method is idempotent. */
-  public close(): void {
-    if (this.#native !== undefined) {
-      this.#native.discard_response();
-      this.#native.free();
-      this.#native = undefined;
-    }
-  }
 }
 
 /** One checked response writer for a finite body or complete LF-normalized SSE blocks. */
 export class ResponseSealer {
   #native: NativeResponseSealer | undefined;
+  /** Protected response prefix and START bytes. Send these first. */
   public readonly start: Uint8Array;
 
   public constructor(native: NativeResponseSealer) {
@@ -661,6 +890,12 @@ export class ResponseSealer {
 
 const EMPTY_BYTES = new Uint8Array();
 
+function validateResponseStatus(status: number): void {
+  if (!Number.isSafeInteger(status) || status < 200 || status > 599) {
+    throw new ProtocolError("invalid_configuration", "response status must be an integer from 200 through 599");
+  }
+}
+
 function requireNative(): NativeModule {
   if (nativeModule === undefined) {
     throw new InitializationError(
@@ -678,6 +913,7 @@ function makeLimits(module: NativeModule, limits: Limits): InstanceType<NativeMo
         limits.maxHeaderBytes,
         limits.maxHeaderCount,
         limits.maxTargetLength,
+        limits.maxRequestBytes,
       ),
   );
 }
@@ -689,12 +925,14 @@ export function normalizeLimits(limits: Limits): Limits {
     maxHeaderBytes?: number;
     maxHeaderCount?: number;
     maxTargetLength?: number;
+    maxRequestBytes?: number;
   } = {};
   const entries = [
     ["maxBodyLength", limits.maxBodyLength],
     ["maxHeaderBytes", limits.maxHeaderBytes],
     ["maxHeaderCount", limits.maxHeaderCount],
     ["maxTargetLength", limits.maxTargetLength],
+    ["maxRequestBytes", limits.maxRequestBytes],
   ] as const;
   for (const [name, value] of entries) {
     if (value !== undefined) {
@@ -710,9 +948,10 @@ function validateLimit(name: keyof Limits, value: number): number {
     maxHeaderBytes: 64 * 1024,
     maxHeaderCount: 256,
     maxTargetLength: 8 * 1024,
+    maxRequestBytes: 4 * 1024 * 1024 * 1024,
   };
   const maximum = maximums[name];
-  if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+  if (!Number.isSafeInteger(value) || value < (name === "maxRequestBytes" ? 1 : 0) || value > maximum) {
     throw new ProtocolError(
       "invalid_configuration",
       `${name} must be an integer from 0 through ${String(maximum)}`,
@@ -746,11 +985,6 @@ function requireServerLimits(server: Server): { body: number; envelope: number }
 
 function maximumBodyLength(limits: Limits): number {
   return limits.maxBodyLength ?? 8 * 1024 * 1024;
-}
-
-function maximumEnvelopeLength(limits: Limits): number {
-  // Covers the bounded BHTTP fields, request target, outer IDs, and crypto framing.
-  return maximumBodyLength(limits) + (limits.maxHeaderBytes ?? 16 * 1024) + 64 * 1024;
 }
 
 function checkLength(length: number, maximum: number): void {
@@ -818,15 +1052,7 @@ function responseFromNative(native: NativeResponse): Response {
 }
 
 function parseMethod(value: string): Method {
-  if (
-    value === "GET" ||
-    value === "POST" ||
-    value === "PUT" ||
-    value === "PATCH" ||
-    value === "DELETE" ||
-    value === "HEAD" ||
-    value === "OPTIONS"
-  ) {
+  if (isMethod(value)) {
     return value;
   }
   throw new ProtocolError("malformed_envelope", "native module returned an invalid method");

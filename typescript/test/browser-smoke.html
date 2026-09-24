@@ -13,6 +13,7 @@
 
   const text = new TextEncoder();
   let hpkeFetch;
+  let overflowFetch;
   let discoveryFetch;
   let badDiscoveryFetch;
   let server;
@@ -93,6 +94,36 @@
     if (response.status !== 200 || (await response.text()) !== "browser-ok") {
       throw new Error("authenticated browser Fetch response did not round-trip");
     }
+    overflowFetch = createHpkeFetch({
+      endpoint: "https://api.example.test/protected",
+      key: { kind: "pin", publicKey: keys.publicKey, keyId },
+      psk, pskId,
+      limits: { maxBodyLength: 1, maxRequestBytes: 128 * 1024 },
+      fetch: async (input, init) => {
+        const outer = new Request(input, init);
+        const opened = server.preparse(new Uint8Array(await outer.arrayBuffer()))
+          .authenticate(psk).admit({ accepted: true });
+        if (new TextDecoder().decode(opened.request.body) !== "overflow-check") {
+          throw new Error("browser stream lost the buffered prefix");
+        }
+        return new Response(opened.protectResponse({ status: 204 }), {
+          status: 200, headers: { "content-type": RESPONSE_MEDIA_TYPE },
+        });
+      },
+    });
+    const uploadParts = ["o", "v", "erflow-check"];
+    let uploadPart = 0;
+    const overflow = await overflowFetch("https://api.example.test/overflow", {
+      method: "POST",
+      body: new ReadableStream({
+        pull(controller) {
+          controller.enqueue(text.encode(uploadParts[uploadPart++]));
+          if (uploadPart === uploadParts.length) controller.close();
+        },
+      }),
+      duplex: "half",
+    });
+    if (overflow.status !== 204) throw new Error("browser buffered prefix stream failed");
     const live = await hpkeFetch("https://api.example.test/browser-sse");
     if (live.status !== 200 || live.body === null) {
       throw new Error("browser SSE response did not expose a checked START");
@@ -170,6 +201,14 @@
     if (discovered.status !== 200 || (await discovered.text()) !== "browser-discovery-ok") {
       throw new Error("browser discovery exchange did not complete");
     }
+    const form = new FormData();
+    form.set("note", "browser-form-upload");
+    const uploaded = await discoveryFetch("https://api.example.test/items", {
+      method: "POST", body: form,
+    });
+    if (uploaded.status !== 200 || (await uploaded.text()) !== "browser-form-upload-ok") {
+      throw new Error("browser FormData did not reach the app with its field");
+    }
     const fault = await globalThis.fetch(`${endpoint}?bad=1`, { credentials: "omit" });
     if (fault.status !== 400 || !(await fault.text()).includes("query")) {
       throw new Error("browser could not read a cross-origin endpoint fault");
@@ -191,8 +230,8 @@
     const statsResponse = await globalThis.fetch(`${apiOrigin}/stats`, { credentials: "omit" });
     const stats = await statsResponse.json();
     if (
-      statsResponse.status !== 200 || stats.key_get !== 1 || stats.preflight < 1 ||
-      stats.protected_post !== 1 || stats.bad_get !== 1 || stats.key_get_had_credentials
+      statsResponse.status !== 200 || stats.key_get !== 2 || stats.preflight < 1 ||
+      stats.protected_post !== 2 || stats.bad_get !== 1 || stats.key_get_had_credentials
     ) {
       throw new Error(`browser discovery CORS checks failed: ${JSON.stringify(stats)}`);
     }
@@ -202,6 +241,7 @@
     await report("fail", detail);
   } finally {
     hpkeFetch?.close();
+    overflowFetch?.close();
     discoveryFetch?.close();
     badDiscoveryFetch?.close();
     server?.close();

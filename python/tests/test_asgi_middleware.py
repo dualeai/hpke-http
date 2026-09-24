@@ -16,11 +16,10 @@ from hpke_http import (
     Header,
     Limits,
     Method,
-    PreparsedRequest,
+    PreparsedStreamRequest,
     ProtocolError,
     Request,
     Response,
-    Server,
     generate_key_pair,
 )
 from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -48,10 +47,7 @@ class _ReplayStore:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("compression_coding", [None, "zstd"])
-async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
-    compression_coding: Literal["zstd"] | None,
-) -> None:
+async def test_asgi_middleware_round_trip_with_canonical_ascii_headers() -> None:
     request_body = b'{"name":"' + b"Ada" * 1024 + b'"}'
     response_body = b'{"id":"' + b"item-1" * 1024 + b'"}'
 
@@ -61,6 +57,7 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
         assert scope["headers"].count((b"content-length", str(len(request_body)).encode())) == 1
         request = await receive()
         assert request["body"] == request_body
+        assert await receive() == {"type": "http.request", "body": b"", "more_body": False}
         await send(
             {
                 "type": "http.response.start",
@@ -79,7 +76,7 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
         await send({"type": "http.response.body", "body": response_body, "more_body": False})
 
     key_pair = generate_key_pair()
-    client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID, compression=compression_coding)
+    client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
     replay_store = _ReplayStore()
     middleware = HPKEMiddleware(
         app,
@@ -87,7 +84,6 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
         KEY_ID,
         _resolve_psk,
         replay_store.admit,
-        compression=compression_coding is not None,
         transport_path="/protected",
     )
     protected = client.protect(
@@ -99,16 +95,12 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
             body=request_body,
         )
     )
-    if compression_coding is not None:
-        assert len(protected.envelope) < len(request_body)
 
     before_admission = int(time.time())
     messages = await _invoke(middleware, protected.envelope)
     assert messages[0]["status"] == 200
     assert (b"content-type", RESPONSE_MEDIA_TYPE.encode()) in messages[0]["headers"]
     assert (b"x-content-type-options", b"nosniff") not in messages[0]["headers"]
-    if compression_coding is not None:
-        assert len(cast(bytes, messages[1]["body"])) < len(response_body)
     response = protected.open_response(cast(bytes, messages[1]["body"]))
     assert response == Response(
         status=201,
@@ -376,7 +368,7 @@ async def test_asgi_middleware_rejects_a_duplicate_without_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_asgi_middleware_bounds_unannounced_outer_request_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_asgi_middleware_bounds_unannounced_outer_request_bytes() -> None:
     async def app(_scope: Scope, _receive: Receive, _send: Send) -> None:
         pytest.fail("oversized envelope must not reach the application")
 
@@ -387,7 +379,7 @@ async def test_asgi_middleware_bounds_unannounced_outer_request_bytes(monkeypatc
         KEY_ID,
         _resolve_psk,
         _ReplayStore().admit,
-        limits=Limits(max_body_len=1),
+        limits=Limits(max_request_bytes=1),
         transport_path="/protected",
     )
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
@@ -395,16 +387,10 @@ async def test_asgi_middleware_bounds_unannounced_outer_request_bytes(monkeypatc
         Request(method=Method.POST, authority="api.example.test", path="/items", body=b"x" * 100_000)
     )
 
-    def fail_preparse(_server: Server, _envelope: bytes) -> NoReturn:
-        pytest.fail("oversized outer body must be rejected before native parsing")
-
-    monkeypatch.setattr(Server, "preparse", fail_preparse)
-
     messages = await _invoke(
         middleware,
         protected.envelope,
         include_content_length=False,
-        incomplete_body=True,
     )
     assert messages[0]["status"] == 400
     assert messages[1]["body"] == b"invalid protected request"
@@ -474,10 +460,10 @@ async def test_asgi_middleware_maps_authentication_failures(
     async def app(_scope: Scope, _receive: Receive, _send: Send) -> None:
         pytest.fail("application must not receive an unauthenticated request")
 
-    def fail_authenticate(_stage: PreparsedRequest, _psk: bytes) -> NoReturn:
+    def fail_authenticate(_stage: PreparsedStreamRequest, _psk: bytes) -> NoReturn:
         raise ProtocolError(code, "injected authentication failure")
 
-    monkeypatch.setattr(PreparsedRequest, "authenticate", fail_authenticate)
+    monkeypatch.setattr(PreparsedStreamRequest, "authenticate", fail_authenticate)
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
     middleware = HPKEMiddleware(

@@ -42,7 +42,7 @@ fn stream() -> Result<(hpke_http::ResponseToken, Vec<u8>, usize, usize), Error> 
         name: b"content-type".to_vec(),
         value: b"text/event-stream; charset=utf-8".to_vec(),
     }];
-    let (mut sealer, mut wire) = capability.into_sealer(200, headers, None)?;
+    let (mut sealer, mut wire) = capability.into_sealer(200, headers)?;
     assert_eq!(sealer.head_mode(), ResponseMode::Sse);
     let start_end = wire.len();
     wire.extend_from_slice(&sealer.seal_sse_block(b": hi\n\n")?);
@@ -50,6 +50,30 @@ fn stream() -> Result<(hpke_http::ResponseToken, Vec<u8>, usize, usize), Error> 
     wire.extend_from_slice(&sealer.seal_sse_block(b"data: two\n\n")?);
     wire.extend_from_slice(&sealer.finish()?);
     Ok((token, wire, start_end, first_end))
+}
+
+#[test]
+fn large_sse_block_uses_zstd_data_and_opens_after_tag() -> Result<(), Error> {
+    let (token, capability) = pair()?;
+    let headers = vec![HeaderField {
+        name: b"content-type".to_vec(),
+        value: b"text/event-stream".to_vec(),
+    }];
+    let (mut writer, start) = capability.into_sealer(200, headers)?;
+    let mut block = b"data:".to_vec();
+    block.extend_from_slice(&vec![b'a'; 4096]);
+    block.extend_from_slice(b"\n\n");
+    let data = writer.seal_sse_block(&block)?;
+    assert!(data.len() < block.len());
+    let mut reader = token.into_opener();
+    assert!(matches!(
+        reader.feed(&start)?.1,
+        Some(ResponseRecord::Start(_))
+    ));
+    assert_eq!(reader.feed(&data)?.1, Some(ResponseRecord::SseData(block)));
+    assert_eq!(reader.feed(&writer.finish()?)?.1, Some(ResponseRecord::End));
+    assert!(reader.finish_eof()?.is_none());
+    Ok(())
 }
 
 fn read_all(
@@ -158,7 +182,7 @@ fn record_mutation_loss_repeat_order_and_wrong_request_fail() -> Result<(), Erro
 #[test]
 fn finite_writer_allows_only_one_data_and_poison_after_error() -> Result<(), Error> {
     let (_, capability) = pair()?;
-    let (mut writer, _) = capability.into_sealer(200, Vec::new(), None)?;
+    let (mut writer, _) = capability.into_sealer(200, Vec::new())?;
     assert!(writer.seal_finite_body(b"first")?.is_some());
     assert_eq!(
         writer.seal_finite_body(b"second"),
@@ -171,7 +195,7 @@ fn finite_writer_allows_only_one_data_and_poison_after_error() -> Result<(), Err
 #[test]
 fn finite_data_stays_private_until_end_and_outer_eof() -> Result<(), Error> {
     let (token, capability) = pair()?;
-    let (mut writer, start) = capability.into_sealer(200, Vec::new(), None)?;
+    let (mut writer, start) = capability.into_sealer(200, Vec::new())?;
     let data = writer
         .seal_finite_body(b"complete")?
         .ok_or(Error::MalformedEnvelope)?;
@@ -201,7 +225,7 @@ fn many_small_sse_records_can_exceed_the_finite_total_limit() -> Result<(), Erro
         name: b"content-type".to_vec(),
         value: b"text/event-stream".to_vec(),
     }];
-    let (mut writer, start) = capability.into_sealer(200, headers, None)?;
+    let (mut writer, start) = capability.into_sealer(200, headers)?;
     let mut reader = token.into_opener();
     assert!(matches!(
         reader.feed(&start)?,
@@ -285,13 +309,13 @@ fn checked_start_rejects_bad_sse_rules() -> Result<(), Error> {
             value: b"7".to_vec(),
         },
     ];
-    assert!(capability.into_sealer(200, headers, None).is_err());
+    assert!(capability.into_sealer(200, headers).is_err());
     let (_, capability) = pair()?;
     let headers = vec![HeaderField {
         name: b"content-type".to_vec(),
         value: b"text/event-stream".to_vec(),
     }];
-    let (mut sealer, _) = capability.into_sealer(200, headers, None)?;
+    let (mut sealer, _) = capability.into_sealer(200, headers)?;
     assert!(sealer.seal_sse_block(b"data: incomplete\n").is_err());
     assert!(sealer.seal_sse_block(b"\n").is_err());
     Ok(())

@@ -238,7 +238,7 @@ jobs:
 
           version, tag, source_sha = sys.argv[1:]
           release = pathlib.Path("release")
-          corpus = pathlib.Path("rust/hpke-http/tests/vectors/protocol-v2.json")
+          corpus = pathlib.Path("rust/hpke-http/tests/vectors/protocol-v3.json")
           artifacts = []
           for path in sorted(release.rglob("*")):
               if path.is_file():
@@ -256,7 +256,7 @@ jobs:
               "version": version,
               "tag": tag,
               "source_sha": source_sha,
-              "protocol_id": "hpke-http/2",
+              "protocol_id": "hpke-http/3",
               "corpus": {
                   "path": corpus.as_posix(),
                   "sha256": hashlib.sha256(corpus.read_bytes()).hexdigest(),
@@ -347,10 +347,10 @@ jobs:
           body: |
             Coordinated Rust, Python, and TypeScript/WASM release from `${{ github.sha }}`.
 
-            Protocol `hpke-http/2` uses checked START, DATA, and END response
-            records. SSE callers get each clear block after its own check, before
-            the server ends the reply. This release has no earlier wire decoder,
-            API alias, or fallback. Applications must configure recipient keys,
+            Protocol `hpke-http/3` uses one START, DATA, and END request form and
+            checked response records. SSE callers get each clear block after
+            its own check, before the server ends the reply. Applications
+            must configure recipient keys,
             PSK identities, bounds, and replay admission. Each packaged README
             has current examples.
 

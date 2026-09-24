@@ -5,15 +5,25 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from typing import Literal
 
 import httpx
 import pytest
 
-from hpke_http import Header, Limits, ProtocolError, Response, Server, StateError, TransportError, generate_key_pair
+from hpke_http import (
+    Header,
+    Limits,
+    ProtocolError,
+    Request,
+    Response,
+    Server,
+    StateError,
+    TransportError,
+    generate_key_pair,
+)
 from hpke_http.middleware import PinnedKey
 from hpke_http.middleware.httpx import HPKEAsyncClient
 from hpke_http.transport import RESPONSE_MEDIA_TYPE, filter_request_headers, filter_response_headers
+from tests.stream_request import open_stream_request
 
 KEY_ID = b"primary-2026-09"
 PSK = b"a 32-byte minimum test credential!"
@@ -21,12 +31,9 @@ PSK_ID = b"tenant-42"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("compression", [None, "gzip", "zstd"])
-async def test_httpx_adapter_protects_complete_exchange_without_ambient_headers(
-    compression: Literal["gzip", "zstd"] | None,
-) -> None:
+async def test_httpx_adapter_protects_complete_exchange_without_ambient_headers() -> None:
     key_pair = generate_key_pair()
-    server = Server(key_pair.private_key, KEY_ID, compression=compression is not None)
+    server = Server(key_pair.private_key, KEY_ID)
     seen_replays: set[bytes] = set()
     request_name = "Ada" * 1024
     response_id = "item-" + "1" * 1024
@@ -39,21 +46,36 @@ async def test_httpx_adapter_protects_complete_exchange_without_ambient_headers(
         assert "x-default" not in request.headers
         assert "x-logical" not in request.headers
         outer_envelope = await request.aread()
-        preparsed = server.preparse(outer_envelope)
+        first_length = server.stream_start_length(outer_envelope)
+        assert first_length is not None
+        preparsed = server.preparse_stream(outer_envelope[:first_length])
         assert preparsed.psk_id == PSK_ID
         authenticated = preparsed.authenticate(PSK)
         assert authenticated.replay_id not in seen_replays
         seen_replays.add(authenticated.replay_id)
-        opened = authenticated.admit(accepted=True)
-        assert opened.request.path == "/items?limit=2"
-        assert json.loads(opened.request.body) == {"name": request_name}
-        if compression is not None:
-            assert len(outer_envelope) < len(opened.request.body)
-        assert all(field.name != "accept-encoding" for field in opened.request.headers)
-        assert Header("authorization", "Bearer inner-secret") in opened.request.headers
-        assert Header("cookie", "session=inner-secret") in opened.request.headers
-        assert Header("x-default", "logical-default") in opened.request.headers
-        assert Header("x-logical", "yes") in opened.request.headers
+        opened_stream = authenticated.admit(accepted=True)
+        parts: list[bytes] = []
+        offset = first_length
+        while offset < len(outer_envelope):
+            used, record = opened_stream.feed(outer_envelope, offset)
+            offset += used
+            if record is not None and record[0] == "data":
+                parts.append(record[1])
+        opened = opened_stream.finish_eof()
+        checked_request = Request(
+            opened_stream.head.method,
+            opened_stream.head.authority,
+            opened_stream.head.path,
+            opened_stream.head.headers,
+            b"".join(parts),
+        )
+        assert checked_request.path == "/items?limit=2"
+        assert json.loads(checked_request.body) == {"name": request_name}
+        assert all(field.name != "accept-encoding" for field in checked_request.headers)
+        assert Header("authorization", "Bearer inner-secret") in checked_request.headers
+        assert Header("cookie", "session=inner-secret") in checked_request.headers
+        assert Header("x-default", "logical-default") in checked_request.headers
+        assert Header("x-logical", "yes") in checked_request.headers
         envelope = opened.protect_response(
             Response(
                 status=201,
@@ -66,8 +88,6 @@ async def test_httpx_adapter_protects_complete_exchange_without_ambient_headers(
                 body=response_body,
             )
         )
-        if compression is not None:
-            assert len(envelope) < len(response_body)
         return httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, content=envelope)
 
     adapter = HPKEAsyncClient(
@@ -77,7 +97,6 @@ async def test_httpx_adapter_protects_complete_exchange_without_ambient_headers(
         PSK_ID,
         headers={"x-default": "logical-default"},
         transport=httpx.MockTransport(transport),
-        compression=compression,
     )
     async with adapter:
         response = await adapter.post(
@@ -142,10 +161,12 @@ def test_transport_filters_are_direction_aware_and_honor_connection_nominations(
         assert filter_request_headers(fields) == (Header("x-logical", "yes"),)
         assert filter_response_headers(fields) == (Header("x-logical", "yes"),)
 
-    for name in ("accept-encoding", "content-length", "expect"):
+    for name in ("accept-encoding", "expect"):
         fields = ((name, "12"), ("x-logical", "yes"))
         assert filter_request_headers(fields) == (Header("x-logical", "yes"),)
         assert filter_response_headers(fields) == (Header(name, "12"), Header("x-logical", "yes"))
+
+    assert filter_request_headers((("content-length", "12"),)) == (Header("content-length", "12"),)
 
     for filter_headers in (filter_request_headers, filter_response_headers):
         with pytest.raises(TransportError) as captured:
@@ -162,6 +183,7 @@ def test_transport_filters_are_direction_aware_and_honor_connection_nominations(
         ("set-cookie", "second=2"),
     )
     assert filter_request_headers(fields) == (
+        Header("content-length", "12"),
         Header("set-cookie", "first=1"),
         Header("set-cookie", "second=2"),
     )
@@ -183,8 +205,7 @@ async def test_httpx_outer_set_cookie_never_reaches_a_later_exchange() -> None:
         nonlocal calls
         calls += 1
         assert "cookie" not in request.headers
-        preparsed = server.preparse(await request.aread())
-        opened = preparsed.authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, await request.aread(), PSK)
         envelope = opened.protect_response(Response(status=200, body=b"ok"))
         headers = [("content-type", RESPONSE_MEDIA_TYPE)]
         if calls == 1:
@@ -210,7 +231,7 @@ async def test_httpx_adapter_rejects_nonidentity_authenticated_content() -> None
     server = Server(key_pair.private_key, KEY_ID)
 
     async def transport(request: httpx.Request) -> httpx.Response:
-        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, await request.aread(), PSK)
         envelope = opened.protect_response(
             Response(
                 status=200,
@@ -282,7 +303,7 @@ async def test_httpx_adapter_bounds_unannounced_outer_response_bytes() -> None:
             closed = True
 
     async def transport(request: httpx.Request) -> httpx.Response:
-        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, await request.aread(), PSK)
         envelope = opened.protect_response(Response(status=200, body=b"ab"))
         response = httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, stream=OversizedStream(envelope))
         assert "content-length" not in response.headers
@@ -323,7 +344,7 @@ async def test_httpx_adapter_holds_finite_body_until_outer_eof() -> None:
             release_eof.set()
 
     async def transport(request: httpx.Request) -> httpx.Response:
-        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, await request.aread(), PSK)
         envelope = opened.protect_response(Response(status=200, body=b"complete"))
         return httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, stream=HeldStream(envelope))
 
@@ -390,16 +411,16 @@ async def test_httpx_adapter_enforces_https_and_request_limit() -> None:
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
-        limits=Limits(max_body_len=1),
+        limits=Limits(max_request_bytes=1),
         transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
     ) as adapter:
         with pytest.raises(TransportError) as insecure:
             await adapter.get("http://api.example.test/items")
         assert insecure.value.code == "invalid_target"
-        with pytest.raises(TransportError) as oversized:
+        with pytest.raises(ProtocolError) as oversized:
             await adapter.post("https://api.example.test/items", content=b"xx")
-        assert oversized.value.code == "request_too_large"
-        with pytest.raises(TransportError) as streamed_oversized:
+        assert oversized.value.code == "limit_exceeded"
+        with pytest.raises(ProtocolError) as streamed_oversized:
             await adapter.post("https://api.example.test/items", content=oversized_stream())
-        assert streamed_oversized.value.code == "request_too_large"
+        assert streamed_oversized.value.code == "limit_exceeded"
         assert stream_read

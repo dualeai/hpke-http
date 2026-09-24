@@ -26,6 +26,7 @@ impl SseSplitter {
     }
 
     /// Read at most one complete block and report the number of input bytes used.
+    /// Pass the unread suffix to the next call.
     ///
     /// # Errors
     /// Returns [`Error::LimitExceeded`] if one block exceeds its bound, or

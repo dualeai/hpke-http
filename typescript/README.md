@@ -1,17 +1,11 @@
 # hpke-http for TypeScript
 
-`@dualeai/hpke-http` is the TypeScript binding and runtime facade for the sole
-`hpke-http/2` implementation in this repository: the shared Rust engine compiled
-to WebAssembly. The generated wasm-bindgen modules are private package details.
+Use `@dualeai/hpke-http` to protect Fetch requests and check replies with the
+Rust engine in WebAssembly.
 
-The package provides a low-level record state machine and a Fetch adapter with
-live SSE bodies. It does not contain a JavaScript
-cryptographic fallback.
+## Build and runtime support
 
-## Install and runtime support
-
-Build the `/2` TypeScript package from this checkout. From the repository root,
-run:
+Build the package from this checkout. From the repository root, run:
 
 ```sh
 make install-deps-typescript install-wasm-bindgen build-typescript
@@ -32,16 +26,81 @@ import { initialize } from "@dualeai/hpke-http/node";
 await initialize();
 ```
 
-The first browser `initialize(input)` call selects the WASM input: a URL string,
-`URL`, `Request`, `Response`, byte buffer, or compiled module. Later calls share
-that result. A new call can try again after a failure. `initialize` loads the
-browser JS glue before it uses the input, so an explicit URL cannot replace
-missing glue.
-If the site uses a Content Security Policy, allow the emitted JS under
-`script-src`, allow `'wasm-unsafe-eval'` there for WASM instantiation, and allow
-any WASM URL under `connect-src`.
+Use the `/browser` entry point in a browser. Its `initialize()` call loads the
+WASM module.
 
-## Credentials and limits
+## Send a request and read its reply
+
+```ts
+import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
+
+await initialize();
+const hpkeFetch = createHpkeFetch({
+  endpoint: "https://api.example.test/protected",
+  key: { kind: "discover" },
+  psk,
+  pskId,
+});
+
+const reply = await hpkeFetch("https://api.example.test/items", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "Ada" }),
+});
+if (!reply.ok) throw new Error(`request failed: ${reply.status}`);
+const item = await reply.json();
+```
+
+The call accepts the same URL, method, headers, body, and abort signal as
+Fetch. It returns a Fetch `Response` with checked status, headers, and body.
+In Node.js, use the same call with imports from `@dualeai/hpke-http/node`.
+The next examples use this open `hpkeFetch` client. Call `hpkeFetch.close()`
+when the application no longer needs it.
+
+## Upload a file or body stream
+
+```ts
+const form = new FormData();
+form.set("file", file); // A browser File from an input element.
+const reply = await hpkeFetch("https://api.example.test/upload", {
+  method: "POST",
+  body: form,
+});
+```
+
+`Blob`, `FormData`, and body streams use the same call. The adapter reads the
+source once. Browser bodies up to 8 MiB by default use a bounded byte POST.
+Larger bodies and Node.js streams send protected records as bytes arrive.
+
+For a direct `ReadableStream` body in a browser or Node.js, pass
+`duplex: "half"` in the request options, as Fetch requires. Normal small
+`FormData` uploads work over HTTP/1.x. Browser bodies above the bounded
+threshold need Fetch upload streaming and an HTTP/2 or HTTP/3 endpoint.
+[Chrome rejects streamed requests over HTTP/1.x](https://developer.chrome.com/docs/capabilities/web-apis/fetch-streaming-requests).
+The Rust engine handles record coding and checks.
+
+## Read an SSE reply
+
+```ts
+const reply = await hpkeFetch("https://api.example.test/events");
+if (reply.body === null) throw new Error("missing SSE body");
+const reader = reply.body.getReader();
+try {
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    handleSseBlock(value);
+  }
+} finally {
+  await reader.cancel();
+}
+```
+
+Each `value` is one checked SSE block. The caller parses fields and comments.
+
+## Technical details
+
+### Credentials and limits
 
 Recipient keys use X25519 and are 32 bytes. Recipient-key and PSK identifiers
 are public opaque values from 1 through 255 bytes. A PSK needs at least 32
@@ -71,87 +130,36 @@ no longer needs them.
 
 | Limit | Default | Hard maximum |
 | --- | ---: | ---: |
-| Request, finite body, or one SSE block | 8 MiB | 64 MiB |
+| One-shot request, finite reply, or one SSE block | 8 MiB | 64 MiB |
+| Total request body across DATA records | 1 GiB | 4 GiB |
 | Combined header-name and value bytes | 16 KiB | 64 KiB |
 | Header fields per message | 64 | 256 |
 | Combined authority and path bytes | 8 KiB | 8 KiB |
 
-Pass a `Limits` object to `Client`, `Server`, or `createHpkeFetch` to make a
-limit stricter. Omitted fields use the defaults. SSE has no whole-stream body cap.
+Pass a `Limits` object to `Client`, `Server`, or `createHpkeFetch` to change a
+limit within its hard maximum. Omitted fields use the defaults. SSE has no
+whole-stream body cap.
 
-Protocol body compression is opt-in: pass `"gzip"` or `"zstd"` as the sixth
-`Client` constructor argument (after `Limits`), set `compression` in
-`createHpkeFetch`, and pass `true` as the fourth `Server` argument. The Rust
-engine codes only the body and applies the body limit both before and after
-decompression. An opt-in client requires an extension-capable server; there is
-no silent fallback. Ciphertext length can leak information when attacker
-input and secrets share a body, so leave compression disabled for those messages.
-SSE blocks use no private compression.
+Rust uses zstd for clear parts of at least 64 bytes when it shrinks them;
+other parts stay raw. It encrypts either form. Rust checks each record and
+restores the clear bytes on receipt. The application sees the original body.
+The protocol adds no padding; an observer can see record size, count, and
+timing.
 
-## Native Fetch adapter
+### Fetch behavior
 
-```ts
-import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
+The first browser `initialize(input)` call selects a WASM URL, `Request`,
+`Response`, byte buffer, or compiled module. Later calls share it. A site with
+a Content Security Policy must allow the JS module, WASM load, and WASM
+instantiation.
 
-await initialize();
-const hpkeFetch = createHpkeFetch({
-  endpoint: "https://api.example.test/protected",
-  key: { kind: "discover" },
-  psk,
-  pskId,
-});
-
-try {
-  const response = await hpkeFetch("https://api.example.test/items", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: "Ada" }),
-  });
-  if (!response.ok) {
-    throw new Error(`logical request failed with ${response.status}`);
-  }
-} finally {
-  hpkeFetch.close();
-}
-```
-
-The adapter uses only the URL, method, headers, body, and abort signal from the
-logical Fetch input. It checks the logical HTTPS origin before it reads a body.
-Discovery sends one GET per call; `{ kind: "pin", publicKey, keyId }` sends no
-GET and keeps a reusable native client. Both modes send POST to the fixed
-endpoint. The adapter buffers requests and finite replies within the
-configured limits, uses `redirect: "error"`, omits ambient credentials, and
-performs no automatic retry. For SSE it returns a synthetic `Response` after
-checked START. Each pull on its body yields one checked clear SSE block before
-the server ends the reply. For finite replies, it waits for END and real outer
-body EOF before it returns. A complete comment block can serve as a heartbeat.
-
-```ts
-const sseFetch = createHpkeFetch({
-  endpoint: "https://api.example.test/protected",
-  key: { kind: "discover" },
-  psk,
-  pskId,
-});
-try {
-  const response = await sseFetch("https://api.example.test/events");
-  const mediaType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
-  if (mediaType !== "text/event-stream") throw new Error("expected SSE response");
-  if (response.body === null) throw new Error("missing SSE body");
-  const reader = response.body.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      handleSseBlock(value); // The caller parses SSE fields and comments.
-    }
-  } finally {
-    await reader.cancel(); // Also close on an early loop exit.
-  }
-} finally {
-  sseFetch.close();
-}
-```
+The adapter checks the logical HTTPS origin before it reads a body. In a
+browser, it waits for body EOF or the first source chunk that crosses
+`maxBodyLength` before POST. This can hold the limit plus one source chunk; a
+source can supply a chunk of any size. It bounds finite replies by
+`maxBodyLength`. For SSE, it returns after checked START and yields each
+checked block as it arrives. A finite reply waits for END and real outer EOF.
+A complete comment block can serve as a heartbeat.
 
 Blocks contain raw bytes. Follow the
 [SSE parsing rules](https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream):
@@ -162,29 +170,24 @@ control fields without a dispatched data event.
 The `endpoint` is a string HTTPS URL with no query, fragment, or credentials.
 GET and POST use that same URL. Set `targetOrigin` when a gateway endpoint has
 a different HTTPS origin from the logical request. An injected `fetch`
-function owns its TLS, abort, and retry behavior and must deliver decoded
-response body bytes like native Fetch.
+function must honor the abort signal and deliver decoded response body bytes
+like native Fetch. The adapter checks browser request stream support before
+it sends a large body.
 
-GET sends no logical authorization, cookies, or PSK ID. It uses
-`credentials: "omit"`, `redirect: "error"`, and `cache: "no-store"`.
-It accepts only status 200, `application/octet-stream`, identity content
-coding, and at most 293 decoded bytes. The exact body is
-`"HHKD" || 0x01 || id_len:u8 || id || public_key[32]`, with a 1 through 255
-byte opaque ID. Any missing or extra bytes fail before protection. There is
-no app key cache or package timer. The caller's Fetch signal sets the limit
-on a pending GET.
-
-The adapter reads the full logical request body before key GET. The body read,
-GET, and protected POST run in order, so their wait times add. Use a caller
-signal with a deadline when the full call needs one. An injected Fetch function
-must honor that signal. A pinned key skips GET when the key is known and this
-extra round trip matters.
+Discovery sends one GET per call with no logical authorization, cookies, or
+PSK ID. It uses `credentials: "omit"`, `redirect: "error"`, and
+`cache: "no-store"`. It accepts only status 200, `application/octet-stream`,
+identity coding, and an exact key record of at most 293 bytes. See
+[key discovery](../README.md#key-discovery) for the record bytes. A pinned key
+skips GET. The caller's abort signal covers GET, upload, and reply. The adapter
+keeps no key cache and does not retry a protected POST.
 
 For cross-origin browser calls, the outer endpoint must allow the public GET,
-the browser's OPTIONS check, the protected POST, and fault replies. The outer POST uses
-`Content-Type: message/hpke-http-request` and `Cache-Control: no-store`.
-Configure CORS for these headers and the outer response before the HPKE
-handler or at a proxy. See the [Fetch CORS rules](https://fetch.spec.whatwg.org/#http-cors-protocol).
+the browser's OPTIONS check, the protected POST, and fault replies. The outer
+POST uses `Content-Type: message/hpke-http-request` and `Cache-Control: no-store`.
+Configure CORS before the HPKE handler or at a proxy. See the
+[Python CORS example](../python/README.md#protect-an-asgi-app) and the
+[Fetch CORS rules](https://fetch.spec.whatwg.org/#http-cors-protocol).
 
 The synthetic response represents authenticated status, headers, and body. It
 does not preserve outer URL history, redirect history, timing, or a cookie-jar
@@ -195,7 +198,7 @@ platform `Headers` object can combine other repeated fields. The low-level
 does not read. Consume or cancel each branch. An abort after Fetch returns,
 an early body cancel, or `hpkeFetch.close()` closes the protected stream.
 
-## Low-level client transaction
+### Low-level client transaction
 
 ```ts
 import { Client, initialize } from "@dualeai/hpke-http/node";
@@ -227,6 +230,14 @@ try {
 must not reuse the same envelope: call `Client.protect` again to create a fresh
 cryptographic attempt.
 
+To send a large or one-use body, call `client.beginStream(head)`. Send
+`writer.start`, pass each source byte cut to `writer.push(bytes)`, and send each
+returned `record`. Use `consumed` to pass any unconsumed bytes again. On source
+EOF, call `writer.finish()`, send its `end` bytes, then end the outer HTTP body.
+Its `intoOpener()` checks the reply. Close the writer and response right on
+failure. Rust keeps request record and zstd state; JavaScript handles only byte
+cuts and transport flow.
+
 For a low-level live reply, call `transaction.intoOpener()`. For each network
 chunk, call `feed(chunk.subarray(offset, offset + 65536))`, add `consumed` to
 `offset`, and repeat until the whole chunk is used. This 64 KiB slice bounds
@@ -242,7 +253,7 @@ after `finish()`. For a finite reply, call `sealFiniteBody(body)` once before
 `finish()`; an empty body gives no DATA record. Close both state objects on an
 early end.
 
-## Low-level server and replay admission
+### Low-level server and replay admission
 
 The TypeScript package does not provide a web-framework server adapter. A host
 can connect the staged `Server` API to its own HTTP stack:
@@ -287,7 +298,18 @@ the supplied exclusive Unix deadline. Report errors and uncertain outcomes as
 rejected. The engine checks the clock again after the store operation and never
 releases plaintext at or after the authenticated deadline.
 
-## HTTP boundary rules
+For a large upload, use the staged server reader. Collect the public prefix
+until `server.streamStartLength(prefix)` returns a length. Pass exactly that
+many bytes to `server.preparseStream(first)`. Resolve `pskId`, call
+`authenticate(psk)`, reserve `replayId`, then call `admit({ accepted })`.
+Feed the remaining outer bytes through `opened.feed(bytes)` and store each
+checked `data` block in temporary storage. Each call accepts at most 64 KiB;
+use `consumed` until all bytes pass. After `end` and true outer EOF, call
+`opened.finishEof()`. Only then dispatch the stored body to the application.
+The returned right can call `protectResponse` or `startResponse`. Close each
+stage on failure. This path uses `maxRequestBytes`, not the one-shot body limit.
+
+### HTTP boundary rules
 
 Requests use absolute HTTPS URLs without embedded credentials. Protocol headers
 are ordered lower-case token names with canonical ASCII values. Repeated fields
@@ -300,8 +322,8 @@ authentication fields, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`,
 
 Logical requests and responses accept only absent or identity
 `Content-Encoding`. The adapter does not decompress authenticated logical bytes
-outside the body bound. Opt-in Rust protocol body coding is separate from this
-HTTP representation field. Native Fetch can decode an outer response while it keeps
+outside the body bound. Native zstd record coding is separate from this HTTP
+representation field. Native Fetch can decode an outer response while it keeps
 encoded response metadata, so the adapter bounds the bytes actually yielded by
 Fetch instead of trusting outer `Content-Length`.
 
@@ -309,7 +331,7 @@ Fetch instead of trusting outer `Content-Length`.
 authenticated `Content-Length` remains valid metadata for `HEAD` and 304, must
 be zero when present on 205, and is forbidden for 204.
 
-## Errors and lifecycle
+### Errors and lifecycle
 
 `ProtocolError.code` uses the Rust engine's stable language-neutral codes:
 
@@ -320,8 +342,7 @@ be zero when present on 205, and is forbidden for 204.
   `invalid_credential`, and `authentication_failed`;
 - replay and time: `replay_rejected`, `invalid_request_time`,
   `replay_decision_mismatch`, and `clock_unavailable`;
-- platform or local operations: `entropy_unavailable`, `crypto_failure`, and
-  `compression_failure`.
+- platform or local operations: `entropy_unavailable` and `crypto_failure`.
 
 `StateError` uses `state_consumed`. `InitializationError` reports an unavailable
 or mismatched WASM module. `FetchTransportError.code` distinguishes invalid
@@ -332,17 +353,13 @@ that Web Fetch cannot represent. Key GET failures use `discovery_network`,
 `statusCode`. A bad GET sends no POST or plaintext fallback. Protected response
 record bounds use `ProtocolError`.
 
-Every live `Client`, `Server`, `ProtectedRequest`, `PreparsedRequest`,
-`AuthenticatedRequest`, `OpenedRequest`, and `HpkeFetch` has an idempotent
+Every live client, server, request stage, response right, and `HpkeFetch` has an idempotent
 `close()` method. Close objects promptly; do not depend on JavaScript garbage
 collection for credential or continuation cleanup.
 
 The package does not parse SSE fields or reconnect on its own. A reconnect
-needs a fresh protected request. Discovery adds one GET round trip per call.
-The server holds one key, so mixed worker keys during a change can make calls
-fail. The adapter does not retry a protected POST; after a lost reply, the
-caller does not know whether the app ran. Cookie-jar integration, Axios,
-TanStack Query, and more framework adapters are outside this package.
+needs a fresh protected request. After a lost reply, the caller does not know
+whether the app ran.
 
 ## Development
 

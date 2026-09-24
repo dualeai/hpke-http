@@ -1,4 +1,4 @@
-//! Bounded-input policy for protocol version 2.
+//! Bounded-input policy for protocol version 3.
 
 use crate::Error;
 
@@ -12,14 +12,13 @@ pub const HARD_MAX_HEADER_COUNT: usize = 256;
 pub const HARD_MAX_TARGET_LEN: usize = 8 * 1024;
 /// Absolute public identifier limit accepted by the implementation.
 pub const HARD_MAX_ID_LEN: usize = 255;
+/// Absolute clear request body limit (4 GiB).
+pub const HARD_MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-const BHTTP_FIXED_ALLOWANCE: usize = 256;
-const BHTTP_PER_HEADER_ALLOWANCE: usize = 16;
-
-/// Per-engine limits. Values can become stricter but never exceed hard limits.
+/// Per-engine limits. Set values within the hard limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
-    /// Maximum request or finite response body, and maximum one SSE block.
+    /// Maximum body for complete request helpers, finite replies, and SSE blocks.
     pub max_body_len: usize,
     /// Maximum combined header-name and header-value bytes per message.
     pub max_header_bytes: usize,
@@ -27,6 +26,8 @@ pub struct Limits {
     pub max_header_count: usize,
     /// Maximum combined request authority and path size.
     pub max_target_len: usize,
+    /// Maximum clear request body across all DATA records.
+    pub max_request_bytes: u64,
 }
 
 impl Default for Limits {
@@ -36,6 +37,7 @@ impl Default for Limits {
             max_header_bytes: 16 * 1024,
             max_header_count: 64,
             max_target_len: HARD_MAX_TARGET_LEN,
+            max_request_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -52,20 +54,11 @@ impl Limits {
             || self.max_header_bytes > HARD_MAX_HEADER_BYTES
             || self.max_header_count > HARD_MAX_HEADER_COUNT
             || self.max_target_len > HARD_MAX_TARGET_LEN
+            || self.max_request_bytes == 0
+            || self.max_request_bytes > HARD_MAX_REQUEST_BYTES
         {
             return Err(Error::InvalidConfiguration);
         }
         Ok(self)
-    }
-
-    pub(crate) fn max_encoded_message_len(self) -> usize {
-        self.max_body_len
-            .saturating_add(self.max_header_bytes)
-            .saturating_add(self.max_target_len)
-            .saturating_add(
-                self.max_header_count
-                    .saturating_mul(BHTTP_PER_HEADER_ALLOWANCE),
-            )
-            .saturating_add(BHTTP_FIXED_ALLOWANCE)
     }
 }

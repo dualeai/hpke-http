@@ -1,18 +1,13 @@
-//! Canonical RFC 9292 requests and field pairs used by protocol version 2.
+//! Canonical request heads and field pairs used by protocol version 3.
 //!
 //! This module implements only the small protocol subset that the engine uses.
 //! It does not depend on a general OHTTP/BHTTP package, accept indeterminate
 //! messages, informational responses, trailers, padding, or non-minimal integer
 //! encodings. Decode limits apply before any field or body allocation. The
-//! private body-coding extension uses a separately validated wire body; its
-//! logical content length is checked only after bounded decompression.
+//! request body arrives in checked DATA records.
 
 use crate::{Error, Limits, Method};
 
-const HTTPS_SCHEME: &[u8] = b"https";
-const REQUEST_MODE: u64 = 0;
-// Space for fixed framing, vector lengths, and the caller's AEAD tag.
-const ENCODING_CAPACITY_ALLOWANCE: usize = 128;
 const FORBIDDEN_HEADERS: &[&[u8]] = &[
     b"connection",
     b"expect",
@@ -52,6 +47,76 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
+/// Request fields without a body. Client input before protection and checked
+/// fields after server admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestHead {
+    /// Supported HTTP method.
+    pub method: Method,
+    /// URI authority.
+    pub authority: Vec<u8>,
+    /// Path and optional query.
+    pub path: Vec<u8>,
+    /// Ordered end-to-end HTTP fields.
+    pub headers: Vec<HeaderField>,
+}
+
+pub(crate) fn encode_stream_head(head: &RequestHead, limits: Limits) -> Result<Vec<u8>, Error> {
+    validate_target(head.method, &head.authority, &head.path, limits)?;
+    validate_payload(&head.headers, &[], limits)?;
+    stream_content_length(&head.headers)?;
+    let fields = encode_fields(&head.headers)?;
+    let mut output = Vec::with_capacity(fields.len() + head.authority.len() + head.path.len() + 64);
+    // This private stream head is not an RFC 9292 Binary HTTP message.
+    write_vector(&mut output, head.method.as_bytes())?;
+    write_vector(&mut output, &head.authority)?;
+    write_vector(&mut output, &head.path)?;
+    write_vector(&mut output, &fields)?;
+    Ok(output)
+}
+
+pub(crate) fn decode_stream_head(input: &[u8], limits: Limits) -> Result<RequestHead, Error> {
+    let mut reader = SliceReader::new(input);
+    let method = Method::from_bytes(reader.read_vector()?)?;
+    let authority = reader.read_vector()?;
+    let path = reader.read_vector()?;
+    validate_target(method, authority, path, limits).map_err(decode_validation_error)?;
+    let headers = decode_fields(reader.read_vector()?, limits).map_err(decode_validation_error)?;
+    if !reader.is_finished() {
+        return Err(Error::MalformedEnvelope);
+    }
+    stream_content_length(&headers).map_err(decode_validation_error)?;
+    Ok(RequestHead {
+        method,
+        authority: authority.to_vec(),
+        path: path.to_vec(),
+        headers,
+    })
+}
+
+pub(crate) fn stream_content_length(headers: &[HeaderField]) -> Result<Option<u64>, Error> {
+    let mut values = headers
+        .iter()
+        .filter(|field| field.name == b"content-length");
+    let Some(field) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some()
+        || field.value.is_empty()
+        || !field.value.iter().all(u8::is_ascii_digit)
+    {
+        return Err(Error::InvalidConfiguration);
+    }
+    let mut length = 0_u64;
+    for digit in &field.value {
+        length = length
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit - b'0')))
+            .ok_or(Error::LimitExceeded)?;
+    }
+    Ok(Some(length))
+}
+
 /// A complete plaintext response supplied to or returned by the engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Response {
@@ -61,91 +126,6 @@ pub struct Response {
     pub headers: Vec<HeaderField>,
     /// Complete bounded response body. Empty bodies remain authenticated.
     pub body: Vec<u8>,
-}
-
-pub(crate) fn encode_request(request: &Request, limits: Limits) -> Result<Vec<u8>, Error> {
-    encode_request_with_body(request, &request.body, limits)
-}
-
-/// Encode a validated logical message with a separately coded wire body.
-/// The private compression frame must be decoded before this becomes an HTTP message.
-pub(crate) fn encode_request_with_body(
-    request: &Request,
-    wire_body: &[u8],
-    limits: Limits,
-) -> Result<Vec<u8>, Error> {
-    validate_request(request, limits)?;
-    if wire_body.len() > limits.max_body_len {
-        return Err(Error::LimitExceeded);
-    }
-    let fields = encode_fields(&request.headers)?;
-    let mut output = Vec::with_capacity(
-        wire_body.len()
-            + fields.len()
-            + request.authority.len()
-            + request.path.len()
-            + ENCODING_CAPACITY_ALLOWANCE,
-    );
-    write_varint(&mut output, REQUEST_MODE)?;
-    write_vector(&mut output, request.method.as_bytes())?;
-    write_vector(&mut output, HTTPS_SCHEME)?;
-    write_vector(&mut output, &request.authority)?;
-    write_vector(&mut output, &request.path)?;
-    write_vector(&mut output, &fields)?;
-    write_vector(&mut output, wire_body)?;
-    write_vector(&mut output, &[])?;
-    Ok(output)
-}
-
-pub(crate) fn decode_request(input: &[u8], limits: Limits) -> Result<Request, Error> {
-    decode_request_inner(input, limits, false)
-}
-
-pub(crate) fn decode_coded_request(input: &[u8], limits: Limits) -> Result<Request, Error> {
-    decode_request_inner(input, limits, true)
-}
-
-fn decode_request_inner(input: &[u8], limits: Limits, coded_body: bool) -> Result<Request, Error> {
-    validate_encoded_length(input, limits)?;
-    let mut reader = SliceReader::new(input);
-    if reader.read_varint()? != REQUEST_MODE {
-        return Err(Error::MalformedEnvelope);
-    }
-    let method = Method::from_bytes(reader.read_vector()?)?;
-    if reader.read_vector()? != HTTPS_SCHEME {
-        return Err(Error::MalformedEnvelope);
-    }
-    let authority = reader.read_vector()?;
-    let path = reader.read_vector()?;
-    validate_target(method, authority, path, limits).map_err(decode_validation_error)?;
-    let headers = decode_fields(reader.read_vector()?, limits).map_err(decode_validation_error)?;
-    let body = reader.read_vector()?;
-    if body.len() > limits.max_body_len {
-        return Err(Error::LimitExceeded);
-    }
-    if !reader.read_vector()?.is_empty() || !reader.is_finished() {
-        return Err(Error::MalformedEnvelope);
-    }
-    let request = Request {
-        method,
-        authority: authority.to_vec(),
-        path: path.to_vec(),
-        headers,
-        body: body.to_vec(),
-    };
-    if !coded_body {
-        validate_decoded_request_body(&request)?;
-    }
-    Ok(request)
-}
-
-pub(crate) fn validate_decoded_request_body(request: &Request) -> Result<(), Error> {
-    validate_content_length(
-        &request.headers,
-        request.body.len(),
-        ContentLengthRule::Exact,
-    )
-    .map_err(decode_validation_error)
 }
 
 pub(crate) fn validate_decoded_response_body(
@@ -203,14 +183,7 @@ pub(crate) fn decode_fields(input: &[u8], limits: Limits) -> Result<Vec<HeaderFi
     Ok(headers)
 }
 
-fn validate_encoded_length(input: &[u8], limits: Limits) -> Result<(), Error> {
-    if input.len() > limits.max_encoded_message_len() {
-        return Err(Error::LimitExceeded);
-    }
-    Ok(())
-}
-
-fn validate_request(request: &Request, limits: Limits) -> Result<(), Error> {
+pub(crate) fn validate_request(request: &Request, limits: Limits) -> Result<(), Error> {
     validate_target(request.method, &request.authority, &request.path, limits)?;
     validate_payload(&request.headers, &request.body, limits)?;
     validate_content_length(
@@ -657,8 +630,8 @@ const fn varint_length(value: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{SliceReader, decode_fields, decode_request, encode_request, write_varint};
-    use crate::{Error, HeaderField, Limits, Method, Request};
+    use super::{SliceReader, decode_fields, decode_stream_head, encode_stream_head, write_varint};
+    use crate::{Error, HeaderField, Limits, Method, RequestHead};
 
     #[test]
     fn field_decoder_stops_at_the_configured_count() {
@@ -698,8 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn request_decoder_rechecks_authenticated_content_length() -> Result<(), Error> {
-        let request = Request {
+    fn stream_head_decoder_rechecks_authenticated_content_length() -> Result<(), Error> {
+        let request = RequestHead {
             method: Method::Post,
             authority: b"api.example.test".to_vec(),
             path: b"/items".to_vec(),
@@ -707,39 +680,37 @@ mod tests {
                 name: b"content-length".to_vec(),
                 value: b"4".to_vec(),
             }],
-            body: b"body".to_vec(),
         };
-        let mut encoded = encode_request(&request, Limits::default())?;
+        let mut encoded = encode_stream_head(&request, Limits::default())?;
         let name_offset = encoded
             .windows(b"content-length".len())
             .position(|window| window == b"content-length")
             .ok_or(Error::MalformedEnvelope)?;
         let value_offset = name_offset + b"content-length".len() + 1;
-        encoded[value_offset] = b'5';
+        encoded[value_offset] = b'x';
         assert_eq!(
-            decode_request(&encoded, Limits::default()).err(),
+            decode_stream_head(&encoded, Limits::default()).err(),
             Some(Error::MalformedEnvelope)
         );
         Ok(())
     }
 
     #[test]
-    fn request_decoder_rechecks_authenticated_authority_syntax() -> Result<(), Error> {
-        let request = Request {
+    fn stream_head_decoder_rechecks_authenticated_authority_syntax() -> Result<(), Error> {
+        let request = RequestHead {
             method: Method::Get,
             authority: b"api.example".to_vec(),
             path: b"/items".to_vec(),
             headers: Vec::new(),
-            body: Vec::new(),
         };
-        let mut encoded = encode_request(&request, Limits::default())?;
+        let mut encoded = encode_stream_head(&request, Limits::default())?;
         let authority_offset = encoded
             .windows(b"api.example".len())
             .position(|window| window == b"api.example")
             .ok_or(Error::MalformedEnvelope)?;
         encoded[authority_offset] = b'[';
         assert_eq!(
-            decode_request(&encoded, Limits::default()).err(),
+            decode_stream_head(&encoded, Limits::default()).err(),
             Some(Error::MalformedEnvelope)
         );
         Ok(())
