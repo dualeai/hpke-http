@@ -33,8 +33,9 @@ await initialize();
 ```
 
 Browser initialization accepts an explicit WASM URL, `Response`, byte buffer, or
-compiled module when the default adjacent asset does not fit the deployment's
-asset path or Content Security Policy.
+compiled module to select the WASM input. The package still imports its browser
+JS glue first. The host must allow that module, any WASM fetch, and WASM
+compilation.
 
 ## Credentials and limits
 
