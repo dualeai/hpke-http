@@ -2,24 +2,41 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pytest
 
-from hpke_http import Client, Header, Method, Request, Response, Server, SseSplitter, generate_key_pair
+from hpke_http import Client, Header, Method, Request, RequestHead, Response, Server, SseSplitter, generate_key_pair
 
 pytestmark = pytest.mark.benchmark
 
 
-@pytest.mark.parametrize("size", [0, 1024, 1024 * 1024, 8 * 1024 * 1024], ids=["empty", "1KiB", "1MiB", "8MiB"])
-def test_roundtrip(benchmark: Any, size: int) -> None:
+@pytest.mark.parametrize(
+    ("size", "data_kind"),
+    [
+        (0, "repeated"),
+        (1024, "repeated"),
+        (1024 * 1024, "repeated"),
+        (8 * 1024 * 1024, "repeated"),
+        (1024 * 1024, "random"),
+        (8 * 1024 * 1024, "random"),
+    ],
+    ids=["empty", "1KiB", "1MiB", "8MiB", "1MiB-random", "8MiB-random"],
+)
+def test_roundtrip(benchmark: Any, size: int, data_kind: str) -> None:
     keys = generate_key_pair()
     key_id = b"benchmark-key"
     psk = b"a 32-byte minimum benchmark credential"
     client = Client(keys.public_key, key_id, psk, b"benchmark-tenant")
     server = Server(keys.private_key, key_id)
-    request = Request(method=Method.POST, authority="api.example.test", path="/benchmark", body=b"B" * size)
-    response = Response(status=200, body=b"C" * size)
+    request = Request(
+        method=Method.POST,
+        authority="api.example.test",
+        path="/benchmark",
+        body=os.urandom(size) if data_kind == "random" else b"B" * size,
+    )
+    response = Response(status=200, body=os.urandom(size) if data_kind == "random" else b"C" * size)
 
     def roundtrip() -> bytes:
         protected = client.protect(request)
@@ -34,6 +51,33 @@ def test_roundtrip(benchmark: Any, size: int) -> None:
     finally:
         client.close()
         server.close()
+
+
+@pytest.mark.parametrize("data_kind", ["repeated", "random"])
+def test_upload_stream_1_mib(benchmark: Any, data_kind: str) -> None:
+    keys = generate_key_pair()
+    client = Client(keys.public_key, b"benchmark-key", b"a 32-byte minimum benchmark credential", b"benchmark-tenant")
+    head = RequestHead(method=Method.POST, authority="api.example.test", path="/upload")
+    body = os.urandom(1024 * 1024) if data_kind == "random" else b"B" * (1024 * 1024)
+
+    def upload() -> int:
+        writer, first = client.begin_stream(head)
+        wire_bytes = len(first)
+        offset = 0
+        while offset < len(body):
+            used, frame = writer.push(body[offset : offset + 64 * 1024])
+            offset += used
+            if frame is not None:
+                wire_bytes += len(frame)
+        end, right = writer.finish()
+        right.close()
+        return wire_bytes + len(end)
+
+    try:
+        if benchmark(upload) <= 0:
+            raise AssertionError("upload benchmark returned no wire bytes")
+    finally:
+        client.close()
 
 
 def test_sse_joined_split(benchmark: Any) -> None:
