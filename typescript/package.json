@@ -46,7 +46,7 @@
     "build:wasm": "node scripts/build-wasm.mjs",
     "build:ts": "npm run generate:version && tsc -p tsconfig.json",
     "build": "npm run clean && npm run build:wasm && npm run build:ts",
-    "check": "npm run generate:version && tsc -p tsconfig.json --noEmit",
+    "check": "npm run build:wasm && npm run generate:version && tsc -p tsconfig.json --noEmit",
     "test:node": "node --test test/*.test.mjs",
     "test:browser": "node scripts/test-browser.mjs",
     "test": "npm run test:node && npm run test:browser",
@@ -57,6 +57,7 @@
     "@codspeed/vitest-plugin": "5.7.1",
     "@types/node": "24.13.6",
     "typescript": "7.0.2",
+    "vite8": "npm:vite@8.2.2",
     "vitest": "4.1.11"
   },
   "packageManager": "npm@11.19.1"

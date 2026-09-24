@@ -200,6 +200,7 @@ smoke-python-sdist:
 		$(PYTHON_DIR)/tests/artifact_smoke.py $(if $(EXPECTED_VERSION),"$(EXPECTED_VERSION)")
 
 smoke-typescript:
+	@set -- $(ARTIFACT_DIR)/npm/*.tgz; test "$$#" -eq 1 && test -f "$$1"
 	mkdir -p $(NPM_SMOKE_DIR)
 	cd $(NPM_SMOKE_DIR) && \
 		npm init --yes >/dev/null && \
@@ -207,6 +208,7 @@ smoke-typescript:
 			"$(abspath $(ARTIFACT_DIR)/npm)"/*.tgz && \
 		cp "$(abspath $(TYPESCRIPT_DIR)/test/artifact-smoke.mjs)" . && \
 		$(if $(EXPECTED_VERSION),EXPECTED_VERSION="$(EXPECTED_VERSION)" )node artifact-smoke.mjs
+	node $(TYPESCRIPT_DIR)/test/vite-artifact-smoke.mjs "$(abspath $(ARTIFACT_DIR)/npm)"/*.tgz
 
 lint:
 	cd $(PYTHON_DIR) && uv run ruff format .

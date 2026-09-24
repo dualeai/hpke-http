@@ -192,6 +192,8 @@ locked versions. Package targets write to `artifacts/`. Run
 `make smoke-python-wheel`, `make smoke-python-sdist`, or `make smoke-typescript`
 after you build the matching package. Set `EXPECTED_VERSION` to the release
 tag's numeric version, without its `v` prefix, when you check a release package.
+The TypeScript smoke target also needs installed TypeScript dev dependencies and
+Chrome or Chromium. Set `CHROME_BIN` if the browser is not in a standard path.
 
 The separate CodSpeed workflow measures complete public-API transactions in
 Rust, Python, and Node/WASM at empty, 1 KiB, 1 MiB, and 8 MiB body sizes. It
