@@ -32,9 +32,14 @@ import { initialize } from "@dualeai/hpke-http/node";
 await initialize();
 ```
 
-Browser initialization accepts an explicit WASM URL, `Response`, byte buffer, or
-compiled module when the default adjacent asset does not fit the deployment's
-asset path or Content Security Policy.
+The first browser `initialize(input)` call selects the WASM input: a URL string,
+`URL`, `Request`, `Response`, byte buffer, or compiled module. Later calls share
+that result. A new call can try again after a failure. `initialize` loads the
+browser JS glue before it uses the input, so an explicit URL cannot replace
+missing glue.
+If the site uses a Content Security Policy, allow the emitted JS under
+`script-src`, allow `'wasm-unsafe-eval'` there for WASM instantiation, and allow
+any WASM URL under `connect-src`.
 
 ## Credentials and limits
 
@@ -347,3 +352,9 @@ repository root. The test target builds the WASM package, runs the Node facade
 tests, and runs a browser smoke test. That test covers pinned and discovered
 calls, checked SSE, aborts, and CORS over local HTTPS. It requires Chrome or
 Chromium; set `CHROME_BIN` when it is not in a standard path.
+
+Run `make package-typescript smoke-typescript` to check the packed npm archive
+with Vite 8.2.2 and Chrome. This also checks browser initialization under a
+restrictive test CSP. A deployed site's own CSP needs its own integration check.
+The standalone `npm run check` builds the generated WASM types first and needs
+the same Rust and wasm-bindgen tools as `build`.

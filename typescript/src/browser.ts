@@ -43,15 +43,15 @@ export type BrowserWasmInput =
   | WebAssembly.Module;
 
 let initialization: Promise<void> | undefined;
-const wasmModulePath = "../_wasm/browser/hpke_http_wasm.js";
 
 /**
  * Load and verify the browser ESM WASM module exactly once.
  *
- * Pass an explicit URL, response, byte buffer, or compiled module when the
- * default adjacent-WASM fetch does not fit the host's asset or CSP policy.
+ * The first call selects the WASM input. Later calls share its result. After
+ * a failed call, a new call can try again. The loader imports its JS glue only
+ * when called, before it uses the input. A site CSP must allow that module,
+ * any WASM fetch, and WASM instantiation (`'wasm-unsafe-eval'` in `script-src`).
  * The runtime must provide WebAssembly, Fetch, Web Crypto, and Web Streams.
- * A failed attempt can be retried after its returned promise rejects.
  */
 export function initialize(input?: BrowserWasmInput): Promise<void> {
   initialization ??= initializeOnce(input).catch((error: unknown) => {
@@ -60,14 +60,14 @@ export function initialize(input?: BrowserWasmInput): Promise<void> {
       throw error;
     }
     throw new InitializationError(
-      `could not initialize hpke-http browser WASM; check the WASM asset URL and CSP: ${String(error)}`,
+      `could not initialize hpke-http browser WASM; check the JS glue, WASM asset URL, and CSP: ${String(error)}`,
     );
   });
   return initialization;
 }
 
 async function initializeOnce(input?: BrowserWasmInput): Promise<void> {
-  const bindings = (await import(wasmModulePath)) as unknown as NativeModule & {
+  const bindings = (await import("../_wasm/browser/hpke_http_wasm.js")) as unknown as NativeModule & {
     default(options?: { module_or_path: BrowserWasmInput }): Promise<unknown>;
   };
   if (input === undefined) {
