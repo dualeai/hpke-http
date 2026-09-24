@@ -46,7 +46,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "cryptography~=48.0",       # Independent v2 corpus check
+    "cryptography~=48.0",       # Independent protocol corpus check
     "maturin>=1.9,<2",           # Build and develop the private PyO3 extension
     "pytest-codspeed==5.0.3",    # CI benchmarks for the Python binding
     "pyright~=1.1",
@@ -59,6 +59,7 @@ dev = [
     "twine~=6.1",                # Package verification before PyPI upload
     "vulture~=2.14",
     "uvicorn==0.53.0",           # Local TLS ASGI live-stream tests
+    "zstandard>=0.24,<1",       # Independent zstd check for native sender records
 ]
 # For downstream services using testing fixtures
 testing = [
@@ -67,6 +68,7 @@ testing = [
 ]
 # FastAPI middleware (optional for server-side)
 fastapi = [
+    "python-multipart~=0.0.32",
     "starlette~=0.50",
 ]
 # aiohttp client (optional for client-side)

@@ -14,7 +14,6 @@ categories = ["cryptography", "web-programming"]
 
 [dependencies]
 chacha20poly1305.workspace = true
-flate2.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 hpke.workspace = true

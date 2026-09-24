@@ -1,6 +1,4 @@
-//! Checked v2 response records. A caller supplies true transport EOF separately.
-
-use std::borrow::Cow;
+//! Checked v3 response records. A caller supplies true transport EOF separately.
 
 use chacha20poly1305::{
     ChaCha20Poly1305,
@@ -8,7 +6,7 @@ use chacha20poly1305::{
 };
 
 use crate::{
-    CompressionCoding, EntropySource, Error, HeaderField, Method, Response,
+    EntropySource, Error, HeaderField, Method, Response,
     codec::{RESPONSE_NONCE_LEN, TAG_LEN, VERSION},
     compression,
     engine::{ResponseMaterial, derive_response_key_nonce},
@@ -18,12 +16,13 @@ use crate::{
 
 const MAGIC: &[u8; 4] = b"HHRP";
 const PREFIX_LEN: usize = 4 + 1 + RESPONSE_NONCE_LEN;
-const AAD_DOMAIN: &[u8] = b"hpke-http/2 response record\0";
+const AAD_DOMAIN: &[u8] = b"hpke-http/3 response record\0";
 const AAD_LEN: usize = AAD_DOMAIN.len() + PREFIX_LEN + 8 + 4;
 const START: u8 = 1;
 const DATA: u8 = 2;
 const END: u8 = 3;
 const MIN_CIPHERTEXT_LEN: usize = 1 + TAG_LEN;
+const RETAIN_FRAME_CAPACITY: usize = 64 * 1024;
 
 /// The checked response kind, based on its single Content-Type field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,8 +42,6 @@ pub struct ResponseHead {
     pub headers: Vec<HeaderField>,
     /// Response body kind.
     pub mode: ResponseMode,
-    /// Private body coding. SSE always uses identity.
-    pub coding: Option<CompressionCoding>,
 }
 
 /// One checked record. Finite body bytes remain in the opener until END.
@@ -94,13 +91,19 @@ impl Crypto {
         aad
     }
 
-    fn seal_record(&mut self, kind: u8, body: &[u8], terminal: bool) -> Result<Vec<u8>, Error> {
+    fn seal_record(
+        &mut self,
+        kind: u8,
+        coding: Option<u8>,
+        body: &[u8],
+        terminal: bool,
+    ) -> Result<Vec<u8>, Error> {
         if self.sequence == u64::MAX && !terminal {
             return Err(Error::LimitExceeded);
         }
         let length = body
             .len()
-            .checked_add(1)
+            .checked_add(1 + usize::from(coding.is_some()))
             .and_then(|size| size.checked_add(TAG_LEN))
             .ok_or(Error::LimitExceeded)?;
         let length = u32::try_from(length).map_err(|_| Error::LimitExceeded)?;
@@ -110,6 +113,9 @@ impl Crypto {
         let mut framed = Vec::with_capacity(frame_len);
         framed.extend_from_slice(&length.to_be_bytes());
         framed.push(kind);
+        if let Some(coding) = coding {
+            framed.push(coding);
+        }
         framed.extend_from_slice(body);
         let cipher = ChaCha20Poly1305::new(&Array(*self.key));
         let tag = cipher
@@ -142,7 +148,6 @@ impl Crypto {
 fn classify_head(
     status: u16,
     headers: &[HeaderField],
-    coding: Option<CompressionCoding>,
     material: &ResponseMaterial,
 ) -> Result<ResponseMode, Error> {
     message::validate_response_head(status, headers, material.limits)?;
@@ -163,7 +168,6 @@ fn classify_head(
     if is_sse {
         if status != 200
             || material.method == Method::Head
-            || coding.is_some()
             || headers
                 .iter()
                 .any(|field| field.name == b"content-length" || field.name == b"content-encoding")
@@ -171,8 +175,6 @@ fn classify_head(
             return Err(Error::InvalidConfiguration);
         }
         Ok(ResponseMode::Sse)
-    } else if coding.is_some() && coding != material.compression {
-        Err(Error::InvalidConfiguration)
     } else {
         Ok(ResponseMode::Finite)
     }
@@ -199,21 +201,19 @@ impl ResponseSealer {
         material: &ResponseMaterial,
         status: u16,
         headers: Vec<HeaderField>,
-        coding: Option<CompressionCoding>,
         entropy: &mut impl EntropySource,
     ) -> Result<(Self, Vec<u8>), Error> {
-        let mode = classify_head(status, &headers, coding, material)?;
+        let mode = classify_head(status, &headers, material)?;
         let mut prefix = [0_u8; PREFIX_LEN];
         prefix[..4].copy_from_slice(MAGIC);
         prefix[4] = VERSION;
         entropy.fill(&mut prefix[5..])?;
         let mut crypto = Crypto::new(material, prefix)?;
         let fields = message::encode_fields(&headers)?;
-        let mut start = Vec::with_capacity(3 + fields.len());
+        let mut start = Vec::with_capacity(2 + fields.len());
         start.extend_from_slice(&status.to_be_bytes());
-        start.push(coding.map_or(0, CompressionCoding::wire_id));
         start.extend_from_slice(&fields);
-        let frame = crypto.seal_record(START, &start, false)?;
+        let frame = crypto.seal_record(START, None, &start, false)?;
         let mut output = Vec::with_capacity(PREFIX_LEN + frame.len());
         output.extend_from_slice(&prefix);
         output.extend_from_slice(&frame);
@@ -224,7 +224,6 @@ impl ResponseSealer {
                     status,
                     headers,
                     mode,
-                    coding,
                 },
                 method: material.method,
                 limits: material.limits,
@@ -252,37 +251,26 @@ impl ResponseSealer {
             return Err(Error::InvalidConfiguration);
         }
         validate_block(block, self.limits.max_body_len)?;
+        let (coding, coded) = compression::encode(block);
         self.crypto
             .as_mut()
             .ok_or(Error::InvalidConfiguration)?
-            .seal_record(DATA, block, false)
+            .seal_record(DATA, Some(coding), &coded, false)
     }
 
     /// Protect the complete logical finite body. An empty body emits no DATA.
     ///
     /// # Errors
-    /// Returns a validation, limit, compression, or cryptographic error and closes the writer.
+    /// Returns a validation, limit, or cryptographic error and closes the writer.
     pub fn seal_finite_body(&mut self, body: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.seal_finite_body_with_precompressed(body, None)
-    }
-
-    pub(crate) fn seal_finite_body_with_precompressed(
-        &mut self,
-        body: &[u8],
-        precompressed: Option<&[u8]>,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        let result = self.seal_finite_body_inner(body, precompressed);
+        let result = self.seal_finite_body_inner(body);
         if result.is_err() {
             self.poison();
         }
         result
     }
 
-    fn seal_finite_body_inner(
-        &mut self,
-        body: &[u8],
-        precompressed: Option<&[u8]>,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    fn seal_finite_body_inner(&mut self, body: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         if self.done || self.head.mode != ResponseMode::Finite || self.finite_data_sent {
             return Err(Error::InvalidConfiguration);
         }
@@ -301,26 +289,15 @@ impl ResponseSealer {
             return Err(Error::InvalidConfiguration);
         }
         if body.is_empty() {
-            if self.head.coding.is_some() || precompressed.is_some() {
-                return Err(Error::InvalidConfiguration);
-            }
             self.finite_data_sent = true;
             return Ok(None);
         }
-        let encoded = match (self.head.coding, precompressed) {
-            (Some(_), Some(encoded)) => Cow::Borrowed(encoded),
-            (Some(coding), None) => Cow::Owned(compression::compress(body, coding)?),
-            (None, None) => Cow::Borrowed(body),
-            (None, Some(_)) => return Err(Error::InvalidConfiguration),
-        };
-        if encoded.len() > self.limits.max_body_len {
-            return Err(Error::LimitExceeded);
-        }
+        let (coding, encoded) = compression::encode(body);
         let frame = self
             .crypto
             .as_mut()
             .ok_or(Error::InvalidConfiguration)?
-            .seal_record(DATA, &encoded, false)?;
+            .seal_record(DATA, Some(coding), &encoded, false)?;
         self.finite_data_sent = true;
         Ok(Some(frame))
     }
@@ -338,7 +315,7 @@ impl ResponseSealer {
             .crypto
             .as_mut()
             .ok_or(Error::InvalidConfiguration)?
-            .seal_record(END, &[], true);
+            .seal_record(END, None, &[], true);
         self.poison();
         result
     }
@@ -389,7 +366,8 @@ impl ResponseOpener {
     }
 
     /// Read at most one checked record and return how many input bytes were used.
-    /// Finite DATA stays inside the reader and returns no public record.
+    /// Pass the unread suffix to the next call. Finite DATA stays inside the
+    /// reader and returns no public record.
     ///
     /// # Errors
     /// Any parse, limit, order, or tag error closes this reader.
@@ -444,7 +422,7 @@ impl ResponseOpener {
                         + material.limits.max_header_count * 16
                         + TAG_LEN
                 } else {
-                    1 + material.limits.max_body_len + TAG_LEN
+                    2 + material.limits.max_body_len + TAG_LEN
                 };
                 if length < MIN_CIPHERTEXT_LEN {
                     return Err(Error::MalformedEnvelope);
@@ -462,7 +440,11 @@ impl ResponseOpener {
                 return Ok((used, None));
             }
             let record = self.open_frame()?;
-            self.frame = Vec::new();
+            if self.frame.capacity() > RETAIN_FRAME_CAPACITY {
+                self.frame = Vec::new();
+            } else {
+                self.frame.clear();
+            }
             self.length.clear();
             self.expected = None;
             if self.done && used < input.len() {
@@ -481,20 +463,18 @@ impl ResponseOpener {
             .open(&mut self.frame, length)?;
         let (&kind, body) = self.frame.split_first().ok_or(Error::MalformedEnvelope)?;
         if self.head.is_none() {
-            if kind != START || body.len() < 3 {
+            if kind != START || body.len() < 2 {
                 return Err(Error::MalformedEnvelope);
             }
             let status = u16::from_be_bytes([body[0], body[1]]);
-            let coding = CompressionCoding::from_wire_id(body[2])?;
             let material = self.material.as_ref().ok_or(Error::MalformedEnvelope)?;
             let headers =
-                message::decode_fields(&body[3..], material.limits).map_err(decode_error)?;
-            let mode = classify_head(status, &headers, coding, material).map_err(decode_error)?;
+                message::decode_fields(&body[2..], material.limits).map_err(decode_error)?;
+            let mode = classify_head(status, &headers, material).map_err(decode_error)?;
             let head = ResponseHead {
                 status,
                 headers,
                 mode,
-                coding,
             };
             self.head = Some(head.clone());
             self.crypto
@@ -506,22 +486,19 @@ impl ResponseOpener {
         let head = self.head.as_ref().ok_or(Error::MalformedEnvelope)?;
         match kind {
             DATA => {
-                if body.is_empty() {
+                if body.len() < 2 {
                     return Err(Error::MalformedEnvelope);
                 }
                 if head.mode == ResponseMode::Sse {
                     let material = self.material.as_ref().ok_or(Error::MalformedEnvelope)?;
-                    validate_block(body, material.limits.max_body_len)?;
+                    let block =
+                        compression::decode(body[0], &body[1..], material.limits.max_body_len)?;
+                    validate_block(&block, material.limits.max_body_len)?;
                     self.crypto
                         .as_mut()
                         .ok_or(Error::MalformedEnvelope)?
                         .advance()?;
-                    let body_len = body.len();
-                    self.frame.copy_within(1.., 0);
-                    self.frame.truncate(body_len);
-                    Ok(Some(ResponseRecord::SseData(std::mem::take(
-                        &mut self.frame,
-                    ))))
+                    Ok(Some(ResponseRecord::SseData(block)))
                 } else {
                     if self.finite_body.is_some() {
                         return Err(Error::MalformedEnvelope);
@@ -530,10 +507,12 @@ impl ResponseOpener {
                         .as_mut()
                         .ok_or(Error::MalformedEnvelope)?
                         .advance()?;
-                    let body_len = body.len();
-                    self.frame.copy_within(1.., 0);
-                    self.frame.truncate(body_len);
-                    self.finite_body = Some(std::mem::take(&mut self.frame));
+                    let material = self.material.as_ref().ok_or(Error::MalformedEnvelope)?;
+                    self.finite_body = Some(compression::decode(
+                        body[0],
+                        &body[1..],
+                        material.limits.max_body_len,
+                    )?);
                     Ok(None)
                 }
             }
@@ -552,12 +531,7 @@ impl ResponseOpener {
     fn finish_finite(&mut self) -> Result<(), Error> {
         let head = self.head.as_ref().ok_or(Error::MalformedEnvelope)?;
         let material = self.material.as_ref().ok_or(Error::MalformedEnvelope)?;
-        let encoded = self.finite_body.take().unwrap_or_default();
-        let body = if let Some(coding) = head.coding {
-            compression::decompress(&encoded, coding, material.limits.max_body_len)?
-        } else {
-            encoded
-        };
+        let body = self.finite_body.take().unwrap_or_default();
         let response = Response {
             status: head.status,
             headers: head.headers.clone(),
@@ -620,20 +594,19 @@ mod tests {
             enc: [8; 32],
             method: Method::Get,
             limits: crate::Limits::default(),
-            compression: None,
         };
         let mut prefix = [0; PREFIX_LEN];
         prefix[..4].copy_from_slice(MAGIC);
         prefix[4] = VERSION;
         let mut writer = Crypto::new(&material, prefix)?;
         writer.sequence = u64::MAX - 1;
-        let data = writer.seal_record(DATA, b"x", false)?;
+        let data = writer.seal_record(DATA, None, b"x", false)?;
         assert_eq!(writer.sequence, u64::MAX);
         assert_eq!(
-            writer.seal_record(DATA, b"y", false),
+            writer.seal_record(DATA, None, b"y", false),
             Err(Error::LimitExceeded)
         );
-        let end = writer.seal_record(END, &[], true)?;
+        let end = writer.seal_record(END, None, &[], true)?;
         let mut reader = Crypto::new(&material, prefix)?;
         reader.sequence = u64::MAX - 1;
         let mut data_body = data[4..].to_vec();

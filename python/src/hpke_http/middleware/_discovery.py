@@ -5,18 +5,14 @@ from __future__ import annotations
 import ipaddress
 from collections.abc import AsyncIterable, Sequence
 from dataclasses import dataclass
-from typing import Literal
 from urllib.parse import urlsplit
 
 import idna
 
-from hpke_http.middleware._native_async import run_native
 from hpke_http.protocol import (
     Client,
     Limits,
-    ProtectedRequest,
     ProtocolError,
-    Request,
     _native_limits,  # pyright: ignore[reportPrivateUsage]
 )
 from hpke_http.transport import TransportError, media_type
@@ -36,21 +32,17 @@ class Discover:
 
 @dataclass(frozen=True, slots=True)
 class PinnedKey:
-    """Use one public key without a discovery GET."""
+    """Use one fixed public key without a key GET."""
 
     public_key: bytes
     key_id: bytes
 
 
-def validate_client_configuration(
-    psk: bytes, psk_id: bytes, limits: Limits, compression: Literal["gzip", "zstd"] | None
-) -> None:
+def validate_client_configuration(psk: bytes, psk_id: bytes, limits: Limits) -> None:
     """Reject local client faults before a discovery GET."""
     _native_limits(limits)
     if len(psk) < _PUBLIC_KEY_LEN or not 1 <= len(psk_id) <= _MAX_ID_LEN or psk == psk_id:
         raise ProtocolError("invalid_configuration", "invalid PSK or PSK identity")
-    if compression not in (None, "gzip", "zstd"):
-        raise ProtocolError("invalid_configuration", "unsupported protocol body coding")
 
 
 def encode_key_record(key_id: bytes, public_key: bytes) -> bytes:
@@ -99,26 +91,12 @@ def make_discovered_client(
     psk: bytes,
     psk_id: bytes,
     limits: Limits,
-    compression: Literal["gzip", "zstd"] | None,
 ) -> Client:
     """Map an unusable key from the GET to a discovery response fault."""
     try:
-        return Client(public_key, key_id, psk, psk_id, limits=limits, compression=compression)
+        return Client(public_key, key_id, psk, psk_id, limits=limits)
     except ProtocolError as error:
         raise TransportError("discovery_response", "key endpoint returned an unusable public key") from error
-
-
-async def protect_discovered_client(client: Client, request: Request) -> ProtectedRequest:
-    """Protect one request and close a temporary discovered client."""
-    try:
-        try:
-            return await run_native(client.protect, request)
-        except ProtocolError as error:
-            if error.code in ("invalid_configuration", "crypto_failure"):
-                raise TransportError("discovery_response", "key endpoint returned an unusable public key") from error
-            raise
-    finally:
-        client.close()
 
 
 def https_origin(value: str, *, endpoint: bool = False) -> tuple[str, int]:

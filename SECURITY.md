@@ -25,13 +25,10 @@ when it affects an `hpke-http` release or one of its default build paths.
 | 2.x | Supported published line |
 | 1.x and earlier | Unsupported |
 
-The current source tree targets the next major release with protocol ID
-`hpke-http/2`. It has no earlier wire decoder or binding fallback. Security
-fixes ship as coordinated Rust, Python, and TypeScript releases from one
-source tag.
+The current source tree implements protocol ID `hpke-http/3`. Security fixes
+ship as coordinated Rust, Python, and TypeScript releases from one source tag.
 
-Protocol gzip/zstd body compression is disabled by default. Enabling it can
-reveal information about mixed secret and attacker-controlled body content
-through ciphertext length, even though the body remains authenticated and
-encrypted. Do not enable it for such bodies; the HTTP `Content-Encoding` field
-is not a substitute for the protocol transform.
+The Rust engine tries zstd on clear payload parts before encryption and sends
+raw parts when zstd does not save bytes. The protocol encrypts content but does
+not hide payload size, record count, or timing. It adds no random padding.
+Traffic size hiding is outside the protocol's scope.

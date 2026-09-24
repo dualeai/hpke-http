@@ -4,8 +4,8 @@ const binding = await import("@dualeai/hpke-http/node");
 const browser = await import("@dualeai/hpke-http/browser");
 await binding.initialize();
 assert.equal(binding.isInitialized(), true);
-assert.equal(binding.PROTOCOL_ID, "hpke-http/2");
-assert.equal(binding.BINDING_ABI_VERSION, 3);
+assert.equal(binding.PROTOCOL_ID, "hpke-http/3");
+assert.equal(binding.BINDING_ABI_VERSION, 7);
 assert.equal(typeof browser.createHpkeFetch, "function");
 if (process.env.EXPECTED_VERSION !== undefined) {
   assert.equal(binding.PACKAGE_VERSION, process.env.EXPECTED_VERSION);
@@ -39,8 +39,8 @@ try {
 }
 
 const body = text.encode("artifact-compression-".repeat(1024));
-const compressedClient = new binding.Client(keys.publicKey, keyId, psk, pskId, {}, "zstd");
-const compressedServer = new binding.Server(keys.privateKey, keyId, {}, true);
+const compressedClient = new binding.Client(keys.publicKey, keyId, psk, pskId);
+const compressedServer = new binding.Server(keys.privateKey, keyId);
 try {
   const protectedRequest = compressedClient.protect({
     method: "POST",

@@ -25,6 +25,18 @@ export interface NativeProtectedRequest extends NativeDisposable {
   discard(): void;
 }
 
+export interface NativeStreamPush extends NativeDisposable {
+  readonly consumed: number;
+  take_record(): Uint8Array | undefined;
+}
+
+export interface NativeStreamRequestSealer extends NativeDisposable {
+  take_start(): Uint8Array;
+  push(input: Uint8Array): NativeStreamPush;
+  finish(): NativeProtectedRequest;
+  close(): void;
+}
+
 export interface NativeFeedResult extends NativeDisposable {
   readonly consumed: number;
   readonly kind: number;
@@ -49,6 +61,7 @@ export interface NativeResponseSealer extends NativeDisposable {
 }
 
 export interface NativeClient extends NativeDisposable {
+  begin_stream(method: string, authority: string, path: string, headersJson: string, nowUnixSeconds: number): NativeStreamRequestSealer;
   protect(
     method: string,
     authority: string,
@@ -68,6 +81,37 @@ export interface NativePreparsedRequest extends NativeDisposable {
     nowUnixSeconds: number,
   ): NativeAuthenticatedRequest;
   discard(): void;
+}
+
+export interface NativePreparsedStreamRequest extends NativeDisposable {
+  readonly psk_id: Uint8Array;
+  readonly consumed: boolean;
+  authenticate(server: NativeServer, psk: Uint8Array, nowUnixSeconds: number): NativeAuthenticatedStreamRequest;
+  discard(): void;
+}
+
+export interface NativeAuthenticatedStreamRequest extends NativeDisposable {
+  readonly replay_id: Uint8Array;
+  readonly retain_until_exclusive: number;
+  readonly consumed: boolean;
+  admit(accepted: boolean, nowUnixSeconds: number): NativeOpenedStreamRequest;
+  discard(): void;
+}
+
+export interface NativeRequestFeed extends NativeDisposable {
+  readonly consumed: number;
+  readonly kind: number;
+  readonly block: Uint8Array;
+}
+
+export interface NativeOpenedStreamRequest extends NativeDisposable {
+  readonly method: string;
+  readonly authority: string;
+  readonly path: string;
+  readonly headers_json: string;
+  feed(input: Uint8Array): NativeRequestFeed;
+  finish_eof(): NativeOpenedRequest;
+  close(): void;
 }
 
 export interface NativeAuthenticatedRequest extends NativeDisposable {
@@ -92,6 +136,9 @@ export interface NativeOpenedRequest extends NativeDisposable {
 
 export interface NativeServer extends NativeDisposable {
   preparse(envelope: Uint8Array): NativePreparsedRequest;
+  max_complete_envelope_len(): number;
+  stream_start_length(input: Uint8Array): number | undefined;
+  preparse_stream(first: Uint8Array): NativePreparsedStreamRequest;
 }
 
 interface NativeConstructor<T, Arguments extends readonly unknown[]> {
@@ -105,11 +152,11 @@ export interface NativeModule {
   generateKeyPair(): NativeKeyPair;
   Limits: NativeConstructor<
     NativeLimits,
-    [number | undefined, number | undefined, number | undefined, number | undefined]
+    [number | undefined, number | undefined, number | undefined, number | undefined, number | undefined]
   >;
   Client: NativeConstructor<
     NativeClient,
-    [Uint8Array, Uint8Array, Uint8Array, Uint8Array, NativeLimits, number]
+    [Uint8Array, Uint8Array, Uint8Array, Uint8Array, NativeLimits]
   >;
-  Server: NativeConstructor<NativeServer, [Uint8Array, Uint8Array, NativeLimits, boolean]>;
+  Server: NativeConstructor<NativeServer, [Uint8Array, Uint8Array, NativeLimits]>;
 }

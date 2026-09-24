@@ -22,19 +22,30 @@ pub enum Method {
 }
 
 impl Method {
-    pub(crate) const fn as_bytes(self) -> &'static [u8] {
+    /// Return the method name used at the HTTP boundary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Get => b"GET",
-            Self::Post => b"POST",
-            Self::Put => b"PUT",
-            Self::Patch => b"PATCH",
-            Self::Delete => b"DELETE",
-            Self::Head => b"HEAD",
-            Self::Options => b"OPTIONS",
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
         }
     }
 
-    pub(crate) fn from_bytes(value: &[u8]) -> Result<Self, Error> {
+    pub(crate) const fn as_bytes(self) -> &'static [u8] {
+        self.as_str().as_bytes()
+    }
+
+    /// Read a supported HTTP method name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedMethod`] for any other name.
+    pub fn from_bytes(value: &[u8]) -> Result<Self, Error> {
         match value {
             b"GET" => Ok(Self::Get),
             b"POST" => Ok(Self::Post),

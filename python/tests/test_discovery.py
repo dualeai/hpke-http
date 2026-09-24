@@ -16,10 +16,16 @@ from starlette.types import Message, Receive, Scope, Send
 
 from hpke_http import Response, Server, TransportError, generate_key_pair
 from hpke_http.middleware import Discover
-from hpke_http.middleware._discovery import encode_key_record, https_origin, parse_key_record, validate_endpoint
+from hpke_http.middleware._discovery import (
+    encode_key_record,
+    https_origin,
+    parse_key_record,
+    validate_endpoint,
+)
 from hpke_http.middleware.fastapi import HPKEMiddleware
 from hpke_http.middleware.httpx import HPKEAsyncClient
 from hpke_http.transport import RESPONSE_MEDIA_TYPE
+from tests.stream_request import open_stream_request
 
 KEY_ID = b"primary-2026-09"
 PSK = b"a 32-byte minimum test credential!"
@@ -95,7 +101,7 @@ async def test_httpx_discovers_one_key_for_each_call_then_posts_to_same_url() ->
                 headers={"content-type": "application/octet-stream", "cache-control": "no-store"},
                 content=b"HHKD\x01\x0fprimary-2026-09" + server.public_key,
             )
-        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        opened = open_stream_request(server, await request.aread(), PSK)
         assert opened.request.path == "/items"
         return httpx.Response(
             200,

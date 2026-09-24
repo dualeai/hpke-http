@@ -1,6 +1,7 @@
 // CodSpeed measures public Node/WASM transactions without transport or setup.
 
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 
 import { afterAll, beforeAll, bench, describe } from "vitest";
 
@@ -25,15 +26,19 @@ afterAll(() => {
   server.close();
 });
 
-for (const [label, size] of [["empty", 0], ["1KiB", 1024], ["1MiB", 1024 * 1024], ["8MiB", 8 * 1024 * 1024]]) {
+for (const [label, size, random] of [
+  ["empty", 0, false], ["1KiB", 1024, false], ["1MiB", 1024 * 1024, false],
+  ["8MiB", 8 * 1024 * 1024, false], ["1MiB-random", 1024 * 1024, true],
+  ["8MiB-random", 8 * 1024 * 1024, true],
+]) {
   describe(`roundtrip/${label}`, () => {
     const request = {
       method: "POST",
       authority: "api.example.test",
       path: "/benchmark",
-      body: new Uint8Array(size).fill(0x42),
+      body: random ? randomBytes(size) : new Uint8Array(size).fill(0x42),
     };
-    const response = { status: 200, body: new Uint8Array(size).fill(0x43) };
+    const response = { status: 200, body: random ? randomBytes(size) : new Uint8Array(size).fill(0x43) };
 
     bench("protect-authenticate-response-open", () => {
       const protectedRequest = client.protect(request);
@@ -41,6 +46,27 @@ for (const [label, size] of [["empty", 0], ["1KiB", 1024], ["1MiB", 1024 * 1024]
       const opened = authenticated.admit({ accepted: true });
       const openedResponse = protectedRequest.openResponse(opened.protectResponse(response));
       assert.equal(openedResponse.body.byteLength, size);
+    });
+  });
+}
+
+for (const [label, random] of [["repeated", false], ["random", true]]) {
+  describe(`upload-stream/1MiB/${label}`, () => {
+    const head = { method: "POST", authority: "api.example.test", path: "/upload" };
+    const body = random ? randomBytes(1024 * 1024) : new Uint8Array(1024 * 1024).fill(0x42);
+
+    bench("seal", () => {
+      const writer = client.beginStream(head);
+      let wireBytes = writer.start.byteLength;
+      for (let offset = 0; offset < body.byteLength;) {
+        const { consumed, record } = writer.push(body.subarray(offset, offset + 64 * 1024));
+        offset += consumed;
+        wireBytes += record?.byteLength ?? 0;
+      }
+      const finished = writer.finish();
+      wireBytes += finished.end.byteLength;
+      finished.close();
+      assert.ok(wireBytes > 0);
     });
   });
 }

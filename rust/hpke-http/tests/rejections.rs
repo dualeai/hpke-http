@@ -1,4 +1,4 @@
-//! Boundary, mutation, and cross-context rejection tests for protocol version 2.
+//! Boundary, mutation, and cross-context rejection tests for protocol version 3.
 
 #[test]
 fn server_public_key_matches_its_private_key() -> Result<(), Error> {
@@ -77,7 +77,13 @@ fn protect_response(
 
 fn request_is_rejected(server: &Server, envelope: &[u8]) -> bool {
     match server.preparse(envelope) {
-        Ok(preparsed) => server.authenticate(preparsed.token, PSK).is_err(),
+        Ok(preparsed) => match server.authenticate(preparsed.token, PSK) {
+            Ok(authenticated) => authenticated
+                .token
+                .admit(authenticated.replay.decision(true))
+                .is_err(),
+            Err(_) => true,
+        },
         Err(_) => true,
     }
 }
@@ -150,10 +156,9 @@ fn request_prefix_errors_are_classified_before_credentials() -> Result<(), Error
     let cases = [
         (0, Error::MalformedEnvelope),
         (4, Error::UnsupportedVersion),
-        (5, Error::MalformedEnvelope),
-        (8, Error::UnsupportedSuite),
-        (10, Error::UnsupportedSuite),
-        (12, Error::UnsupportedSuite),
+        (7, Error::UnsupportedSuite),
+        (9, Error::UnsupportedSuite),
+        (11, Error::UnsupportedSuite),
     ];
     for (offset, expected) in cases {
         let mut mutated = envelope.clone();
@@ -161,7 +166,7 @@ fn request_prefix_errors_are_classified_before_credentials() -> Result<(), Error
         assert_eq!(server.preparse(&mutated).err(), Some(expected));
     }
 
-    for offset in [6, 7] {
+    for offset in [5, 6] {
         let mut empty_id = envelope.clone();
         empty_id[offset] = 0;
         assert_eq!(
@@ -191,6 +196,25 @@ fn every_request_truncation_and_single_byte_mutation_is_rejected() -> Result<(),
         mutated[offset] ^= 1;
         assert!(request_is_rejected(&server, &mutated));
     }
+    Ok(())
+}
+
+#[test]
+fn one_shot_preparse_bounds_wire_before_it_clones() -> Result<(), Error> {
+    let limits = Limits {
+        max_body_len: 32,
+        ..Limits::default()
+    };
+    let (_, server) = engines_with_limits(limits)?;
+    let oversized = vec![0_u8; 50_000];
+    assert_eq!(
+        server.preparse(&oversized).err(),
+        Some(Error::LimitExceeded)
+    );
+    assert_eq!(
+        server.preparse_owned(oversized).err(),
+        Some(Error::LimitExceeded)
+    );
     Ok(())
 }
 
@@ -236,6 +260,7 @@ fn configured_limits_apply_at_exact_boundaries() -> Result<(), Error> {
         max_header_bytes: 7,
         max_header_count: 1,
         max_target_len: 5,
+        max_request_bytes: 3,
     };
     let (client, _) = engines_with_limits(limits)?;
     let accepted = Request {

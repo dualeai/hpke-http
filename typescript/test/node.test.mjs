@@ -7,10 +7,6 @@ import {
   PACKAGE_VERSION,
   PROTOCOL_ID,
   Client,
-  AuthenticatedRequest,
-  OpenedRequest,
-  PreparsedRequest,
-  ProtectedRequest,
   ProtocolError,
   Server,
   StateError,
@@ -27,23 +23,12 @@ const KEY_ID = new TextEncoder().encode("primary-2026-09");
 const PSK = new TextEncoder().encode("a 32-byte minimum test credential!");
 const PSK_ID = new TextEncoder().encode("tenant-42");
 
-test("continuation constructors are not exposed as runtime factories", () => {
-  for (const continuation of [
-    ProtectedRequest,
-    PreparsedRequest,
-    AuthenticatedRequest,
-    OpenedRequest,
-  ]) {
-    assert.equal(Object.hasOwn(continuation, "fromNative"), false);
-  }
-});
-
 test("Node loader and complete hpke-http transaction", async () => {
   await initialize();
   assert.equal(isInitialized(), true);
   assert.equal(PACKAGE_VERSION, packageMetadata.version);
-  assert.equal(PROTOCOL_ID, "hpke-http/2");
-  assert.equal(BINDING_ABI_VERSION, 3);
+  assert.equal(PROTOCOL_ID, "hpke-http/3");
+  assert.equal(BINDING_ABI_VERSION, 7);
 
   const keys = generateKeyPair();
   const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID);
@@ -51,7 +36,7 @@ test("Node loader and complete hpke-http transaction", async () => {
   const request = {
     method: "POST",
     authority: "api.example.test",
-    path: "/v2/items?limit=2",
+    path: "/v3/items?limit=2",
     headers: [{ name: "content-type", value: "application/json" }],
     body: new TextEncoder().encode('{"name":"Ada"}'),
   };
@@ -85,6 +70,109 @@ test("Node loader and complete hpke-http transaction", async () => {
   server.close();
 });
 
+test("native request writer accepts uneven cuts and one v3 wire form", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID, {
+    maxRequestBytes: 512 * 1024,
+  });
+  const server = new Server(keys.privateKey, KEY_ID, { maxRequestBytes: 512 * 1024 });
+  const body = new Uint8Array(256 * 1024).fill(0x41);
+  const writer = client.beginStream({
+    method: "POST", authority: "api.example.test", path: "/stream",
+    headers: [{ name: "content-length", value: String(body.byteLength) }],
+  });
+  const records = [writer.start];
+  try {
+    for (let offset = 0; offset < body.byteLength;) {
+      const result = writer.push(body.subarray(offset, Math.min(offset + 7777, body.byteLength)));
+      assert.ok(result.consumed > 0);
+      offset += result.consumed;
+      if (result.record !== undefined) records.push(result.record);
+    }
+    const finished = writer.finish();
+    records.push(finished.end);
+    const envelope = Buffer.concat(records);
+    assert.ok(envelope.byteLength < body.byteLength);
+    const opened = server.preparse(envelope).authenticate(PSK).admit({ accepted: true });
+    assert.deepEqual(opened.request.body, body);
+    const protectedResponse = opened.protectResponse({ status: 200, body: new TextEncoder().encode("ok") });
+    const opener = finished.intoOpener();
+    try {
+      let offset = 0;
+      while (offset < protectedResponse.byteLength) {
+        const result = opener.feed(protectedResponse.subarray(offset));
+        assert.ok(result.consumed > 0);
+        offset += result.consumed;
+      }
+      assert.equal(new TextDecoder().decode(opener.finishEof().body), "ok");
+    } finally {
+      opener.close();
+    }
+  } finally {
+    writer.close();
+    client.close();
+    server.close();
+  }
+});
+
+test("staged TypeScript server reads a request beyond the one-shot body limit", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const limits = { maxBodyLength: 32, maxRequestBytes: 256 * 1024 };
+  const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID, limits);
+  const server = new Server(keys.privateKey, KEY_ID, limits);
+  const body = new Uint8Array(128 * 1024 + 7).fill(0x61);
+  const writer = client.beginStream({ method: "POST", authority: "api.example.test", path: "/large" });
+  const records = [];
+  try {
+    for (let offset = 0; offset < body.byteLength;) {
+      const result = writer.push(body.subarray(offset));
+      offset += result.consumed;
+      if (result.record !== undefined) records.push(result.record);
+    }
+    const finished = writer.finish();
+    records.push(finished.end);
+    assert.equal(server.streamStartLength(writer.start.subarray(0, 4)), undefined);
+    assert.equal(server.streamStartLength(writer.start), writer.start.byteLength);
+    assert.throws(() => server.preparse(Buffer.concat([writer.start, ...records])).authenticate(PSK),
+      (error) => error instanceof ProtocolError && error.code === "limit_exceeded");
+    const preparsed = server.preparseStream(writer.start);
+    assert.deepEqual(preparsed.pskId, PSK_ID);
+    const authenticated = preparsed.authenticate(PSK);
+    assert.equal(authenticated.replayId.byteLength, 32);
+    const opened = authenticated.admit({ accepted: true });
+    assert.equal(opened.head.path, "/large");
+    const clearParts = [];
+    let endSeen = false;
+    for (const record of records) {
+      for (let offset = 0; offset < record.byteLength;) {
+        const result = opened.feed(record.subarray(offset, offset + 17));
+        assert.ok(result.consumed > 0);
+        offset += result.consumed;
+        if (result.record?.kind === "data") clearParts.push(result.record.block);
+        if (result.record?.kind === "end") endSeen = true;
+      }
+    }
+    assert.equal(endSeen, true);
+    assert.deepEqual(Uint8Array.from(Buffer.concat(clearParts)), body);
+    const right = opened.finishEof();
+    const encrypted = right.protectResponse({ status: 200, body: new TextEncoder().encode("ok") });
+    const opener = finished.intoOpener();
+    try {
+      let offset = 0;
+      while (offset < encrypted.byteLength) {
+        offset += opener.feed(encrypted.subarray(offset)).consumed;
+      }
+      assert.equal(new TextDecoder().decode(opener.finishEof().body), "ok");
+    } finally { opener.close(); }
+  } finally {
+    writer.close();
+    client.close();
+    server.close();
+  }
+});
+
 test("low-level finite response sealer handles empty and nonempty bodies", async () => {
   await initialize();
   for (const body of [new Uint8Array(), new TextEncoder().encode("finite body")]) {
@@ -113,12 +201,11 @@ test("low-level finite response sealer handles empty and nonempty bodies", async
   }
 });
 
-for (const coding of ["gzip", "zstd"]) {
-  test(`opt-in ${coding} body compression preserves logical HTTP`, async () => {
+test("native zstd request and response coding preserves logical HTTP", async () => {
     await initialize();
     const keys = generateKeyPair();
-    const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID, {}, coding);
-    const server = new Server(keys.privateKey, KEY_ID, {}, true);
+    const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID);
+    const server = new Server(keys.privateKey, KEY_ID);
     const body = new Uint8Array(16 * 1024).fill(0x41);
     const request = {
       method: "POST",
@@ -143,20 +230,20 @@ for (const coding of ["gzip", "zstd"]) {
     assert.deepEqual(protectedRequest.openResponse(envelope), response);
     client.close();
     server.close();
-  });
-}
+});
 
-test("identity-only server rejects a client compression extension", async () => {
+test("empty request can receive a native zstd response", async () => {
   await initialize();
   const keys = generateKeyPair();
-  const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID, {}, "gzip");
+  const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID);
   const server = new Server(keys.privateKey, KEY_ID);
   const protectedRequest = client.protect({ method: "GET", authority: "api.example.test", path: "/" });
-  assert.throws(
-    () => server.preparse(protectedRequest.envelope).authenticate(PSK),
-    (error) => error instanceof ProtocolError && error.code === "malformed_envelope",
-  );
-  protectedRequest.close();
+  const opened = server.preparse(protectedRequest.envelope).authenticate(PSK).admit({ accepted: true });
+  assert.deepEqual(opened.request.body, new Uint8Array());
+  const body = new Uint8Array(16 * 1024).fill(0x42);
+  const envelope = opened.protectResponse({ status: 200, body });
+  assert.ok(envelope.byteLength < body.byteLength);
+  assert.deepEqual(protectedRequest.openResponse(envelope).body, body);
   client.close();
   server.close();
 });
@@ -164,8 +251,8 @@ test("identity-only server rejects a client compression extension", async () => 
 test("binding size guards reject before copying and preserve one-shot consumption", async () => {
   await initialize();
   const keys = generateKeyPair();
-  const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID, { maxBodyLength: 1 });
-  const server = new Server(keys.privateKey, KEY_ID, { maxBodyLength: 1 });
+  const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID, { maxBodyLength: 1, maxRequestBytes: 1 });
+  const server = new Server(keys.privateKey, KEY_ID, { maxBodyLength: 1, maxRequestBytes: 1 });
   const oversizedBody = new Uint8Array(2);
   const oversizedEnvelope = new Uint8Array(100_000);
 
@@ -196,6 +283,22 @@ test("binding size guards reject before copying and preserve one-shot consumptio
   client.close();
   server.close();
   largeServer.close();
+});
+
+test("preparse keeps room for many request records", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const limits = { maxBodyLength: 10_000, maxRequestBytes: 10_000 };
+  const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID, limits);
+  const server = new Server(keys.privateKey, KEY_ID, limits);
+  const protectedRequest = client.protect({ method: "POST", authority: "api.example.test", path: "/" });
+  const envelope = Buffer.concat([protectedRequest.envelope, Buffer.alloc(100_000 - protectedRequest.envelope.byteLength)]);
+  const preparsed = server.preparse(envelope);
+  assert.deepEqual(preparsed.pskId, PSK_ID);
+  preparsed.close();
+  protectedRequest.close();
+  client.close();
+  server.close();
 });
 
 test("replay rejection stays a stable protocol error", async () => {

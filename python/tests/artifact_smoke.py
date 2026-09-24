@@ -28,7 +28,7 @@ def main() -> None:
     expected_version = sys.argv[1] if len(sys.argv) > 1 else distribution_version("hpke_http")
     if expected_version != PACKAGE_VERSION or expected_version != distribution_version("hpke_http"):
         raise RuntimeError("installed Python package version does not match the release candidate")
-    if PROTOCOL_ID != "hpke-http/2" or BINDING_ABI_VERSION != 3:
+    if PROTOCOL_ID != "hpke-http/3" or BINDING_ABI_VERSION != 7:
         raise RuntimeError("installed Python binding identity is incoherent")
 
     keys = generate_key_pair()
@@ -48,8 +48,8 @@ def main() -> None:
 
     body = b"artifact-compression-" * 1024
     with (
-        Client(keys.public_key, KEY_ID, PSK, PSK_ID, compression="zstd") as client,
-        Server(keys.private_key, KEY_ID, compression=True) as server,
+        Client(keys.public_key, KEY_ID, PSK, PSK_ID) as client,
+        Server(keys.private_key, KEY_ID) as server,
     ):
         protected = client.protect(
             Request(method=Method.POST, authority="artifact.example.test", path="/compressed", body=body)
@@ -113,7 +113,16 @@ async def check_adapter_discovery(private_key: bytes) -> None:
         if request.method == "GET":
             record = b"HHKD\x01" + bytes((len(KEY_ID),)) + KEY_ID + server.public_key
             return httpx.Response(200, headers={"content-type": "application/octet-stream"}, content=record)
-        opened = server.preparse(await request.aread()).authenticate(PSK).admit(accepted=True)
+        raw = await request.aread()
+        first_length = server.stream_start_length(raw)
+        if first_length is None:
+            raise RuntimeError("installed Python adapter sent no request START")
+        opened_stream = server.preparse_stream(raw[:first_length]).authenticate(PSK).admit(accepted=True)
+        offset = first_length
+        while offset < len(raw):
+            used, _record = opened_stream.feed(raw, offset)
+            offset += used
+        opened = opened_stream.finish_eof()
         body = opened.protect_response(Response(status=200, body=b"artifact-discovery-ok"))
         return httpx.Response(200, headers={"content-type": "message/hpke-http-response"}, content=body)
 

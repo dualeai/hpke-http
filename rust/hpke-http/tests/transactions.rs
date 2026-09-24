@@ -1,4 +1,4 @@
-//! End-to-end protocol version 2 transaction and rejection tests.
+//! End-to-end protocol version 3 transaction and rejection tests.
 
 use hpke_http::{
     Client, EntropySource, Error, HeaderField, Limits, Method, Request, Response, Server,
@@ -28,7 +28,7 @@ fn request(body: &[u8]) -> Request {
     Request {
         method: Method::Post,
         authority: b"api.example.test".to_vec(),
-        path: b"/v2/items?limit=2".to_vec(),
+        path: b"/v3/items?limit=2".to_vec(),
         headers: vec![HeaderField {
             name: b"content-type".to_vec(),
             value: b"application/json".to_vec(),
@@ -322,7 +322,7 @@ fn malformed_and_tampered_envelopes_are_rejected() -> Result<(), Error> {
     let preparsed = server.preparse(&trailing)?;
     assert_eq!(
         server.authenticate(preparsed.token, PSK).err(),
-        Some(Error::AuthenticationFailed)
+        Some(Error::MalformedEnvelope)
     );
 
     let mut tampered = envelope.clone();

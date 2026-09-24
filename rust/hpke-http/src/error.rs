@@ -20,10 +20,10 @@ pub enum Error {
     /// The envelope uses a protocol version this implementation does not support.
     #[error("unsupported protocol version")]
     UnsupportedVersion,
-    /// The envelope names a cryptographic suite outside protocol version 2.
+    /// The envelope names a cryptographic suite outside protocol version 3.
     #[error("unsupported cryptographic suite")]
     UnsupportedSuite,
-    /// The request uses an HTTP method outside protocol version 2.
+    /// The request uses an HTTP method outside protocol version 3.
     #[error("unsupported HTTP method")]
     UnsupportedMethod,
     /// The request names a recipient key that is not configured on this server.
@@ -53,9 +53,6 @@ pub enum Error {
     /// A cryptographic primitive rejected otherwise bounded input.
     #[error("cryptographic operation failed")]
     CryptoFailure,
-    /// A local body compressor failed before an envelope was produced.
-    #[error("compression failed")]
-    CompressionFailure,
 }
 
 impl Error {
@@ -78,7 +75,6 @@ impl Error {
             Self::ClockUnavailable => "clock_unavailable",
             Self::EntropyUnavailable => "entropy_unavailable",
             Self::CryptoFailure => "crypto_failure",
-            Self::CompressionFailure => "compression_failure",
         }
     }
 }

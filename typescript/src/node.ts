@@ -8,20 +8,26 @@ export {
   PACKAGE_VERSION,
   PROTOCOL_ID,
   AuthenticatedRequest,
+  AuthenticatedStreamRequest,
   Client,
   InitializationError,
   OpenedRequest,
+  OpenedStreamRequest,
   PreparsedRequest,
+  PreparsedStreamRequest,
   ProtectedRequest,
   ProtocolError,
   ResponseOpener,
   ResponseSealer,
   Server,
   StateError,
+  StreamFinishedRequest,
+  StreamRequestSealer,
+  StreamResponseRight,
   generateKeyPair,
   isInitialized,
 } from "./index.js";
-export type { CheckedRecord, CompressionCoding, Header, KeyPair, Limits, Method, Request, Response } from "./index.js";
+export type { CheckedRecord, CheckedRequestRecord, Header, KeyPair, Limits, Method, Request, RequestHead, Response } from "./index.js";
 export {
   REQUEST_MEDIA_TYPE,
   RESPONSE_MEDIA_TYPE,
