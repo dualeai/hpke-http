@@ -1,9 +1,9 @@
-"""Buffered aiohttp client adapter for the native hpke-http protocol."""
+"""aiohttp client adapter for checked finite and live SSE responses."""
 
 from __future__ import annotations
 
 import json as json_module
-from collections.abc import AsyncIterable, Iterable, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import ExitStack
 from http import HTTPStatus
 from typing import Any, Literal, cast
@@ -14,8 +14,22 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from typing_extensions import Self
 from yarl import URL
 
+from hpke_http.middleware._discovery import (
+    KEY_MEDIA_TYPE,
+    Discover,
+    PinnedKey,
+    make_discovered_client,
+    protect_discovered_client,
+    read_key_record,
+    same_origin,
+    validate_client_configuration,
+    validate_endpoint,
+    validate_key_response,
+    validate_target_origin,
+)
 from hpke_http.middleware._native_async import run_native
-from hpke_http.protocol import Client, Limits, Method, ProtocolError, Request
+from hpke_http.middleware._records import CheckedStream
+from hpke_http.protocol import Client, Limits, Method, ProtectedRequest, ProtocolError, Request, StateError
 from hpke_http.transport import (
     REQUEST_MEDIA_TYPE,
     RESPONSE_MEDIA_TYPE,
@@ -23,7 +37,6 @@ from hpke_http.transport import (
     filter_request_headers,
     filter_response_headers,
     max_body_len,
-    max_envelope_len,
     media_type,
 )
 
@@ -119,10 +132,10 @@ class HPKEResponse:
             )
 
     def release(self) -> None:
-        """Compatibility no-op; the outer response is already released."""
+        """Do nothing; the finite outer response is already released."""
 
     def close(self) -> None:
-        """Compatibility no-op; the outer response is already closed."""
+        """Do nothing; the finite outer response is already closed."""
 
     async def __aenter__(self) -> Self:
         return self
@@ -150,10 +163,10 @@ class _RequestContextManager:
 
 
 class HPKEClientSession:
-    """Compose a dedicated aiohttp transport with one recipient configuration.
+    """Compose a dedicated aiohttp transport with one fixed key endpoint.
 
-    ``base_url`` resolves logical relative targets. ``transport_endpoint`` can
-    select one fixed HTTPS envelope endpoint. The connector and accepted session
+    ``Discover()`` fetches one key per call. ``PinnedKey`` sends no key GET.
+    The connector and accepted session
     options configure only the dedicated outer connection pool. Session default
     credentials, cookies, headers, and environment proxy state are rejected or
     disabled. ``compression`` selects optional Rust protocol body coding, not
@@ -163,41 +176,64 @@ class HPKEClientSession:
 
     def __init__(
         self,
-        recipient_public_key: bytes,
-        recipient_key_id: bytes,
+        endpoint: str,
+        key_source: Discover | PinnedKey,
         psk: bytes,
         psk_id: bytes,
         *,
-        base_url: str | URL | None = None,
-        transport_endpoint: str | URL | None = None,
+        target_origin: str | None = None,
         limits: Limits = _DEFAULT_LIMITS,
         compression: Literal["gzip", "zstd"] | None = None,
         connector: aiohttp.BaseConnector | None = None,
         **session_options: Any,
     ) -> None:
-        sensitive_options = {"auth", "connector", "cookie_jar", "cookies", "headers"}.intersection(session_options)
+        endpoint = validate_endpoint(endpoint)
+        target_key = validate_target_origin(target_origin, endpoint)
+        validate_client_configuration(psk, psk_id, limits, compression)
+        if type(key_source) not in (Discover, PinnedKey):
+            raise TypeError("key_source must be Discover() or PinnedKey")
+        sensitive_options = {
+            "auth",
+            "connector",
+            "cookie_jar",
+            "cookies",
+            "headers",
+            "base_url",
+            "transport_endpoint",
+        }.intersection(session_options)
         if sensitive_options:
             names = ", ".join(sorted(sensitive_options))
             msg = f"outer transport session cannot use credential-bearing defaults: {names}"
             raise ValueError(msg)
-        if session_options.get("trust_env") is True:
+        if session_options.pop("trust_env", False) is not False:
             raise ValueError("outer transport session cannot use ambient proxy or netrc state: trust_env")
 
         with ExitStack() as cleanup:
-            client = Client(recipient_public_key, recipient_key_id, psk, psk_id, limits=limits, compression=compression)
-            cleanup.callback(client.close)
+            client = (
+                Client(key_source.public_key, key_source.key_id, psk, psk_id, limits=limits, compression=compression)
+                if isinstance(key_source, PinnedKey)
+                else None
+            )
+            if client is not None:
+                cleanup.callback(client.close)
             http = aiohttp.ClientSession(
                 connector=connector,
                 cookie_jar=aiohttp.DummyCookieJar(),
+                trust_env=False,
                 **session_options,
             )
             cleanup.pop_all()
         self._http = http
-        self._base_url = URL(base_url) if base_url is not None else None
-        self._transport_endpoint = transport_endpoint
+        self._endpoint = URL(endpoint)
+        self._target_origin = target_key
         self._client = client
+        self._psk = bytes(psk) if isinstance(key_source, Discover) else b""
+        self._psk_id = bytes(psk_id)
+        self._limits = limits
+        self._compression: Literal["gzip", "zstd"] | None = compression
+        self._closed = False
         self._max_request_len = max_body_len(limits)
-        self._max_response_envelope_len = max_envelope_len(limits)
+        self._streams: set[HPKEStreamResponse] = set()
 
     async def __aenter__(self) -> Self:
         return self
@@ -208,12 +244,31 @@ class HPKEClientSession:
     @property
     def closed(self) -> bool:
         """Return whether the dedicated outer connection pool is closed."""
-        return self._http.closed
+        return self._closed
 
     async def close(self) -> None:
         """Release credential copies and close the outer connection pool."""
-        self._client.close()
+        self._closed = True
+        for stream in tuple(self._streams):
+            await stream.aclose()
+        self._psk = b""
+        if self._client is not None:
+            self._client.close()
         await self._http.close()
+
+    def stream(
+        self,
+        method: str,
+        url: str | URL,
+        *,
+        params: Mapping[str, str | int | float] | None = None,
+        headers: Mapping[str, str] | Iterable[tuple[str, str]] | None = None,
+        data: object = None,
+        json: object = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+    ) -> _StreamContext:
+        """Open a context-owned reply after its START record passes."""
+        return _StreamContext(self, method, url, params, headers, data, json, timeout)
 
     def request(
         self,
@@ -284,9 +339,42 @@ class HPKEClientSession:
         json: object,
         timeout: aiohttp.ClientTimeout | None,
     ) -> HPKEResponse:
+        stream = await self._open_stream(
+            method, url, params=params, headers=headers, data=data, json=json, timeout=timeout, live=False
+        )
+        try:
+            if stream.mode == "sse":
+                raise StateError("use stream() for an SSE response")
+            body = await stream.read()
+            return HPKEResponse(
+                status=stream.status,
+                headers=stream.headers.items(),
+                body=body,
+                url=stream.url,
+                method=stream.method,
+            )
+        finally:
+            await stream.aclose()
+
+    async def _open_stream(
+        self,
+        method: str,
+        url: str | URL,
+        *,
+        params: Mapping[str, str | int | float] | None,
+        headers: Mapping[str, str] | Iterable[tuple[str, str]] | None,
+        data: object,
+        json: object,
+        timeout: aiohttp.ClientTimeout | None,
+        live: bool,
+    ) -> HPKEStreamResponse:
+        if self.closed:
+            raise StateError("client is closed")
         target = self._resolve(url)
         if params is not None:
             target = target.update_query(params)
+        if not same_origin(str(target), self._target_origin):
+            raise TransportError("invalid_target", "logical target has the wrong HTTPS origin")
         body, default_content_type = await _encode_body(data, json, self._max_request_len)
         fields = CIMultiDict[str](headers or ())
         if default_content_type is not None and "content-type" not in fields:
@@ -296,39 +384,117 @@ class HPKEClientSession:
         except ValueError as error:
             raise ProtocolError("unsupported_method", "request method is not supported by hpke-http") from error
 
-        protected = await run_native(
-            self._client.protect,
-            Request(
-                method=protocol_method,
-                authority=target.raw_authority,
-                path=target.raw_path_qs,
-                headers=filter_request_headers(fields.items()),
-                body=body,
-            ),
-        )
+        protected = await self._protect(target, protocol_method, fields, body, timeout)
         try:
-            endpoint = target if self._transport_endpoint is None else self._resolve(self._transport_endpoint)
-            envelope = await self._exchange(endpoint, protected.envelope, timeout)
-            authenticated = await run_native(protected.open_response, envelope)
-            authenticated_headers = filter_response_headers(
-                (field.name, field.value) for field in authenticated.headers
-            )
-            return HPKEResponse(
-                status=authenticated.status,
-                headers=((field.name, field.value) for field in authenticated_headers),
-                body=authenticated.body,
-                url=target,
-                method=method.upper(),
-            )
+            if self.closed:
+                raise StateError("client is closed")
+            outer_headers = {
+                "accept": RESPONSE_MEDIA_TYPE,
+                "accept-encoding": "identity",
+                "cache-control": "no-store",
+                "content-type": REQUEST_MEDIA_TYPE,
+            }
+            chosen_timeout = timeout or self._http.timeout
+            if live and timeout is None:
+                session_timeout = self._http.timeout
+                chosen_timeout = aiohttp.ClientTimeout(
+                    total=None,
+                    connect=session_timeout.connect,
+                    sock_connect=session_timeout.sock_connect,
+                    sock_read=None,
+                )
+            try:
+                outer = await self._http.post(
+                    self._endpoint,
+                    data=protected.envelope,
+                    headers=outer_headers,
+                    allow_redirects=False,
+                    auth=None,
+                    auto_decompress=False,
+                    raise_for_status=False,
+                    timeout=chosen_timeout,
+                )
+            except (aiohttp.ClientError, TimeoutError) as error:
+                raise TransportError("network_error", "protected HTTP request failed") from error
+            driver: CheckedStream | None = None
+            try:
+                _check_outer(outer)
+                driver = CheckedStream(
+                    protected.into_opener(), outer.content.iter_chunked(64 * 1024), _close_outer(outer)
+                )
+                await driver.start()
+                filtered = filter_response_headers((field.name, field.value) for field in driver.headers)
+                response = HPKEStreamResponse(
+                    driver,
+                    driver.status,
+                    ((field.name, field.value) for field in filtered),
+                    target,
+                    method.upper(),
+                    self._streams,
+                )
+                self._streams.add(response)
+                return response
+            except BaseException:
+                if driver is not None:
+                    await driver.aclose()
+                else:
+                    outer.close()
+                raise
         finally:
             protected.close()
+
+    async def _protect(
+        self,
+        target: URL,
+        method: Method,
+        fields: CIMultiDict[str],
+        body: bytes,
+        timeout: aiohttp.ClientTimeout | None,
+    ) -> ProtectedRequest:
+        request = Request(
+            method=method,
+            authority=target.raw_authority,
+            path=target.raw_path_qs,
+            headers=filter_request_headers(fields.items()),
+            body=body,
+        )
+        if self._client is not None:
+            return await run_native(self._client.protect, request)
+        client = await self._discover_client(timeout)
+        return await protect_discovered_client(client, request)
+
+    async def _discover_client(self, timeout: aiohttp.ClientTimeout | None) -> Client:
+        try:
+            response = await self._http.get(
+                self._endpoint,
+                headers={"accept": KEY_MEDIA_TYPE, "accept-encoding": "identity", "cache-control": "no-store"},
+                allow_redirects=False,
+                auth=None,
+                auto_decompress=False,
+                raise_for_status=False,
+                timeout=timeout or self._http.timeout,
+            )
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        try:
+            validate_key_response(
+                response.status,
+                response.headers.getall("content-type", ()),
+                response.headers.getall("content-encoding", ()),
+            )
+            key_id, public_key = await read_key_record(response.content.iter_chunked(64 * 1024))
+            if self.closed:
+                raise StateError("client is closed")
+            return make_discovered_client(public_key, key_id, self._psk, self._psk_id, self._limits, self._compression)
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        finally:
+            response.close()
 
     def _resolve(self, value: str | URL) -> URL:
         candidate = URL(value)
         if not candidate.is_absolute():
-            if self._base_url is None:
-                raise TransportError("invalid_target", "protected requests require an absolute HTTPS URL")
-            candidate = self._base_url.join(candidate)
+            raise TransportError("invalid_target", "protected requests require an absolute HTTPS URL")
         if candidate.scheme != "https" or candidate.user is not None or candidate.password is not None:
             raise TransportError(
                 "invalid_target",
@@ -336,60 +502,103 @@ class HPKEClientSession:
             )
         return candidate.with_fragment(None)
 
-    async def _exchange(
+
+class HPKEStreamResponse:
+    """Checked head and one context-owned aiohttp body reader."""
+
+    def __init__(
         self,
-        endpoint: URL,
-        envelope: bytes,
+        driver: CheckedStream,
+        status: int,
+        headers: Iterable[tuple[str, str]],
+        url: URL,
+        method: str,
+        registry: set[HPKEStreamResponse],
+    ) -> None:
+        fields = CIMultiDict[str]()
+        for name, value in headers:
+            fields.add(name, value)
+        self._driver = driver
+        self._registry = registry
+        self.status = status
+        self.headers = CIMultiDictProxy(fields)
+        self.url = url
+        self.method = method
+        self.mode = driver.mode
+
+    async def read(self) -> bytes:
+        """Return finite body bytes after END and outer EOF pass."""
+        return await self._driver.read()
+
+    async def iter_sse(self) -> AsyncIterator[bytes]:
+        """Yield clear bytes for each complete checked SSE block."""
+        async for block in self._driver.iter_sse():
+            yield block
+
+    async def aclose(self) -> None:
+        """Close the live outer reply and native opener."""
+        self._registry.discard(self)
+        await self._driver.aclose()
+
+
+class _StreamContext:
+    def __init__(
+        self,
+        client: HPKEClientSession,
+        method: str,
+        url: str | URL,
+        params: Mapping[str, str | int | float] | None,
+        headers: Mapping[str, str] | Iterable[tuple[str, str]] | None,
+        data: object,
+        json: object,
         timeout: aiohttp.ClientTimeout | None,
-    ) -> bytes:
-        try:
-            headers = {
-                "accept": RESPONSE_MEDIA_TYPE,
-                "accept-encoding": "identity",
-                "cache-control": "no-store",
-                "content-type": REQUEST_MEDIA_TYPE,
-            }
-            context = (
-                self._http.post(
-                    endpoint,
-                    data=envelope,
-                    headers=headers,
-                    allow_redirects=False,
-                    auth=None,
-                    auto_decompress=False,
-                    timeout=timeout,
-                )
-                if timeout is not None
-                else self._http.post(
-                    endpoint,
-                    data=envelope,
-                    headers=headers,
-                    allow_redirects=False,
-                    auth=None,
-                    auto_decompress=False,
-                )
-            )
-            async with context as response:
-                if response.status != _OUTER_OK_STATUS:
-                    raise TransportError(
-                        "outer_status",
-                        f"protected endpoint returned outer status {response.status}",
-                        status_code=response.status,
-                    )
-                content_types = response.headers.getall("content-type", ())
-                if len(content_types) != 1 or media_type(content_types[0]) != RESPONSE_MEDIA_TYPE:
-                    raise TransportError(
-                        "outer_content_type",
-                        f"protected endpoint must return {RESPONSE_MEDIA_TYPE}",
-                    )
-                content_encodings = response.headers.getall("content-encoding", ())
-                if len(content_encodings) > 1 or (content_encodings and content_encodings[0].lower() != "identity"):
-                    raise TransportError("outer_content_encoding", "protected envelope must not use content encoding")
-                return await _read_outer_body(response, self._max_response_envelope_len)
-        except TransportError:
-            raise
-        except (aiohttp.ClientError, TimeoutError) as error:
-            raise TransportError("network_error", "protected HTTP request failed") from error
+    ) -> None:
+        self._client = client
+        self._method = method
+        self._url = url
+        self._params = params
+        self._headers = headers
+        self._data = data
+        self._json = json
+        self._timeout = timeout
+        self._response: HPKEStreamResponse | None = None
+
+    async def __aenter__(self) -> HPKEStreamResponse:
+        self._response = await self._client._open_stream(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            self._method,
+            self._url,
+            params=self._params,
+            headers=self._headers,
+            data=self._data,
+            json=self._json,
+            timeout=self._timeout,
+            live=True,
+        )
+        return self._response
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        if self._response is not None:
+            await self._response.aclose()
+
+
+def _check_outer(response: aiohttp.ClientResponse) -> None:
+    if response.status != _OUTER_OK_STATUS:
+        raise TransportError(
+            "outer_status", f"protected endpoint returned outer status {response.status}", status_code=response.status
+        )
+    content_types = response.headers.getall("content-type", ())
+    if len(content_types) != 1 or media_type(content_types[0]) != RESPONSE_MEDIA_TYPE:
+        raise TransportError("outer_content_type", f"protected endpoint must return {RESPONSE_MEDIA_TYPE}")
+    content_encodings = response.headers.getall("content-encoding", ())
+    if len(content_encodings) > 1 or (content_encodings and content_encodings[0].lower() != "identity"):
+        raise TransportError("outer_content_encoding", "protected envelope must not use content encoding")
+
+
+def _close_outer(response: aiohttp.ClientResponse) -> Callable[[], Awaitable[None]]:
+    async def close() -> None:
+        response.close()
+
+    return close
 
 
 async def _encode_body(data: object, json: object, maximum: int) -> tuple[bytes, str | None]:
@@ -429,20 +638,6 @@ async def _collect_async(source: AsyncIterable[bytes], maximum: int) -> bytes:
     return bytes(body)
 
 
-async def _read_outer_body(response: aiohttp.ClientResponse, maximum: int) -> bytes:
-    declared = response.headers.get("content-length")
-    if declared is not None and declared.isdecimal() and int(declared) > maximum:
-        raise TransportError("response_too_large", "buffered response exceeds the configured limit")
-    body = bytearray()
-    length = 0
-    async for chunk in response.content.iter_chunked(64 * 1024):
-        length += len(chunk)
-        if length > maximum:
-            raise TransportError("response_too_large", "buffered response exceeds the configured limit")
-        body.extend(chunk)
-    return bytes(body)
-
-
 def _charset(content_type: str | None) -> str | None:
     if content_type is None:
         return None
@@ -469,4 +664,4 @@ def _reason_phrase(status: int) -> str:
         return ""
 
 
-__all__ = ["HPKEClientSession", "HPKEResponse"]
+__all__ = ["HPKEClientSession", "HPKEResponse", "HPKEStreamResponse"]

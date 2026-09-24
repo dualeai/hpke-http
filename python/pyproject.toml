@@ -1,7 +1,7 @@
 [project]
 name = "hpke_http"
 version = "0.1.0"
-description = "Bounded HPKE-protected HTTP transactions backed by a shared Rust engine."
+description = "HPKE-protected HTTP requests and checked live response records backed by Rust."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -40,11 +40,13 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "idna~=3.10",
     "typing_extensions~=4.12",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "cryptography~=48.0",       # Independent v2 corpus check
     "maturin>=1.9,<2",           # Build and develop the private PyO3 extension
     "pytest-codspeed==5.0.3",    # CI benchmarks for the Python binding
     "pyright~=1.1",
@@ -56,6 +58,7 @@ dev = [
     "trustme~=1.2",              # Ephemeral TLS certificates for real aiohttp transport tests
     "twine~=6.1",                # Package verification before PyPI upload
     "vulture~=2.14",
+    "uvicorn==0.53.0",           # Local TLS ASGI live-stream tests
 ]
 # For downstream services using testing fixtures
 testing = [

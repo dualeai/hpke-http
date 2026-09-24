@@ -4,8 +4,8 @@
 
 use hpke_http::{
     Client, CompressionCoding, Error, HeaderField, Limits, Method, ReplayRequest, ReplayToken,
-    Request, Response, ResponseCapability, ResponseToken, Server, StartToken, build_info,
-    generate_key_pair,
+    Request, Response, ResponseCapability, ResponseMode, ResponseOpener, ResponseRecord,
+    ResponseSealer, ResponseToken, Server, SseSplitter, StartToken, build_info, generate_key_pair,
 };
 use pyo3::{
     create_exception,
@@ -25,6 +25,7 @@ create_exception!(
 type NativeLimitTuple = (Option<usize>, Option<usize>, Option<usize>, Option<usize>);
 type NativeHeaders = Vec<(String, String)>;
 type NativeResponse = (u16, NativeHeaders, Vec<u8>);
+type NativeRecord = (String, u16, NativeHeaders, String, Vec<u8>);
 
 #[pyfunction]
 fn native_build_info() -> (&'static str, &'static str, u32) {
@@ -109,7 +110,7 @@ impl NativeProtectedRequest {
         PyBytes::new(py, &envelope)
     }
 
-    fn open_response(
+    fn open_finite_response(
         &mut self,
         py: Python<'_>,
         envelope: PyBackedBytes,
@@ -119,9 +120,19 @@ impl NativeProtectedRequest {
             .take()
             .ok_or_else(continuation_consumed)?;
         let response = py
-            .detach(move || token.open(&envelope))
+            .detach(move || token.open_finite(&envelope))
             .map_err(native_error)?;
         export_response(response)
+    }
+
+    fn take_opener(&mut self) -> PyResult<NativeResponseOpener> {
+        let token = self
+            .response_token
+            .take()
+            .ok_or_else(continuation_consumed)?;
+        Ok(NativeResponseOpener {
+            inner: Some(token.into_opener()),
+        })
     }
 
     #[getter]
@@ -177,6 +188,11 @@ impl NativeServer {
             psk_id: preparsed.credential.psk_id,
             token: Some(preparsed.token),
         })
+    }
+
+    #[getter]
+    fn public_key(&self) -> Vec<u8> {
+        self.inner.public_key()
     }
 
     fn __repr__(&self) -> String {
@@ -319,8 +335,24 @@ impl NativeOpenedRequest {
             headers: import_headers(headers),
             body,
         };
-        py.detach(|| capability.protect(&response))
+        py.detach(|| capability.protect_finite(&response))
             .map_err(native_error)
+    }
+
+    fn take_sealer(
+        &mut self,
+        py: Python<'_>,
+        status: u16,
+        headers: NativeHeaders,
+    ) -> PyResult<(NativeResponseSealer, Vec<u8>)> {
+        let capability = self
+            .response_capability
+            .take()
+            .ok_or_else(continuation_consumed)?;
+        let (inner, first) = py
+            .detach(|| capability.into_sealer(status, import_headers(headers), None))
+            .map_err(native_error)?;
+        Ok((NativeResponseSealer { inner: Some(inner) }, first))
     }
 
     #[getter]
@@ -330,6 +362,145 @@ impl NativeOpenedRequest {
 
     fn discard_response(&mut self) {
         self.response_capability = None;
+    }
+}
+
+#[pyclass(name = "ResponseOpener", module = "hpke_http._native")]
+struct NativeResponseOpener {
+    inner: Option<ResponseOpener>,
+}
+
+#[pymethods]
+impl NativeResponseOpener {
+    // PyO3 owns this byte view while the GIL is released.
+    #[allow(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (input, offset=0))]
+    fn feed(
+        &mut self,
+        py: Python<'_>,
+        input: PyBackedBytes,
+        offset: usize,
+    ) -> PyResult<(usize, Option<NativeRecord>)> {
+        let inner = self.inner.as_mut().ok_or_else(continuation_consumed)?;
+        let input = input
+            .get(offset..)
+            .ok_or_else(|| PyValueError::new_err("offset exceeds input length"))?;
+        let (used, record) = py.detach(|| inner.feed(input)).map_err(native_error)?;
+        let record = match record {
+            Some(ResponseRecord::Start(head)) => Some((
+                "start".to_owned(),
+                head.status,
+                export_headers(head.headers)?,
+                match head.mode {
+                    ResponseMode::Finite => "finite",
+                    ResponseMode::Sse => "sse",
+                }
+                .to_owned(),
+                Vec::new(),
+            )),
+            Some(ResponseRecord::SseData(block)) => {
+                Some(("data".to_owned(), 0, Vec::new(), String::new(), block))
+            }
+            Some(ResponseRecord::End) => {
+                Some(("end".to_owned(), 0, Vec::new(), String::new(), Vec::new()))
+            }
+            None => None,
+        };
+        Ok((used, record))
+    }
+
+    fn finish_eof(&mut self, py: Python<'_>) -> PyResult<Option<NativeResponse>> {
+        let inner = self.inner.as_mut().ok_or_else(continuation_consumed)?;
+        let response = py.detach(|| inner.finish_eof()).map_err(native_error)?;
+        self.inner = None;
+        response.map(export_response).transpose()
+    }
+
+    fn close(&mut self) {
+        self.inner = None;
+    }
+}
+
+#[pyclass(name = "ResponseSealer", module = "hpke_http._native")]
+struct NativeResponseSealer {
+    inner: Option<ResponseSealer>,
+}
+
+#[pymethods]
+impl NativeResponseSealer {
+    // PyO3 owns this byte view while the GIL is released.
+    #[allow(clippy::needless_pass_by_value)]
+    fn seal_finite_body(
+        &mut self,
+        py: Python<'_>,
+        body: PyBackedBytes,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let inner = self.inner.as_mut().ok_or_else(continuation_consumed)?;
+        py.detach(|| inner.seal_finite_body(&body))
+            .map_err(native_error)
+    }
+
+    // PyO3 owns this byte view while the GIL is released.
+    #[allow(clippy::needless_pass_by_value)]
+    fn seal_sse_block(&mut self, py: Python<'_>, block: PyBackedBytes) -> PyResult<Vec<u8>> {
+        let inner = self.inner.as_mut().ok_or_else(continuation_consumed)?;
+        py.detach(|| inner.seal_sse_block(&block))
+            .map_err(native_error)
+    }
+
+    fn finish(&mut self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        let inner = self.inner.as_mut().ok_or_else(continuation_consumed)?;
+        let output = py.detach(|| inner.finish()).map_err(native_error)?;
+        self.inner = None;
+        Ok(output)
+    }
+
+    fn close(&mut self) {
+        self.inner = None;
+    }
+}
+
+#[pyclass(name = "SseSplitter", module = "hpke_http._native")]
+struct NativeSseSplitter {
+    inner: Option<SseSplitter>,
+}
+
+#[pymethods]
+impl NativeSseSplitter {
+    #[new]
+    fn new(max_block_len: usize) -> Self {
+        Self {
+            inner: Some(SseSplitter::new(max_block_len)),
+        }
+    }
+
+    // PyO3 owns this byte view while the GIL is released.
+    #[allow(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (input, offset=0, max_bytes=None))]
+    fn feed(
+        &mut self,
+        py: Python<'_>,
+        input: PyBackedBytes,
+        offset: usize,
+        max_bytes: Option<usize>,
+    ) -> PyResult<(usize, Option<Vec<u8>>)> {
+        let inner = self.inner.as_mut().ok_or_else(continuation_consumed)?;
+        let input = input
+            .get(offset..)
+            .ok_or_else(|| PyValueError::new_err("offset exceeds input length"))?;
+        let input = &input[..max_bytes.unwrap_or(input.len()).min(input.len())];
+        py.detach(|| inner.feed(input)).map_err(native_error)
+    }
+
+    fn finish(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.finish();
+        }
+        self.inner = None;
+    }
+
+    fn close(&mut self) {
+        self.inner = None;
     }
 }
 
@@ -431,5 +602,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativePreparsedRequest>()?;
     module.add_class::<NativeAuthenticatedRequest>()?;
     module.add_class::<NativeOpenedRequest>()?;
+    module.add_class::<NativeResponseOpener>()?;
+    module.add_class::<NativeResponseSealer>()?;
+    module.add_class::<NativeSseSplitter>()?;
     Ok(())
 }

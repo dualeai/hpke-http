@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Literal, NoReturn, cast
@@ -10,6 +11,7 @@ import pytest
 from starlette.types import Message, Receive, Scope, Send
 
 from hpke_http import (
+    CheckedRecord,
     Client,
     Header,
     Limits,
@@ -18,6 +20,7 @@ from hpke_http import (
     ProtocolError,
     Request,
     Response,
+    Server,
     generate_key_pair,
 )
 from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -79,7 +82,13 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID, compression=compression_coding)
     replay_store = _ReplayStore()
     middleware = HPKEMiddleware(
-        app, key_pair.private_key, KEY_ID, _resolve_psk, replay_store.admit, compression=compression_coding is not None
+        app,
+        key_pair.private_key,
+        KEY_ID,
+        _resolve_psk,
+        replay_store.admit,
+        compression=compression_coding is not None,
+        transport_path="/protected",
     )
     protected = client.protect(
         Request(
@@ -119,6 +128,57 @@ async def test_asgi_middleware_round_trip_with_canonical_ascii_headers(
 
 
 @pytest.mark.asyncio
+async def test_asgi_sends_each_complete_normalized_block_and_drops_tail() -> None:
+    async def app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/event-stream; charset=utf-8"),
+                    (b"content-length", b"999"),
+                    (b"content-encoding", b"identity"),
+                    (b"connection", b"x-hop"),
+                    (b"x-hop", b"private"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b": keepalive\r", "more_body": True})
+        await send({"type": "http.response.body", "body": b"\n\r", "more_body": True})
+        await send({"type": "http.response.body", "body": b"\nid: 7\n\n: control\n\npartial", "more_body": False})
+
+    keys = generate_key_pair()
+    client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
+    middleware = HPKEMiddleware(
+        app, keys.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
+    protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
+    try:
+        messages = await _invoke(middleware, protected.envelope)
+        assert messages[0]["status"] == 200
+        assert (b"content-length", b"999") not in messages[0]["headers"]
+        assert (b"cache-control", b"no-store, no-transform") in messages[0]["headers"]
+        reader = protected.into_opener()
+        checked: list[CheckedRecord] = []
+        for message in messages[1:]:
+            part = cast(bytes, message["body"])
+            offset = 0
+            while offset < len(part):
+                used, record = reader.feed(part[offset:])
+                offset += used
+                if record is not None:
+                    checked.append(record)
+        assert [record.kind for record in checked] == ["start", "data", "data", "data", "end"]
+        assert checked[0].headers == (Header("content-type", "text/event-stream; charset=utf-8"),)
+        assert [record.block for record in checked[1:4]] == [b": keepalive\n\n", b"id: 7\n\n", b": control\n\n"]
+        assert reader.finish_eof() is None
+    finally:
+        protected.close()
+        client.close()
+        middleware.close()
+
+
+@pytest.mark.asyncio
 async def test_asgi_middleware_forwards_disconnect_after_the_logical_body() -> None:
     async def app(_scope: Scope, receive: Receive, send: Send) -> None:
         assert (await receive())["body"] == b"logical body"
@@ -128,16 +188,47 @@ async def test_asgi_middleware_forwards_disconnect_after_the_logical_body() -> N
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(
         Request(method=Method.POST, authority="api.example.test", path="/items", body=b"logical body")
     )
 
-    messages = await _invoke(middleware, protected.envelope)
-    assert messages[0]["status"] == 200
-    assert protected.open_response(cast(bytes, messages[1]["body"])).body == b"ok"
+    messages = await _invoke(middleware, protected.envelope, disconnect_after_body=True)
+    assert messages[0]["status"] == 500
     client.close()
     middleware.close()
+
+
+@pytest.mark.parametrize("mode", ["finite", "sse"])
+@pytest.mark.asyncio
+async def test_asgi_receive_finishes_after_final_response_body(mode: Literal["finite", "sse"]) -> None:
+    resumed = asyncio.Event()
+
+    async def app(_scope: Scope, receive: Receive, send: Send) -> None:
+        assert (await receive())["type"] == "http.request"
+        headers = [(b"content-type", b"text/event-stream")] if mode == "sse" else []
+        body = b"data: done\n\n" if mode == "sse" else b"done"
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+        assert (await receive())["type"] == "http.disconnect"
+        resumed.set()
+
+    key_pair = generate_key_pair()
+    client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
+    try:
+        protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
+        messages = await asyncio.wait_for(_invoke(middleware, protected.envelope), 2)
+        assert resumed.is_set()
+        assert messages[0]["status"] == 200
+        assert messages[-1]["more_body"] is False
+    finally:
+        client.close()
+        middleware.close()
 
 
 @pytest.mark.asyncio
@@ -155,7 +246,9 @@ async def test_asgi_middleware_discards_head_body_and_preserves_length_metadata(
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.HEAD, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -174,7 +267,9 @@ async def test_asgi_middleware_rejects_nonempty_bodyless_statuses(status: int) -
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -193,7 +288,9 @@ async def test_asgi_middleware_accepts_none_raw_path() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope, raw_path=None)
@@ -210,12 +307,14 @@ async def test_asgi_middleware_advertises_post_on_method_rejection() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
-    messages = await _invoke(middleware, protected.envelope, outer_method="GET")
+    messages = await _invoke(middleware, protected.envelope, outer_method="PUT")
     assert messages[0]["status"] == 405
-    assert (b"allow", b"POST") in messages[0]["headers"]
+    assert (b"allow", b"GET, POST") in messages[0]["headers"]
     protected.close()
     client.close()
     middleware.close()
@@ -234,7 +333,9 @@ async def test_asgi_middleware_fails_closed_when_replay_store_errors() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, unavailable_store)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, unavailable_store, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -258,7 +359,9 @@ async def test_asgi_middleware_rejects_a_duplicate_without_dispatch() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     first = await _invoke(middleware, protected.envelope)
@@ -273,7 +376,7 @@ async def test_asgi_middleware_rejects_a_duplicate_without_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_asgi_middleware_bounds_unannounced_outer_request_bytes() -> None:
+async def test_asgi_middleware_bounds_unannounced_outer_request_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     async def app(_scope: Scope, _receive: Receive, _send: Send) -> None:
         pytest.fail("oversized envelope must not reach the application")
 
@@ -285,16 +388,28 @@ async def test_asgi_middleware_bounds_unannounced_outer_request_bytes() -> None:
         _resolve_psk,
         _ReplayStore().admit,
         limits=Limits(max_body_len=1),
+        transport_path="/protected",
     )
+    client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
+    protected = client.protect(
+        Request(method=Method.POST, authority="api.example.test", path="/items", body=b"x" * 100_000)
+    )
+
+    def fail_preparse(_server: Server, _envelope: bytes) -> NoReturn:
+        pytest.fail("oversized outer body must be rejected before native parsing")
+
+    monkeypatch.setattr(Server, "preparse", fail_preparse)
 
     messages = await _invoke(
         middleware,
-        b"x" * 100_000,
+        protected.envelope,
         include_content_length=False,
         incomplete_body=True,
     )
     assert messages[0]["status"] == 400
     assert messages[1]["body"] == b"invalid protected request"
+    protected.close()
+    client.close()
     middleware.close()
 
 
@@ -308,7 +423,9 @@ async def test_asgi_middleware_hides_unknown_psk_ids() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, missing_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, missing_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -329,7 +446,9 @@ async def test_asgi_middleware_maps_psk_resolver_outages_to_503() -> None:
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, unavailable_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, unavailable_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -361,7 +480,9 @@ async def test_asgi_middleware_maps_authentication_failures(
     monkeypatch.setattr(PreparsedRequest, "authenticate", fail_authenticate)
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
 
     messages = await _invoke(middleware, protected.envelope)
@@ -412,7 +533,9 @@ async def test_asgi_middleware_turns_boundary_failures_into_controlled_outer_err
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(Request(method=Method.GET, authority="api.example.test", path="/items"))
     extra_headers = [(b"host", b"other.example.test")] if failure == "duplicate_host" else []
     messages = await _invoke(middleware, protected.envelope, extra_headers=extra_headers)
@@ -435,7 +558,9 @@ async def test_asgi_middleware_rejects_nonidentity_authenticated_request_content
 
     key_pair = generate_key_pair()
     client = Client(key_pair.public_key, KEY_ID, PSK, PSK_ID)
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     protected = client.protect(
         Request(
             method=Method.POST,
@@ -477,7 +602,9 @@ async def test_asgi_lifespan_closes_native_server() -> None:
         sent.append(message)
 
     key_pair = generate_key_pair()
-    middleware = HPKEMiddleware(app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit)
+    middleware = HPKEMiddleware(
+        app, key_pair.private_key, KEY_ID, _resolve_psk, _ReplayStore().admit, transport_path="/protected"
+    )
     scope = cast(Scope, {"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.0"}})
 
     await middleware(scope, receive, send)
@@ -494,12 +621,14 @@ async def _invoke(
     envelope: bytes,
     *,
     extra_headers: list[tuple[bytes, bytes]] | None = None,
-    raw_path: bytes | None = b"/items",
+    raw_path: bytes | None = b"/protected",
     outer_method: str = "POST",
     include_content_length: bool = True,
     incomplete_body: bool = False,
+    disconnect_after_body: bool = False,
 ) -> list[Message]:
     delivered = False
+    disconnect = asyncio.Event()
     messages: list[Message] = []
     headers = [
         (b"host", b"api.example.test"),
@@ -516,7 +645,7 @@ async def _invoke(
             "http_version": "1.1",
             "method": outer_method,
             "scheme": "https",
-            "path": "/items",
+            "path": "/protected",
             "raw_path": raw_path,
             "query_string": b"",
             "root_path": "",
@@ -531,6 +660,8 @@ async def _invoke(
         if delivered:
             if incomplete_body:
                 pytest.fail("oversized body must be rejected before requesting another chunk")
+            if not disconnect_after_body:
+                await disconnect.wait()
             return {"type": "http.disconnect"}
         delivered = True
         return {"type": "http.request", "body": envelope, "more_body": incomplete_body}

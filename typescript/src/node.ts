@@ -14,12 +14,14 @@ export {
   PreparsedRequest,
   ProtectedRequest,
   ProtocolError,
+  ResponseOpener,
+  ResponseSealer,
   Server,
   StateError,
   generateKeyPair,
   isInitialized,
 } from "./index.js";
-export type { CompressionCoding, Header, KeyPair, Limits, Method, Request, Response } from "./index.js";
+export type { CheckedRecord, CompressionCoding, Header, KeyPair, Limits, Method, Request, Response } from "./index.js";
 export {
   REQUEST_MEDIA_TYPE,
   RESPONSE_MEDIA_TYPE,
@@ -31,6 +33,7 @@ export type {
   FetchTransportErrorCode,
   HpkeFetch,
   HpkeFetchConfiguration,
+  HpkeKeySource,
 } from "./fetch.js";
 
 const require = createRequire(import.meta.url);

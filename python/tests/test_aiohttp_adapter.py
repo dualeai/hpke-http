@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import socket
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal, cast
 
 import aiohttp
@@ -14,13 +17,15 @@ import trustme
 from aiohttp import web
 from yarl import URL
 
-from hpke_http import Header, Limits, Response, Server, StateError, TransportError, generate_key_pair
+from hpke_http import Header, Limits, ProtocolError, Response, Server, StateError, TransportError, generate_key_pair
+from hpke_http.middleware import Discover, PinnedKey
 from hpke_http.middleware.aiohttp import HPKEClientSession, HPKEResponse
 from hpke_http.transport import REQUEST_MEDIA_TYPE, RESPONSE_MEDIA_TYPE
 
 KEY_ID = b"primary-2026-09"
 PSK = b"a 32-byte minimum test credential!"
 PSK_ID = b"tenant-42"
+KEY_RECORD_FIXTURE = Path(__file__).resolve().parents[2] / "rust/hpke-http/tests/vectors/key-discovery-v1.json"
 
 _Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
@@ -37,6 +42,7 @@ async def _https_endpoint(handler: _Handler) -> AsyncIterator[tuple[URL, aiohttp
 
     application = web.Application()
     application.router.add_post("/protected", handler)
+    application.router.add_get("/protected", handler)
     runner = web.AppRunner(application)
     await runner.setup()
     connector: aiohttp.TCPConnector | None = None
@@ -99,17 +105,16 @@ async def test_aiohttp_adapter_protects_buffered_json_exchange(compression: Lite
     try:
         async with _https_endpoint(transport) as (endpoint, connector):
             session = HPKEClientSession(
-                key_pair.public_key,
-                KEY_ID,
+                str(endpoint),
+                PinnedKey(key_pair.public_key, KEY_ID),
                 PSK,
                 PSK_ID,
-                base_url="https://api.example.test/",
-                transport_endpoint=endpoint,
+                target_origin="https://api.example.test",
                 connector=connector,
                 compression=compression,
             )
             async with session:
-                async with session.post("/items", json={"name": request_name}) as response:
+                async with session.post("https://api.example.test/items", json={"name": request_name}) as response:
                     assert response.status == 200
                     assert await response.json() == {"ok": response_value}
                     assert response.headers["content-length"] == str(len(response_body))
@@ -164,11 +169,11 @@ async def test_aiohttp_adapter_rejects_nonidentity_authenticated_content() -> No
     try:
         async with _https_endpoint(transport) as (endpoint, connector):
             async with HPKEClientSession(
-                key_pair.public_key,
-                KEY_ID,
+                str(endpoint),
+                PinnedKey(key_pair.public_key, KEY_ID),
                 PSK,
                 PSK_ID,
-                transport_endpoint=endpoint,
+                target_origin="https://api.example.test",
                 connector=connector,
             ) as session:
                 with pytest.raises(TransportError) as captured:
@@ -202,11 +207,11 @@ async def test_aiohttp_adapter_rejects_invalid_outer_responses(
     key_pair = generate_key_pair()
     async with _https_endpoint(transport) as (endpoint, connector):
         async with HPKEClientSession(
-            key_pair.public_key,
-            KEY_ID,
+            str(endpoint),
+            PinnedKey(key_pair.public_key, KEY_ID),
             PSK,
             PSK_ID,
-            transport_endpoint=endpoint,
+            target_origin="https://api.example.test",
             connector=connector,
         ) as session:
             with pytest.raises(TransportError) as captured:
@@ -216,29 +221,34 @@ async def test_aiohttp_adapter_rejects_invalid_outer_responses(
 
 @pytest.mark.asyncio
 async def test_aiohttp_adapter_bounds_the_actual_outer_response_body() -> None:
+    key_pair = generate_key_pair()
+    server = Server(key_pair.private_key, KEY_ID)
+
     async def transport(request: web.Request) -> web.StreamResponse:
+        opened = server.preparse(await request.read()).authenticate(PSK).admit(accepted=True)
+        envelope = opened.protect_response(Response(status=200, body=b"ab"))
         response = web.StreamResponse(headers={"content-type": RESPONSE_MEDIA_TYPE})
         response.enable_chunked_encoding()
         await response.prepare(request)
         assert "content-length" not in response.headers
-        await response.write(b"x" * 100_000)
+        await response.write(envelope)
         await response.write_eof()
         return response
 
-    key_pair = generate_key_pair()
     async with _https_endpoint(transport) as (endpoint, connector):
         async with HPKEClientSession(
-            key_pair.public_key,
-            KEY_ID,
+            str(endpoint),
+            PinnedKey(key_pair.public_key, KEY_ID),
             PSK,
             PSK_ID,
             limits=Limits(max_body_len=1),
-            transport_endpoint=endpoint,
+            target_origin="https://api.example.test",
             connector=connector,
         ) as session:
-            with pytest.raises(TransportError) as captured:
+            with pytest.raises(ProtocolError) as captured:
                 await session.get("https://api.example.test/items")
-    assert captured.value.code == "response_too_large"
+    assert captured.value.code == "limit_exceeded"
+    server.close()
 
 
 @pytest.mark.asyncio
@@ -248,11 +258,11 @@ async def test_aiohttp_adapter_maps_connection_failures() -> None:
         unavailable.bind(("127.0.0.1", 0))
         port = cast(tuple[str, int], unavailable.getsockname())[1]
         async with HPKEClientSession(
-            key_pair.public_key,
-            KEY_ID,
+            f"https://127.0.0.1:{port}/protected",
+            PinnedKey(key_pair.public_key, KEY_ID),
             PSK,
             PSK_ID,
-            transport_endpoint=f"https://127.0.0.1:{port}/protected",
+            target_origin="https://api.example.test",
             connector=aiohttp.TCPConnector(ssl=False),
         ) as session:
             with pytest.raises(TransportError) as captured:
@@ -282,13 +292,108 @@ async def test_aiohttp_json_accepts_structured_suffix_but_not_substring_match() 
         await not_json.json()
 
 
-def test_aiohttp_adapter_rejects_environment_credentials() -> None:
+@pytest.mark.parametrize("trust_env", [True, 1, "yes"])
+def test_aiohttp_adapter_rejects_environment_credentials(trust_env: object) -> None:
     key_pair = generate_key_pair()
     with pytest.raises(ValueError, match="trust_env"):
         HPKEClientSession(
-            key_pair.public_key,
-            KEY_ID,
+            "https://api.example.test/protected",
+            PinnedKey(key_pair.public_key, KEY_ID),
             PSK,
             PSK_ID,
-            trust_env=True,
+            trust_env=trust_env,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["status", "type", "coding", "size", "shape", "point"])
+async def test_aiohttp_bad_key_get_never_sends_post(fault: str) -> None:
+    valid_record = bytes.fromhex(json.loads(KEY_RECORD_FIXTURE.read_text())["record"])
+    methods: list[str] = []
+
+    async def transport(request: web.Request) -> web.Response:
+        methods.append(request.method)
+        assert request.method == "GET"
+        record = valid_record
+        status = 503 if fault == "status" else 200
+        headers = {"content-type": "text/plain" if fault == "type" else "application/octet-stream"}
+        if fault == "coding":
+            headers["content-encoding"] = "gzip"
+        if fault == "size":
+            record = b"x" * 294
+        elif fault == "shape":
+            record += b"x"
+        elif fault == "point":
+            record = valid_record[:-32] + bytes(32)
+        return web.Response(status=status, headers=headers, body=record)
+
+    async with _https_endpoint(transport) as (endpoint, connector):
+        async with HPKEClientSession(str(endpoint), Discover(), PSK, PSK_ID, connector=connector) as client:
+            with pytest.raises(TransportError) as captured:
+                await client.get(str(endpoint.with_path("/items")))
+    assert methods == ["GET"]
+    assert captured.value.code == ("discovery_status" if fault == "status" else "discovery_response")
+    assert captured.value.status_code == (503 if fault == "status" else None)
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_rejects_local_headers_before_key_get() -> None:
+    methods: list[str] = []
+
+    async def transport(request: web.Request) -> web.Response:
+        methods.append(request.method)
+        return web.Response(status=503)
+
+    async with _https_endpoint(transport) as (endpoint, connector):
+        async with HPKEClientSession(str(endpoint), Discover(), PSK, PSK_ID, connector=connector) as client:
+            with pytest.raises(TransportError) as captured:
+                await client.get(str(endpoint.with_path("/items")), headers={"content-encoding": "gzip"})
+    assert captured.value.code == "inner_content_encoding"
+    assert methods == []
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_wrong_origin_fails_before_body_read_or_get() -> None:
+    touched = False
+
+    async def body() -> AsyncIterator[bytes]:
+        nonlocal touched
+        touched = True
+        yield b"x"
+
+    async with HPKEClientSession(
+        "https://api.example.test/protected",
+        Discover(),
+        PSK,
+        PSK_ID,
+        connector=aiohttp.TCPConnector(ssl=False),
+    ) as client:
+        with pytest.raises(TransportError) as captured:
+            await client.post("https://other.example.test/items", data=body())
+    assert captured.value.code == "invalid_target"
+    assert not touched
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_cancelled_key_get_sends_no_post() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    methods: list[str] = []
+
+    async def transport(request: web.Request) -> web.Response:
+        methods.append(request.method)
+        entered.set()
+        await release.wait()
+        return web.Response(status=503)
+
+    async with _https_endpoint(transport) as (endpoint, connector):
+        async with HPKEClientSession(str(endpoint), Discover(), PSK, PSK_ID, connector=connector) as client:
+            task = asyncio.ensure_future(client.get(str(endpoint.with_path("/items"))))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 5)
+            finally:
+                release.set()
+    assert methods == ["GET"]

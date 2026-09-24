@@ -6,20 +6,22 @@ import type {
   NativePreparsedRequest,
   NativeProtectedRequest,
   NativeResponse,
+  NativeResponseOpener,
+  NativeResponseSealer,
   NativeServer,
 } from "./native.js";
 import { PACKAGE_VERSION } from "./_package-version.js";
 
 /** Stable language-neutral wire-protocol identifier. */
-export const PROTOCOL_ID = "hpke-http/1";
+export const PROTOCOL_ID = "hpke-http/2";
 
 /** ABI version shared by the TypeScript facade and its private WASM module. */
-export const BINDING_ABI_VERSION = 1;
+export const BINDING_ABI_VERSION = 3;
 
 /** npm package version used to reject a mismatched private WASM module. */
 export { PACKAGE_VERSION };
 
-/** HTTP methods accepted by protocol version 1. */
+/** HTTP methods accepted by protocol version 2. */
 export type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
 
 /** Opt-in protocol body coding, independent of HTTP `Content-Encoding`. */
@@ -66,7 +68,10 @@ export interface Response {
 
 /** Optional per-engine limits. An omitted value selects the documented default. */
 export interface Limits {
-  /** Body bytes per message. Default: 8 MiB. Hard maximum: 64 MiB. */
+  /**
+   * Request or finite response body bytes, or one SSE block.
+   * An SSE stream has no total body limit. Default: 8 MiB. Hard maximum: 64 MiB.
+   */
   readonly maxBodyLength?: number;
 
   /** Combined field-name and field-value bytes. Default: 16 KiB. Hard maximum: 64 KiB. */
@@ -129,7 +134,7 @@ export class InitializationError extends Error {
 let nativeModule: NativeModule | undefined;
 const serverHandles = new WeakMap<Server, NativeServer>();
 const serverLimits = new WeakMap<Server, { body: number; envelope: number }>();
-let createProtectedRequest: (native: NativeProtectedRequest, maximumEnvelope: number) => ProtectedRequest;
+let createProtectedRequest: (native: NativeProtectedRequest) => ProtectedRequest;
 let createPreparsedRequest: (native: NativePreparsedRequest, server: Server) => PreparsedRequest;
 let createAuthenticatedRequest: (native: NativeAuthenticatedRequest, maximumBody: number) => AuthenticatedRequest;
 let createOpenedRequest: (native: NativeOpenedRequest, maximumBody: number) => OpenedRequest;
@@ -181,14 +186,13 @@ export function generateKeyPair(): KeyPair {
 export class Client {
   #native: NativeClient | undefined;
   readonly #maximumBody: number;
-  readonly #maximumEnvelope: number;
 
   /**
    * Validate and copy one client credential configuration.
    *
    * @param recipientPublicKey - Encoded 32-byte X25519 public key.
    * @param recipientKeyId - Non-empty public key identifier, at most 255 bytes.
-   * @param psk - Secret of at least 32 bytes.
+   * @param psk - Secret of at least 32 bytes with at least 32 bytes of entropy.
    * @param pskId - Non-empty public opaque identifier, at most 255 bytes and not equal to `psk`.
    * @param limits - Optional limits applied to every request and response.
    * @param compression - Optional authenticated body coding. Ciphertext size can reveal
@@ -207,7 +211,6 @@ export class Client {
     const normalized = normalizeLimits(limits);
     const nativeLimits = makeLimits(module, normalized);
     this.#maximumBody = maximumBodyLength(normalized);
-    this.#maximumEnvelope = maximumEnvelopeLength(normalized);
     try {
       this.#native = callNative(
         () =>
@@ -243,7 +246,7 @@ export class Client {
         currentUnixSeconds(),
       ),
     );
-    return createProtectedRequest(protectedRequest, this.#maximumEnvelope);
+    return createProtectedRequest(protectedRequest);
   }
 
   /**
@@ -260,17 +263,15 @@ export class Client {
 /** Protected request bytes plus the one-shot capability that opens its response. */
 export class ProtectedRequest {
   #native: NativeProtectedRequest | undefined;
-  readonly #maximumEnvelope: number;
   /** Owned copy of the complete protected request envelope. */
   public readonly envelope: Uint8Array;
 
   static {
-    createProtectedRequest = (native, maximumEnvelope) => new ProtectedRequest(native, maximumEnvelope);
+    createProtectedRequest = (native) => new ProtectedRequest(native);
   }
 
-  private constructor(native: NativeProtectedRequest, maximumEnvelope: number) {
+  private constructor(native: NativeProtectedRequest) {
     this.#native = native;
-    this.#maximumEnvelope = maximumEnvelope;
     this.envelope = native.take_envelope();
   }
 
@@ -279,12 +280,36 @@ export class ProtectedRequest {
     return this.#native === undefined || this.#native.consumed;
   }
 
-  /** Consume the capability and authenticate one complete response envelope. */
+  /** Check one complete finite response through the v2 record reader. */
   public openResponse(envelope: Uint8Array): Response {
+    const opener = this.intoOpener();
+    try {
+      let offset = 0;
+      while (offset < envelope.byteLength) {
+        const { consumed, record } = opener.feed(envelope.subarray(offset, Math.min(offset + 64 * 1024, envelope.byteLength)));
+        if (record?.kind === "start" && record.mode === "sse") {
+          throw new StateError();
+        }
+        if (consumed === 0) {
+          throw new ProtocolError("malformed_envelope", "response reader made no progress");
+        }
+        offset += consumed;
+      }
+      const response = opener.finishEof();
+      if (response === undefined) {
+        throw new ProtocolError("malformed_envelope", "finite response body is missing");
+      }
+      return response;
+    } finally {
+      opener.close();
+    }
+  }
+
+  /** Transfer the one response right to a live checked record reader. */
+  public intoOpener(): ResponseOpener {
     const native = requireHandle(this.#native);
     try {
-      checkLength(envelope.byteLength, this.#maximumEnvelope);
-      return responseFromNative(callNative(() => native.open_response(ownedBytes(envelope))));
+      return new ResponseOpener(callNative(() => native.into_opener()));
     } finally {
       this.close();
     }
@@ -294,6 +319,59 @@ export class ProtectedRequest {
   public close(): void {
     if (this.#native !== undefined) {
       this.#native.discard();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
+/** One checked response record. SSE DATA holds one clear complete block. */
+export type CheckedRecord =
+  | { readonly kind: "start"; readonly status: number; readonly headers: readonly Header[]; readonly mode: "finite" | "sse" }
+  | { readonly kind: "sse_data"; readonly block: Uint8Array }
+  | { readonly kind: "end" };
+
+/** One response reader that accepts any byte cuts. */
+export class ResponseOpener {
+  #native: NativeResponseOpener | undefined;
+
+  public constructor(native: NativeResponseOpener) { this.#native = native; }
+
+  /** Consume at most one record; finite DATA returns no public record. */
+  public feed(input: Uint8Array): { readonly consumed: number; readonly record?: CheckedRecord } {
+    const native = requireHandle(this.#native);
+    const result = callNative(() => native.feed(input));
+    try {
+      let record: CheckedRecord | undefined;
+      switch (result.kind) {
+        case 1:
+          record = { kind: "start", status: result.status, headers: decodeHeaders(result.headers_json), mode: result.mode === 2 ? "sse" : "finite" };
+          break;
+        case 2:
+          record = { kind: "sse_data", block: result.block };
+          break;
+        case 3:
+          record = { kind: "end" };
+          break;
+      }
+      return record === undefined ? { consumed: result.consumed } : { consumed: result.consumed, record };
+    } finally {
+      result.free();
+    }
+  }
+
+  /** Confirm true outer body EOF after END. */
+  public finishEof(): Response | undefined {
+    const native = requireHandle(this.#native);
+    const response = callNative(() => native.finish_eof());
+    this.close();
+    return response === undefined ? undefined : responseFromNative(response);
+  }
+
+  /** Stop without a complete-response claim. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.close();
       this.#native.free();
       this.#native = undefined;
     }
@@ -521,10 +599,60 @@ export class OpenedRequest {
     }
   }
 
+  /** Start a checked response stream and transfer its one-use writer right. */
+  public startResponse(status: number, headers: readonly Header[]): ResponseSealer {
+    const native = requireHandle(this.#native);
+    if (!Number.isSafeInteger(status) || status < 200 || status > 599) {
+      throw new ProtocolError("invalid_configuration", "response status must be 200 through 599");
+    }
+    try {
+      return new ResponseSealer(callNative(() => native.start_response(status, encodeHeaders(headers))));
+    } finally {
+      this.close();
+    }
+  }
+
   /** Discard the response capability. This method is idempotent. */
   public close(): void {
     if (this.#native !== undefined) {
       this.#native.discard_response();
+      this.#native.free();
+      this.#native = undefined;
+    }
+  }
+}
+
+/** One checked response writer for a finite body or complete LF-normalized SSE blocks. */
+export class ResponseSealer {
+  #native: NativeResponseSealer | undefined;
+  public readonly start: Uint8Array;
+
+  public constructor(native: NativeResponseSealer) {
+    this.#native = native;
+    this.start = native.take_start();
+  }
+
+  /** Protect a finite body once. An empty body emits no DATA record. */
+  public sealFiniteBody(body: Uint8Array): Uint8Array | undefined {
+    return callNative(() => requireHandle(this.#native).seal_finite_body(ownedBytes(body)));
+  }
+
+  /** Protect one complete LF-normalized SSE block, including its final blank line. */
+  public sealSseBlock(block: Uint8Array): Uint8Array {
+    return callNative(() => requireHandle(this.#native).seal_sse_block(ownedBytes(block)));
+  }
+
+  /** Protect END. The caller must then end the outer HTTP body. */
+  public finish(): Uint8Array {
+    const native = requireHandle(this.#native);
+    try { return callNative(() => native.finish()); }
+    finally { this.close(); }
+  }
+
+  /** Discard the writer without END. This method is idempotent. */
+  public close(): void {
+    if (this.#native !== undefined) {
+      this.#native.close();
       this.#native.free();
       this.#native = undefined;
     }

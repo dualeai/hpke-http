@@ -419,3 +419,6 @@ $RECYCLE.BIN/
 _wasm/
 !Cargo.lock
 /typescript/src/_package-version.ts
+
+# Internal investigation notes
+scratchpad/

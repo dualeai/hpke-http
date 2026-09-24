@@ -374,6 +374,15 @@ wheels = [
 ]
 
 [[package]]
+name = "click"
+version = "8.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/0e/7fa0ef50764b67090eca4114772a2abf8b6148198475e54c660b97caeee6/click-8.5.0.tar.gz", hash = "sha256:ba0d2089de75ea0310e2dde03160e6ca10009947fb95a182f9b54021bb272e34", size = 382235, upload-time = "2026-08-26T13:33:14.56Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/58/50/6c0d534c5f134586a8e1ba4e330569e32f057e33372ae556463212fb4cd3/click-8.5.0-py3-none-any.whl", hash = "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360", size = 125251, upload-time = "2026-08-26T13:33:12.928Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -711,6 +720,7 @@ name = "hpke-http"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "idna" },
     { name = "typing-extensions" },
 ]
 
@@ -719,6 +729,7 @@ aiohttp = [
     { name = "aiohttp" },
 ]
 dev = [
+    { name = "cryptography" },
     { name = "maturin" },
     { name = "pyright" },
     { name = "pytest" },
@@ -729,6 +740,7 @@ dev = [
     { name = "ruff" },
     { name = "trustme" },
     { name = "twine" },
+    { name = "uvicorn" },
     { name = "vulture" },
 ]
 fastapi = [
@@ -745,7 +757,9 @@ testing = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'aiohttp'", specifier = "~=3.13" },
+    { name = "cryptography", marker = "extra == 'dev'", specifier = "~=48.0" },
     { name = "httpx", marker = "extra == 'httpx'", specifier = "~=0.28" },
+    { name = "idna", specifier = "~=3.10" },
     { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.9,<2" },
     { name = "pyright", marker = "extra == 'dev'", specifier = "~=1.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "~=8.3" },
@@ -760,6 +774,7 @@ requires-dist = [
     { name = "trustme", marker = "extra == 'dev'", specifier = "~=1.2" },
     { name = "twine", marker = "extra == 'dev'", specifier = "~=6.1" },
     { name = "typing-extensions", specifier = "~=4.12" },
+    { name = "uvicorn", marker = "extra == 'dev'", specifier = "==0.53.0" },
     { name = "vulture", marker = "extra == 'dev'", specifier = "~=2.14" },
 ]
 provides-extras = ["dev", "testing", "fastapi", "aiohttp", "httpx"]
@@ -1643,6 +1658,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1e/24/a2a2ed9addd907787d7aa0355ba36a6cadf1768b934c652ea78acbd59dcd/urllib3-2.6.2.tar.gz", hash = "sha256:016f9c98bb7e98085cb2b4b17b87d2c702975664e4f060c6532e64d1c1a5e797", size = 432930, upload-time = "2025-12-11T15:56:40.252Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6d/b9/4095b668ea3678bf6a0af005527f39de12fb026516fb3df17495a733b7f8/urllib3-2.6.2-py3-none-any.whl", hash = "sha256:ec21cddfe7724fc7cb4ba4bea7aa8e2ef36f607a4bab81aa6ce42a13dc3f03dd", size = 131182, upload-time = "2025-12-11T15:56:38.584Z" },
+]
+
+[[package]]
+name = "uvicorn"
+version = "0.53.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "h11" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5d/ad/04bbb797c84fc1f26cb171f7394716f4865ffb8d8c5e1eef42565c2dfa6b/uvicorn-0.53.0.tar.gz", hash = "sha256:a9356f0cb89b3b8621529c5d5eebd69bfe154f4c3f68b4cf2de47e45fa855c2e", size = 110881, upload-time = "2026-09-14T07:44:23.815Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/18/0eea75741ee812e9f598b687619ce2454f6c3a1c5cd21ea990ec6bd26f45/uvicorn-0.53.0-py3-none-any.whl", hash = "sha256:e8dca71ec86dce5f04e333f0d56cdedf942446e6643b9cea1af0d6d3a02cb03e", size = 87081, upload-time = "2026-09-14T07:44:22.179Z" },
 ]
 
 [[package]]

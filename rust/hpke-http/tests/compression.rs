@@ -66,15 +66,18 @@ fn gzip_and_zstd_round_trip_with_logical_content_length() -> Result<(), Error> {
         assert_eq!(opened.request, expected_request);
 
         let expected_response = response(vec![b'b'; 16 * 1024]);
-        let protected_response = opened.response.protect(&expected_response)?;
+        let protected_response = opened.response.protect_finite(&expected_response)?;
         assert!(protected_response.len() < expected_response.body.len());
-        assert_eq!(response_token.open(&protected_response)?, expected_response);
+        assert_eq!(
+            response_token.open_finite(&protected_response)?,
+            expected_response
+        );
     }
     Ok(())
 }
 
 #[test]
-fn opt_in_rejects_old_server_and_old_client_still_works_with_new_server() -> Result<(), Error> {
+fn compression_requires_server_opt_in_and_identity_requests_work() -> Result<(), Error> {
     let (client, server) = engines(Limits::default(), Limits::default())?;
     let old_request = client.protect(&request(vec![b'a'; 4096]))?;
     let preparsed = server.preparse(old_request.envelope())?;
@@ -82,9 +85,11 @@ fn opt_in_rejects_old_server_and_old_client_still_works_with_new_server() -> Res
     let opened = authenticated
         .token
         .admit(authenticated.replay.decision(true))?;
-    let old_response = opened.response.protect(&response(vec![b'b'; 4096]))?;
+    let old_response = opened
+        .response
+        .protect_finite(&response(vec![b'b'; 4096]))?;
     assert_eq!(
-        old_request.into_parts().1.open(&old_response)?,
+        old_request.into_parts().1.open_finite(&old_response)?,
         response(vec![b'b'; 4096])
     );
 
@@ -151,7 +156,12 @@ fn decoded_response_limit_is_enforced() -> Result<(), Error> {
     let opened = authenticated
         .token
         .admit(authenticated.replay.decision(true))?;
-    let envelope = opened.response.protect(&response(vec![b'b'; 4096]))?;
-    assert_eq!(response_token.open(&envelope), Err(Error::LimitExceeded));
+    let envelope = opened
+        .response
+        .protect_finite(&response(vec![b'b'; 4096]))?;
+    assert_eq!(
+        response_token.open_finite(&envelope),
+        Err(Error::LimitExceeded)
+    );
     Ok(())
 }

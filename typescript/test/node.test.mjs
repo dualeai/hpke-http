@@ -42,8 +42,8 @@ test("Node loader and complete hpke-http transaction", async () => {
   await initialize();
   assert.equal(isInitialized(), true);
   assert.equal(PACKAGE_VERSION, packageMetadata.version);
-  assert.equal(PROTOCOL_ID, "hpke-http/1");
-  assert.equal(BINDING_ABI_VERSION, 1);
+  assert.equal(PROTOCOL_ID, "hpke-http/2");
+  assert.equal(BINDING_ABI_VERSION, 3);
 
   const keys = generateKeyPair();
   const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID);
@@ -51,7 +51,7 @@ test("Node loader and complete hpke-http transaction", async () => {
   const request = {
     method: "POST",
     authority: "api.example.test",
-    path: "/v1/items?limit=2",
+    path: "/v2/items?limit=2",
     headers: [{ name: "content-type", value: "application/json" }],
     body: new TextEncoder().encode('{"name":"Ada"}'),
   };
@@ -83,6 +83,34 @@ test("Node loader and complete hpke-http transaction", async () => {
 
   client.close();
   server.close();
+});
+
+test("low-level finite response sealer handles empty and nonempty bodies", async () => {
+  await initialize();
+  for (const body of [new Uint8Array(), new TextEncoder().encode("finite body")]) {
+    const keys = generateKeyPair();
+    const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID);
+    const server = new Server(keys.privateKey, KEY_ID);
+    try {
+      const protectedRequest = client.protect({
+        method: "POST", authority: "api.example.test", path: "/finite",
+      });
+      const opened = server.preparse(protectedRequest.envelope).authenticate(PSK).admit({ accepted: true });
+      const headers = [{ name: "content-type", value: "text/plain" }];
+      const writer = opened.startResponse(200, headers);
+      const data = writer.sealFiniteBody(body);
+      assert.equal(data === undefined, body.byteLength === 0);
+      const end = writer.finish();
+      const envelope = new Uint8Array(writer.start.byteLength + (data?.byteLength ?? 0) + end.byteLength);
+      envelope.set(writer.start);
+      if (data !== undefined) envelope.set(data, writer.start.byteLength);
+      envelope.set(end, writer.start.byteLength + (data?.byteLength ?? 0));
+      assert.deepEqual(protectedRequest.openResponse(envelope), { status: 200, headers, body });
+    } finally {
+      client.close();
+      server.close();
+    }
+  }
 });
 
 for (const coding of ["gzip", "zstd"]) {
@@ -157,13 +185,17 @@ test("binding size guards reject before copying and preserve one-shot consumptio
     (error) => error instanceof ProtocolError && error.code === "limit_exceeded",
   );
   assert.equal(opened.responseConsumed, true);
+  const largeServer = new Server(keys.privateKey, KEY_ID);
+  const largeOpened = largeServer.preparse(protectedRequest.envelope).authenticate(PSK).admit({ accepted: true });
+  const validLargeResponse = largeOpened.protectResponse({ status: 200, body: oversizedBody });
   assert.throws(
-    () => protectedRequest.openResponse(oversizedEnvelope),
+    () => protectedRequest.openResponse(validLargeResponse),
     (error) => error instanceof ProtocolError && error.code === "limit_exceeded",
   );
   assert.equal(protectedRequest.consumed, true);
   client.close();
   server.close();
+  largeServer.close();
 });
 
 test("replay rejection stays a stable protocol error", async () => {

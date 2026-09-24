@@ -1,11 +1,12 @@
 //! Known-answer checks against frozen protocol data cross-checked independently.
 
 use hpke_http::{
-    Client, EntropySource, Error, HeaderField, Limits, Method, Request, Response, Server,
+    Client, EntropySource, Error, HeaderField, Limits, Method, Request, Response, ResponseMode,
+    ResponseRecord, Server,
 };
 use serde_json::Value;
 
-const CORPUS: &str = include_str!("vectors/protocol-v1.json");
+const CORPUS: &str = include_str!("vectors/protocol-v2.json");
 
 struct FixedEntropy(Vec<u8>);
 
@@ -23,9 +24,12 @@ impl EntropySource for FixedEntropy {
 fn rust_server_opens_frozen_request_and_matches_response() -> Result<(), Box<dyn std::error::Error>>
 {
     let corpus: Value = serde_json::from_str(CORPUS)?;
-    assert_eq!(text(&corpus, "schema")?, "hpke-http-protocol-corpus/1");
+    assert_eq!(text(&corpus, "schema")?, "hpke-http-protocol-corpus/2");
     assert_eq!(text(&corpus, "protocol")?, hpke_http::PROTOCOL_ID);
-    assert_eq!(text(&corpus, "generator")?, "frozen-cross-implementation/1");
+    assert_eq!(
+        text(&corpus, "generator")?,
+        "independent-python-cryptography/2"
+    );
 
     let recipient_private_key = hex_field(&corpus, "recipient_private_key")?;
     let recipient_key_id = hex_field(&corpus, "recipient_key_id")?;
@@ -56,7 +60,7 @@ fn rust_server_opens_frozen_request_and_matches_response() -> Result<(), Box<dyn
     let mut entropy = FixedEntropy(response_nonce);
     let response_envelope = opened
         .response
-        .protect_with_entropy(&expected_response(&corpus)?, &mut entropy)?;
+        .protect_finite_with_entropy(&expected_response(&corpus)?, &mut entropy)?;
     assert_eq!(response_envelope, hex_field(&corpus, "response_envelope")?);
     Ok(())
 }
@@ -89,6 +93,99 @@ fn rust_client_matches_frozen_sender_envelope() -> Result<(), Box<dyn std::error
         protected.envelope(),
         hex_field(&corpus, "sender_request_envelope")?
     );
+    Ok(())
+}
+
+#[test]
+fn rust_sse_writer_and_reader_match_frozen_records() -> Result<(), Box<dyn std::error::Error>> {
+    let corpus: Value = serde_json::from_str(CORPUS)?;
+    let server = Server::new(
+        &hex_field(&corpus, "recipient_private_key")?,
+        hex_field(&corpus, "recipient_key_id")?,
+        Limits::default(),
+    )?;
+    let envelope = hex_field(&corpus, "request_envelope")?;
+    let preparsed = server.preparse(&envelope)?;
+    let issued = corpus
+        .get("issued_at_unix_s")
+        .and_then(Value::as_u64)
+        .ok_or("missing time")?;
+    let authenticated =
+        server.authenticate_at(preparsed.token, &hex_field(&corpus, "psk")?, issued)?;
+    let opened = authenticated
+        .token
+        .admit(authenticated.replay.decision(true))?;
+    let sse = object(&corpus, "sse_response")?;
+    let status = u16::try_from(
+        sse.get("status")
+            .and_then(Value::as_u64)
+            .ok_or("missing status")?,
+    )?;
+    let mut entropy = FixedEntropy(hex_field(&corpus, "sse_response_nonce")?);
+    let (mut sealer, mut wire) =
+        opened
+            .response
+            .into_sealer_with_entropy(status, headers(sse)?, None, &mut entropy)?;
+    let blocks: Vec<Vec<u8>> = sse
+        .get("blocks")
+        .and_then(Value::as_array)
+        .ok_or("missing blocks")?
+        .iter()
+        .map(|value| decode_hex(value.as_str().ok_or("invalid block")?))
+        .collect::<Result<_, _>>()?;
+    for block in &blocks {
+        wire.extend_from_slice(&sealer.seal_sse_block(block)?);
+    }
+    wire.extend_from_slice(&sealer.finish()?);
+    assert_eq!(wire, hex_field(&corpus, "sse_response_envelope")?);
+
+    let client = Client::new(
+        &hex_field(&corpus, "recipient_public_key")?,
+        hex_field(&corpus, "recipient_key_id")?,
+        hex_field(&corpus, "psk")?,
+        hex_field(&corpus, "psk_id")?,
+        Limits::default(),
+    )?;
+    let mut sender_entropy = FixedEntropy(hex_field(&corpus, "sender_entropy_seed")?);
+    let token = client
+        .protect_at_with_entropy(&expected_request(&corpus)?, issued, &mut sender_entropy)?
+        .into_parts()
+        .1;
+    let sender_request = hex_field(&corpus, "sender_request_envelope")?;
+    let preparsed = server.preparse(&sender_request)?;
+    let authenticated =
+        server.authenticate_at(preparsed.token, &hex_field(&corpus, "psk")?, issued)?;
+    let sender_opened = authenticated
+        .token
+        .admit(authenticated.replay.decision(true))?;
+    let mut nonce_entropy = FixedEntropy(hex_field(&corpus, "sse_response_nonce")?);
+    let (mut sender_sealer, mut sender_wire) = sender_opened.response.into_sealer_with_entropy(
+        status,
+        headers(sse)?,
+        None,
+        &mut nonce_entropy,
+    )?;
+    for block in &blocks {
+        sender_wire.extend_from_slice(&sender_sealer.seal_sse_block(block)?);
+    }
+    sender_wire.extend_from_slice(&sender_sealer.finish()?);
+    let mut reader = token.into_opener();
+    let mut offset = 0;
+    let mut seen = Vec::new();
+    let mut ended = false;
+    while offset < sender_wire.len() {
+        let (used, record) = reader.feed(&sender_wire[offset..])?;
+        offset += used;
+        match record {
+            Some(ResponseRecord::Start(head)) => assert_eq!(head.mode, ResponseMode::Sse),
+            Some(ResponseRecord::SseData(block)) => seen.push(block),
+            Some(ResponseRecord::End) => ended = true,
+            None => {}
+        }
+    }
+    assert_eq!(seen, blocks);
+    assert!(ended);
+    assert!(reader.finish_eof()?.is_none());
     Ok(())
 }
 

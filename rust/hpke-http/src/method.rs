@@ -1,8 +1,8 @@
-//! HTTP methods included in protocol version 1.
+//! Supported HTTP request methods.
 
 use crate::Error;
 
-/// HTTP request methods supported by protocol version 1.
+/// Supported HTTP request methods.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
     /// GET.

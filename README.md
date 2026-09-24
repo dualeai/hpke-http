@@ -1,11 +1,11 @@
 # hpke-http
 
-`hpke-http` protects complete, bounded HTTP requests and responses with one
+`hpke-http` protects bounded HTTP requests and checked response records with one
 shared Rust protocol engine. Python calls that engine through PyO3. TypeScript
 calls the same engine through WebAssembly and includes an adapter for the
 runtime's native Fetch API.
 
-The protocol identifier is `hpke-http/1`. It is the only protocol implemented
+The protocol identifier is `hpke-http/2`. It is the only protocol implemented
 in this repository. There is no pure-Python or pure-TypeScript cryptographic
 fallback.
 
@@ -18,17 +18,16 @@ typescript/           TypeScript API, WASM boundary, and native Fetch adapter
 cicd/                 tag-derived coordinated release tooling
 ```
 
-The Rust crate owns byte encoding, HPKE operations, limits, validation, replay
-identity, and one-shot response state. The language projects own their runtime
-lifecycle and HTTP integrations. Generated binding APIs are private.
+The Rust crate owns protected message encoding, HPKE operations, limits,
+validation, replay identity, and response record state. The language projects
+own key GET and record handling, runtime lifecycle, and HTTP integrations.
+Generated binding APIs are private.
 
 ## Install and runtime support
 
-```sh
-cargo add hpke-http
-python -m pip install hpke_http
-npm install @dualeai/hpke-http
-```
+Build this checkout with the commands in [Development](#development) to use
+`hpke-http/2`. Package registry installs select a published release, not this
+checkout.
 
 The Rust crate requires Rust 1.87 or newer. Python supports CPython 3.10 through
 3.14; release wheels target Linux x86-64 and AArch64 and macOS universal2.
@@ -38,12 +37,13 @@ explicit `./node` and `./browser` exports and no root export.
 
 ## Protocol properties
 
-Protocol version 1 uses:
+Protocol version 2 uses:
 
 - RFC 9180 HPKE PSK mode with X25519, HKDF-SHA256, and ChaCha20-Poly1305;
-- canonical known-length Binary HTTP Messages from RFC 9292;
+- a canonical known-length Binary HTTP request from RFC 9292, with RFC 9292
+  field-line encoding in response START;
 - a project-specific request envelope and request-bound response keys; and
-- complete-message authentication before application plaintext is released.
+- one checked response START, a checked DATA record per SSE block, and a checked END.
 
 The protocol is not wire-compatible with RFC 9458 Oblivious HTTP. HTTPS is
 still required because endpoints, public key and PSK identifiers, message
@@ -52,22 +52,53 @@ sizes, and timing remain visible.
 Servers resolve a public PSK ID and then make one atomic replay-admission
 decision. The authenticated plaintext remains inside the engine until that
 decision succeeds. Each request can create and open only one protected
-response.
+response. A client uses the START fields only after its tag passes. It gets each
+SSE block after that block's tag passes, before the server sends END. A finite
+response becomes complete only after END and the real outer body EOF.
 
-The engine accepts whole messages, with an 8 MiB default body limit and hard
-resource ceilings. It supports opt-in gzip or zstd body compression in the Rust
+The engine accepts whole requests, finite replies, and live SSE blocks. The
+default body limit is 8 MiB per request, finite response, or SSE block; a live
+SSE stream has no total body cap. It supports opt-in gzip or zstd body compression in the Rust
 protocol layer, with bounded decompression in every binding. This is separate
 from HTTP `Content-Encoding`: high-level adapters still require identity
-logical content coding. The engine does not implement incremental streaming,
-discovery, or suite negotiation. Compression can leak body information through
+logical content coding. SSE records use no private body coding. The engine does
+no network I/O; the Python and Fetch adapters can discover one key. There is
+no suite negotiation. Compression can leak body information through
 ciphertext length; enable it only when attacker-controlled data cannot be
 combined with secrets in the same body.
 
 Recipient keys use X25519. Public recipient-key and PSK identifiers are
-non-empty and at most 255 bytes; PSKs are at least 32 bytes and must not equal
-their public IDs. Native objects copy credentials. Closing them releases native
-copies, but it cannot erase caller-owned Python `bytes` or JavaScript
-`Uint8Array` values.
+non-empty and at most 255 bytes; PSKs must be at least 32 bytes long, contain
+at least 32 bytes of entropy, and differ from their public IDs. Native objects
+copy credentials. Closing them releases native copies, but it cannot erase
+caller-owned Python `bytes` or JavaScript `Uint8Array` values.
+
+## Key discovery
+
+One configured HTTPS endpoint serves the public key through GET and receives
+protected requests through POST. A client gets the key before each discovered
+call. The GET sends no logical authorization, cookies, or PSK ID. The client
+accepts no redirect and stores no app key cache. A pinned key uses the same
+POST endpoint and sends no GET. The client accepts logical requests at one
+fixed HTTPS origin; a gateway can set a different `target_origin` or
+`targetOrigin` and the ASGI server's `expected_authority`.
+Origin checks fold DNS case and IDNA names, normalize IPv6 and the default
+port 443, and keep other ports distinct. A wrong logical origin fails before
+the client reads its body or sends GET.
+
+The GET body is exactly `"HHKD" || 0x01 || id_len:u8 || id || x25519_public_key[32]`.
+The ID length is 1 through 255, so the full record is 39 through 293 bytes.
+The server sends `application/octet-stream` and `Cache-Control: no-store`.
+Clients reject any other record form or extra bytes. Version `0x01` describes
+this key record; request and response bytes still use `hpke-http/2`. There is
+no earlier discovery JSON, old route, or old client API path.
+
+The server holds one recipient key. All workers for an endpoint must use that
+key; a key change across mixed workers can make a request fail. The adapters
+do not retry a protected POST. If its reply is lost, the caller does not know
+whether the app ran. The added GET is one more network round trip on each
+discovered call. For browser calls, outer CORS must cover GET, POST preflight,
+POST, and fault replies.
 
 ## Rust
 
@@ -77,9 +108,12 @@ the exact protocol bytes, replay contract, limits, and stable error categories.
 
 ## Python
 
-The Python package provides the low-level state machine plus buffered adapters
+The Python package provides the low-level state machine, buffered finite replies,
+and live SSE adapters
 for `httpx`, `aiohttp`, and FastAPI/Starlette. See the
-[Python package README](https://github.com/dualeai/hpke-http/blob/main/python/README.md).
+[Python package README](python/README.md).
+
+The key values and `send_envelope` below come from the application.
 
 ```python
 from hpke_http import Client, Method, Request
@@ -89,7 +123,7 @@ with Client(server_public_key, key_id, psk, psk_id) as client:
         Request(Method.POST, "api.example.test", "/items", body=b"payload")
     )
     try:
-        # Send transaction.envelope, then authenticate the returned envelope.
+        protected_response = send_envelope(transaction.envelope)
         response = transaction.open_response(protected_response)
     finally:
         transaction.close()
@@ -98,16 +132,16 @@ with Client(server_public_key, key_id, psk, psk_id) as client:
 ## TypeScript
 
 The TypeScript package provides explicit browser and Node entry points and a
-buffered `createHpkeFetch` adapter over native Fetch. See the
-[TypeScript package README](https://github.com/dualeai/hpke-http/blob/main/typescript/README.md).
+`createHpkeFetch` adapter over native Fetch with live SSE bodies. See the
+[TypeScript package README](typescript/README.md).
 
 ```ts
 import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
 
 await initialize();
 const hpkeFetch = createHpkeFetch({
-  recipientPublicKey: serverPublicKey,
-  recipientKeyId: keyId,
+  endpoint: "https://api.example.test/protected",
+  key: { kind: "discover" },
   psk,
   pskId,
 });
@@ -156,14 +190,16 @@ each platform.
 Local Python targets update `uv.lock` when dependencies change. CI uses the
 locked versions. Package targets write to `artifacts/`. Run
 `make smoke-python-wheel`, `make smoke-python-sdist`, or `make smoke-typescript`
-after you build the matching package. Pass `EXPECTED_VERSION=2.0.0` to check a
-specific release version.
+after you build the matching package. Set `EXPECTED_VERSION` to the release
+tag's numeric version, without its `v` prefix, when you check a release package.
 
-The separate CodSpeed workflow benchmarks complete public-API transactions in
-Rust, Python, and Node/WASM at empty, 1 KiB, 1 MiB, and 8 MiB body sizes. It prepares
-keys and message bodies outside the measured operation; only the native Rust
-suite enables CodSpeed's allocation-memory mode. There are no local stopwatch
-scripts or hardware-dependent timing thresholds.
+The separate CodSpeed workflow measures complete public-API transactions in
+Rust, Python, and Node/WASM at empty, 1 KiB, 1 MiB, and 8 MiB body sizes. It
+also measures pinned and discovered HTTPX and Fetch calls with in-memory
+transports; those runs include no network wait. The body-size runs prepare keys
+and message bodies outside the measured step. Only the native Rust suite enables
+CodSpeed's allocation-memory mode. There are no local stopwatch scripts or
+hardware-dependent timing thresholds.
 
 `wasm-bindgen-cli` 0.2.128 and the Rust `wasm32-unknown-unknown` target are
 required for the TypeScript build. CI uses Rust 1.98.1 and a shared Rust build
@@ -184,10 +220,9 @@ Python, and npm package metadata before it builds or tests any artifact. The
 crate, Python distributions, npm package, and GitHub release then use the same
 tag and workflow.
 
-The supported 2.x line is the Rust-backed product described here. Published
-1.x versions used the removed Python protocol and are not API- or
-wire-compatible fallbacks. The coordinated release notes are the migration
-record; no old implementation remains in the package.
+This source tree targets the next major release with protocol `hpke-http/2`.
+Its parser and bindings have no earlier wire mode or API fallback. The exact
+release tag sets the package versions after this code is ready.
 
 The protocol details live in Rust module documentation, public API docs, and
 frozen known-answer tests owned by the Rust core. This repository does not
@@ -195,13 +230,14 @@ maintain a separate specification or architecture-decision document tree.
 
 ## Security
 
-See the [security policy](https://github.com/dualeai/hpke-http/blob/main/SECURITY.md)
+See the [security policy](SECURITY.md)
 for supported releases and private reporting.
-Do not use a PSK as its public PSK ID. Use an atomic replay store shared by all
+Give each PSK at least 32 bytes of entropy. Do not use it as its public PSK ID.
+Use an atomic replay store shared by all
 server workers that can process the same credentials.
 
 The core standards are [RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html)
 and [RFC 9292](https://www.rfc-editor.org/rfc/rfc9292.html). Response-key
 derivation follows the pattern in
 [RFC 9458 section 4.4](https://www.rfc-editor.org/rfc/rfc9458.html#section-4.4),
-but `hpke-http/1` is not an Oblivious HTTP profile.
+but `hpke-http/2` is not an Oblivious HTTP profile.

@@ -5,10 +5,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use chacha20poly1305::{
-    ChaCha20Poly1305,
-    aead::{Aead, AeadInOut, KeyInit, Payload, array::Array},
-};
 use hkdf::Hkdf;
 use hpke::{
     Deserializable, Kem as KemTrait, OpModeR, OpModeS, PskBundle, Serializable,
@@ -27,11 +23,11 @@ use crate::{
     CLOCK_SKEW_SECS, CompressionCoding, EntropySource, Error, HARD_MAX_ID_LEN, Limits, Method,
     REQUEST_LIFETIME_SECS, SystemEntropy,
     codec::{
-        ENC_LEN, RESPONSE_NONCE_LEN, TAG_LEN, encode_request, encode_request_header,
-        encode_response, parse_request, parse_response,
+        ENC_LEN, RESPONSE_NONCE_LEN, TAG_LEN, encode_request, encode_request_header, parse_request,
     },
     compression,
-    message::{Request, Response},
+    message::{HeaderField, Request, Response},
+    response::{ResponseMode, ResponseOpener, ResponseRecord, ResponseSealer},
 };
 
 type Kem = X25519HkdfSha256;
@@ -39,17 +35,17 @@ type Kdf = HkdfSha256;
 type HpkeAead = HpkeChaCha20Poly1305;
 type RecipientContext = AeadCtxR<HpkeAead, Kdf, Kem>;
 
-const REQUEST_INFO_LABEL: &[u8] = b"message/hpke-http request\0v1";
-const RESPONSE_EXPORT_LABEL: &[u8] = b"message/hpke-http response\0v1";
-const REPLAY_LABEL: &[u8] = b"hpke-http/replay\0v1\0";
-const RESPONSE_KEY_INFO: &[u8] = b"key";
-const RESPONSE_NONCE_INFO: &[u8] = b"nonce";
+const REQUEST_INFO_LABEL: &[u8] = b"message/hpke-http request\0v2";
+const RESPONSE_EXPORT_LABEL: &[u8] = b"message/hpke-http response\0v2";
+const REPLAY_LABEL: &[u8] = b"hpke-http/replay\0v2\0";
+const RESPONSE_KEY_INFO: &[u8] = b"hpke-http/2 response key";
+const RESPONSE_NONCE_INFO: &[u8] = b"hpke-http/2 response nonce";
 const RESPONSE_SECRET_LEN: usize = 32;
 const RESPONSE_KEY_LEN: usize = 32;
 const AEAD_NONCE_LEN: usize = 12;
 const MIN_PSK_LEN: usize = 32;
-type ResponseKey = Zeroizing<[u8; RESPONSE_KEY_LEN]>;
-type ResponseNonce = Zeroizing<[u8; AEAD_NONCE_LEN]>;
+pub(crate) type ResponseKey = Zeroizing<[u8; RESPONSE_KEY_LEN]>;
+pub(crate) type ResponseNonce = Zeroizing<[u8; AEAD_NONCE_LEN]>;
 
 /// A generated X25519 recipient key pair.
 pub struct KeyPair {
@@ -190,7 +186,7 @@ impl Client {
 
     /// Opt in to authenticated request-body compression and advertise the
     /// same coding for responses. Even an identity-sized request carries the
-    /// extension marker; older servers reject it rather than silently ignore it.
+    /// extension marker; servers without compression support reject it.
     /// Do not mix attacker-controlled text with secrets in a body being coded:
     /// ciphertext length can reveal information about compression ratio.
     #[must_use]
@@ -488,6 +484,14 @@ impl Server {
         self
     }
 
+    /// Return the encoded public key for this server's private key.
+    #[must_use]
+    pub fn public_key(&self) -> Vec<u8> {
+        Kem::sk_to_pk(&self.recipient_private_key)
+            .to_bytes()
+            .to_vec()
+    }
+
     /// Parse bounded public fields without accepting credentials or plaintext.
     ///
     /// # Errors
@@ -614,12 +618,12 @@ impl Server {
     }
 }
 
-struct ResponseMaterial {
-    secret: Zeroizing<[u8; RESPONSE_SECRET_LEN]>,
-    enc: [u8; ENC_LEN],
-    method: Method,
-    limits: Limits,
-    compression: Option<CompressionCoding>,
+pub(crate) struct ResponseMaterial {
+    pub(crate) secret: Zeroizing<[u8; RESPONSE_SECRET_LEN]>,
+    pub(crate) enc: [u8; ENC_LEN],
+    pub(crate) method: Method,
+    pub(crate) limits: Limits,
+    pub(crate) compression: Option<CompressionCoding>,
 }
 
 impl fmt::Debug for ResponseMaterial {
@@ -649,32 +653,31 @@ impl fmt::Debug for ResponseToken {
 }
 
 impl ResponseToken {
-    /// Consume this token and open one complete protected response.
+    /// Consume this token to check response records as they arrive.
+    #[must_use]
+    pub fn into_opener(self) -> ResponseOpener {
+        ResponseOpener::new(self.0)
+    }
+
+    /// Open one complete finite response with the v2 record reader.
     ///
     /// # Errors
-    ///
-    /// Returns a parse, limit, or authentication error.
-    pub fn open(self, envelope: &[u8]) -> Result<Response, Error> {
-        let parsed = parse_response(envelope, self.0.limits)?;
-        let (key, nonce) = derive_response_key_nonce(&self.0, parsed.nonce)?;
-        let cipher = ChaCha20Poly1305::new(&Array(*key));
-        let plaintext = cipher
-            .decrypt(
-                &Array(*nonce),
-                Payload {
-                    msg: parsed.ciphertext,
-                    aad: &[],
-                },
-            )
-            .map_err(|_| Error::AuthenticationFailed)?;
-        let response = compression::decode_response(
-            &plaintext,
-            self.0.method,
-            self.0.limits,
-            self.0.compression,
-        )?;
-        validate_response_body(self.0.method, &response).map_err(|_| Error::MalformedEnvelope)?;
-        Ok(response)
+    /// Returns a parse, limit, authentication, or response-mode error.
+    pub fn open_finite(self, envelope: &[u8]) -> Result<Response, Error> {
+        let mut opener = self.into_opener();
+        let mut offset = 0;
+        while offset < envelope.len() {
+            let (used, record) = opener.feed(&envelope[offset..])?;
+            offset += used;
+            if matches!(record, Some(ResponseRecord::Start(ref head)) if head.mode == ResponseMode::Sse)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
+            if used == 0 {
+                return Err(Error::MalformedEnvelope);
+            }
+        }
+        opener.finish_eof()?.ok_or(Error::MalformedEnvelope)
     }
 }
 
@@ -692,46 +695,75 @@ impl fmt::Debug for ResponseCapability {
 }
 
 impl ResponseCapability {
-    /// Consume this capability and protect one response with platform entropy.
+    /// Start one checked response. The returned bytes hold the prefix and START.
     ///
     /// # Errors
-    ///
-    /// Returns a validation, limit, entropy, compression, or cryptographic error.
-    pub fn protect(self, response: &Response) -> Result<Vec<u8>, Error> {
-        self.protect_with_entropy(response, &mut SystemEntropy)
+    /// Returns a validation, entropy, or cryptographic error.
+    pub fn into_sealer(
+        self,
+        status: u16,
+        headers: Vec<HeaderField>,
+        coding: Option<CompressionCoding>,
+    ) -> Result<(ResponseSealer, Vec<u8>), Error> {
+        self.into_sealer_with_entropy(status, headers, coding, &mut SystemEntropy)
     }
 
-    /// Consume this capability and protect one response with injected entropy.
+    /// Start one checked response with an injected entropy source.
     ///
     /// # Errors
+    /// Returns a validation, entropy, or cryptographic error.
+    pub fn into_sealer_with_entropy(
+        self,
+        status: u16,
+        headers: Vec<HeaderField>,
+        coding: Option<CompressionCoding>,
+        entropy: &mut impl EntropySource,
+    ) -> Result<(ResponseSealer, Vec<u8>), Error> {
+        ResponseSealer::new(&self.0, status, headers, coding, entropy)
+    }
+
+    /// Protect one complete finite response with the v2 record writer.
     ///
-    /// Returns a validation, limit, entropy, compression, or cryptographic
-    /// error before any response envelope is exposed.
-    pub fn protect_with_entropy(
+    /// # Errors
+    /// Returns a validation, limit, entropy, compression, or cryptographic error.
+    pub fn protect_finite(self, response: &Response) -> Result<Vec<u8>, Error> {
+        self.protect_finite_with_entropy(response, &mut SystemEntropy)
+    }
+
+    /// Protect one complete finite response with injected entropy.
+    ///
+    /// # Errors
+    /// Returns a validation, limit, entropy, compression, or cryptographic error.
+    pub fn protect_finite_with_entropy(
         self,
         response: &Response,
         entropy: &mut impl EntropySource,
     ) -> Result<Vec<u8>, Error> {
-        validate_response_body(self.0.method, response)?;
-        let mut ciphertext = compression::encode_response(
-            response,
-            self.0.method,
-            self.0.limits,
-            self.0.compression,
+        let (coding, compressed) = match self.0.compression {
+            Some(coding) if !response.body.is_empty() => {
+                let compressed = compression::maybe_compress(&response.body, coding)?;
+                (compressed.as_ref().map(|_| coding), compressed)
+            }
+            _ => (None, None),
+        };
+        let (mut sealer, mut output) = self.into_sealer_with_entropy(
+            response.status,
+            response.headers.clone(),
+            coding,
+            entropy,
         )?;
-        let mut response_nonce = [0_u8; RESPONSE_NONCE_LEN];
-        entropy.fill(&mut response_nonce)?;
-        let (key, nonce) = derive_response_key_nonce(&self.0, &response_nonce)?;
-        let cipher = ChaCha20Poly1305::new(&Array(*key));
-        let tag = cipher
-            .encrypt_inout_detached(
-                &Array(*nonce),
-                &[],
-                InOutBuf::from(ciphertext.as_mut_slice()),
-            )
-            .map_err(|_| Error::CryptoFailure)?;
-        ciphertext.extend_from_slice(&tag);
-        encode_response(&response_nonce, &ciphertext)
+        if sealer.head_mode() != ResponseMode::Finite {
+            return Err(Error::InvalidConfiguration);
+        }
+        let data =
+            sealer.seal_finite_body_with_precompressed(&response.body, compressed.as_deref())?;
+        let end = sealer.finish()?;
+        output.reserve(data.as_ref().map_or(0, Vec::len) + end.len());
+        if let Some(data) = data {
+            output.extend_from_slice(&data);
+        }
+        output.extend_from_slice(&end);
+        Ok(output)
     }
 }
 
@@ -808,16 +840,7 @@ where
     })
 }
 
-fn validate_response_body(method: Method, response: &Response) -> Result<(), Error> {
-    if (!response.body.is_empty())
-        && (method == Method::Head || matches!(response.status, 204 | 205 | 304))
-    {
-        return Err(Error::InvalidConfiguration);
-    }
-    Ok(())
-}
-
-fn derive_response_key_nonce(
+pub(crate) fn derive_response_key_nonce(
     material: &ResponseMaterial,
     response_nonce: &[u8],
 ) -> Result<(ResponseKey, ResponseNonce), Error> {

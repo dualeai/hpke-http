@@ -1,7 +1,7 @@
 {
   "name": "@dualeai/hpke-http",
   "version": "0.1.0",
-  "description": "Bounded whole-message HPKE protection for TypeScript, backed by Rust/WASM",
+  "description": "HPKE requests and checked live response records for TypeScript, backed by Rust/WASM",
   "license": "Apache-2.0",
   "keywords": [
     "hpke",

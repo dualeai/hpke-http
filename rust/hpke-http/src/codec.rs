@@ -1,9 +1,9 @@
-//! Version 1 outer envelopes around encrypted BHTTP messages.
+//! Version 2 request envelope and response record framing.
 
 use crate::{Error, HARD_MAX_ID_LEN, Limits};
 
 pub(crate) const REQUEST_MAGIC: &[u8; 4] = b"HHRQ";
-pub(crate) const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 2;
 pub(crate) const FLAGS: u8 = 0;
 pub(crate) const KEM_ID: u16 = 0x0020;
 pub(crate) const KDF_ID: u16 = 0x0001;
@@ -23,12 +23,6 @@ pub(crate) struct ParsedRequest<'a> {
     pub psk_id: &'a [u8],
     pub issued_at_unix_s: u64,
     pub enc: &'a [u8],
-    pub ciphertext: &'a [u8],
-}
-
-#[derive(Debug)]
-pub(crate) struct ParsedResponse<'a> {
-    pub nonce: &'a [u8],
     pub ciphertext: &'a [u8],
 }
 
@@ -141,35 +135,6 @@ pub(crate) fn parse_request(input: &[u8], limits: Limits) -> Result<ParsedReques
         issued_at_unix_s,
         enc: &input[header_len..ciphertext_start],
         ciphertext: &input[ciphertext_start..],
-    })
-}
-
-pub(crate) fn encode_response(
-    nonce: &[u8; RESPONSE_NONCE_LEN],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, Error> {
-    if ciphertext.len() < TAG_LEN {
-        return Err(Error::CryptoFailure);
-    }
-    let capacity = RESPONSE_NONCE_LEN
-        .checked_add(ciphertext.len())
-        .ok_or(Error::LimitExceeded)?;
-    let mut output = Vec::with_capacity(capacity);
-    output.extend_from_slice(nonce);
-    output.extend_from_slice(ciphertext);
-    Ok(output)
-}
-
-pub(crate) fn parse_response(input: &[u8], limits: Limits) -> Result<ParsedResponse<'_>, Error> {
-    if input.len() < RESPONSE_NONCE_LEN + TAG_LEN {
-        return Err(Error::MalformedEnvelope);
-    }
-    if input.len() - RESPONSE_NONCE_LEN - TAG_LEN > limits.max_encoded_message_len() {
-        return Err(Error::LimitExceeded);
-    }
-    Ok(ParsedResponse {
-        nonce: &input[..RESPONSE_NONCE_LEN],
-        ciphertext: &input[RESPONSE_NONCE_LEN..],
     })
 }
 
