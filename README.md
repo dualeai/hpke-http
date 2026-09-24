@@ -193,11 +193,13 @@ locked versions. Package targets write to `artifacts/`. Run
 after you build the matching package. Set `EXPECTED_VERSION` to the release
 tag's numeric version, without its `v` prefix, when you check a release package.
 
-The separate CodSpeed workflow benchmarks complete public-API transactions in
-Rust, Python, and Node/WASM at empty, 1 KiB, 1 MiB, and 8 MiB body sizes. It prepares
-keys and message bodies outside the measured operation; only the native Rust
-suite enables CodSpeed's allocation-memory mode. There are no local stopwatch
-scripts or hardware-dependent timing thresholds.
+The separate CodSpeed workflow measures complete public-API transactions in
+Rust, Python, and Node/WASM at empty, 1 KiB, 1 MiB, and 8 MiB body sizes. It
+also measures pinned and discovered HTTPX and Fetch calls with in-memory
+transports; those runs include no network wait. The body-size runs prepare keys
+and message bodies outside the measured step. Only the native Rust suite enables
+CodSpeed's allocation-memory mode. There are no local stopwatch scripts or
+hardware-dependent timing thresholds.
 
 `wasm-bindgen-cli` 0.2.128 and the Rust `wasm32-unknown-unknown` target are
 required for the TypeScript build. CI uses Rust 1.98.1 and a shared Rust build

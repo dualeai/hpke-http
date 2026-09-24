@@ -59,7 +59,7 @@ install-deps-python-ci:
 	uv sync --project $(PYTHON_DIR) --frozen --all-extras
 
 install-benchmark-python:
-	uv sync --project $(PYTHON_DIR) --frozen --extra dev
+	uv sync --project $(PYTHON_DIR) --frozen --extra dev --extra httpx
 
 install-deps-typescript:
 	npm ci --prefix $(TYPESCRIPT_DIR) --ignore-scripts
