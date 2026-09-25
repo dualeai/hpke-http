@@ -679,7 +679,11 @@ class HPKEStreamResponse:
         return await self._driver.read()
 
     async def iter_sse(self) -> AsyncIterator[bytes]:
-        """Yield clear bytes for each complete checked SSE block."""
+        """Yield each checked SSE block.
+
+        Full iteration checks END and outer EOF. A later read can fail after
+        earlier blocks were yielded.
+        """
         async for block in self._driver.iter_sse():
             yield block
 

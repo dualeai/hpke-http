@@ -272,7 +272,7 @@ impl Client {
 /// Public information needed by a host credential resolver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialRequest {
-    /// Opaque public PSK identifier authenticated with the request.
+    /// Untrusted public PSK ID for credential lookup before START authentication.
     pub psk_id: Vec<u8>,
 }
 
@@ -421,7 +421,8 @@ impl ReplayToken {
 /// A fully authenticated request and its one-use response capability.
 #[must_use]
 pub struct OpenedRequest {
-    /// Verified request data safe for application dispatch.
+    /// Verified request data. The host checks its logical target policy before
+    /// dispatch.
     pub request: Request,
     /// One-use capability bound to this request.
     pub response: ResponseCapability,
@@ -533,7 +534,9 @@ impl Server {
         max_complete_envelope_len(self.limits)
     }
 
-    /// Parse bounded public fields without accepting credentials or plaintext.
+    /// Parse bounded public fields from a supplied complete envelope.
+    /// An HTTP host first reads the outer body through real EOF; this method
+    /// cannot observe transport EOF itself.
     ///
     /// # Errors
     ///
@@ -552,7 +555,8 @@ impl Server {
     ///
     /// Bindings which already own their input can move it into the one-shot
     /// credential-resolution token. The same bounded public checks run before
-    /// the token is created.
+    /// the token is created. An HTTP host first reads the outer body through
+    /// real EOF; this method cannot observe transport EOF itself.
     ///
     /// # Errors
     ///
@@ -812,6 +816,7 @@ impl ResponseToken {
     }
 
     /// Open one complete finite response with the v3 record reader.
+    /// An HTTP caller first reads the outer body through real EOF.
     ///
     /// # Errors
     /// Returns a parse, limit, authentication, or response-mode error.
@@ -1190,7 +1195,8 @@ impl StreamRequestSealer {
         Ok(frame)
     }
 
-    /// Protect END and release the one-use response right.
+    /// Protect final DATA, if any, then END, and release the one-use response right.
+    /// Send all returned bytes before ending the outer HTTP body.
     ///
     /// # Errors
     /// Returns a state, logical length, or cryptographic error.
@@ -1227,7 +1233,8 @@ impl Client {
     /// Start a protected request and return its bounded prefix and checked START.
     ///
     /// # Errors
-    /// Returns a validation, entropy, or cryptographic error before source bytes are read.
+    /// Returns a validation, clock, entropy, or cryptographic error before
+    /// source bytes are read.
     pub fn begin_stream(
         &self,
         head: &RequestHead,
@@ -1353,10 +1360,11 @@ impl StreamReplayToken {
     }
 }
 
-/// Checked request head and a live body reader. The response right waits for END and EOF.
+/// Checked request head and a live body reader. The host checks its logical
+/// target policy and holds DATA from the app until END and real outer EOF.
 #[must_use]
 pub struct OpenedStreamRequest {
-    /// Authenticated request fields.
+    /// Authenticated request fields; the host still checks its target policy.
     pub head: RequestHead,
     /// Checks each DATA part before it is released.
     pub reader: StreamRequestOpener,
@@ -1502,7 +1510,8 @@ impl StreamRequestOpener {
         Ok((used, Some(record)))
     }
 
-    /// Check true outer EOF after END and release the response right.
+    /// Call after the host observes real outer EOF. Check END and release the
+    /// response right. This method cannot observe transport EOF itself.
     ///
     /// # Errors
     /// Returns an error for a missing END or partial frame.

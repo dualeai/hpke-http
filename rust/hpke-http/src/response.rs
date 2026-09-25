@@ -302,7 +302,8 @@ impl ResponseSealer {
         Ok(Some(frame))
     }
 
-    /// Protect the terminal record. The caller then ends the outer HTTP body.
+    /// Protect END. In finite mode, call `seal_finite_body` once first, even
+    /// for an empty body. The caller then ends the outer HTTP body.
     ///
     /// # Errors
     /// Returns an order or cryptographic error and closes the writer.
@@ -547,7 +548,8 @@ impl ResponseOpener {
         Ok(())
     }
 
-    /// Confirm true outer body EOF after END and release a complete finite reply.
+    /// Call after the host observes real outer body EOF. Check END and release
+    /// a finite reply, if any. This method cannot observe transport EOF itself.
     ///
     /// # Errors
     /// Returns an error if END is absent, the reader failed, or EOF was checked twice.

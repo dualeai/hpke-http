@@ -1,7 +1,9 @@
 # hpke-http for Python
 
 `hpke_http` protects HTTP requests and replies with the Rust `hpke-http/3`
-engine. Use the HTTPX or aiohttp client with an ASGI app.
+engine. Use the HTTPX or aiohttp client with an ASGI app. The
+[protocol specification](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md)
+holds the shared wire bytes, key record, checks, and host steps.
 
 ## Install the published package
 
@@ -11,9 +13,14 @@ Install the v4 release with the HTTPX, aiohttp, and FastAPI adapters used below:
 python -m pip install 'hpke-http[httpx,aiohttp,fastapi]~=4.0'
 ```
 
+The v4 clients do not read HHKD v1 key records. Change clients and hosts
+together, or use separate endpoints.
+
 ## Protect an ASGI app
 
-Wrap the app at one HTTPS path:
+Wrap the app at one HTTPS path. Your app supplies `app`,
+`recipient_private_key`, `key_id`, and `lease_seconds`. It also implements
+`resolve_psk` and `admit_replay`:
 
 ```python
 from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -40,11 +47,9 @@ path. Set `expected_authority` if the logical host differs from the outer
 `Host` header. A lifespan shutdown closes the native server; call
 `protected_app.close()` at shutdown if the host sends no lifespan events.
 The service sets `lease_seconds` and a bound to deliver and parse POST START.
-For a planned switch from A to B, set all workers to advertise A with
-`accepted_keys=[(b_private_key, b_key_id)]`. Then set all workers to advertise B
-with `accepted_keys=[(a_private_key, a_key_id)]`. After the last A lease, POST
-START delivery bound, and worker clock margin end, set all workers to advertise
-B with no other accepted key. Each pair holds a private key, then its public ID.
+For a planned key change, follow the
+[key switch order](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#hhkd-v2-key-record).
+Set `accepted_keys` to `(private_key, key_id)` pairs for other accepted keys.
 
 The app receives its usual HTTP request fields and body. The wrapper checks
 START, every DATA part, END, and the outer body end before it starts the app.
@@ -72,6 +77,9 @@ The browser must read outer `Content-Encoding` on GET and POST replies. If a
 proxy adds this header, CORS must expose it so the client can check it.
 
 ## Send requests with HTTPX
+
+Set `psk` to your app's shared secret bytes. This example uses `b"tenant-42"`
+as its public PSK ID.
 
 ```python
 from hpke_http.middleware.httpx import DiscoveredEndpoint, HPKEAsyncClient
@@ -113,6 +121,8 @@ For a finite reply in a stream context, call `await response.read()`.
 
 ## Send requests with aiohttp
 
+Set `endpoint`, `logical_url`, `psk`, and `psk_id` from your app config.
+
 ```python
 import aiohttp
 from hpke_http.middleware.aiohttp import DiscoveredEndpoint, HPKEClientSession
@@ -135,15 +145,10 @@ sources, and JSON. It keeps the ordinary aiohttp request shape. The finite
 
 ### Keys and transport
 
-`DiscoveredEndpoint(endpoint)` holds one checked key until its service-set
-`use_for_s` lease ends. Concurrent callers share one GET. Keep a distinct
-source for each full endpoint URL, including Bridge and Library paths.
-
-The lease clock starts before GET, so a slow GET leaves less time to start
-POST. The client checks the lease before POST START. It can get a new key if it
-can still use the request body; otherwise it reports `discovery_expired` before
-it yields POST START. The service's POST START delivery bound covers time after
-that check.
+`DiscoveredEndpoint(endpoint)` shares one checked key and one GET among
+callers. Keep a distinct source for each full endpoint URL, including Bridge
+and Library paths. The [key record and lease rules](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#hhkd-v2-key-record)
+are in the central spec.
 
 A source owns its outer HTTP pool and endpoint URL; short-lived credential
 clients borrow it.
@@ -171,15 +176,10 @@ follow outer redirects. They do not retry a protected POST. The GET has no
 bearer, cookies, or PSK ID. Business headers stay in the protected request. A
 lost reply leaves the request result unknown.
 
-HHKD v2 requires a positive lease; these clients have no v1 discovery
-fallback. A client that reads only HHKD v1 cannot use a v2 host, and a v2
-client cannot use a v1 host. Switch clients and hosts together, or use
-separate endpoints.
-
-Generate a recipient key pair with `generate_key_pair()`. Recipient keys use
-X25519 and have 32 bytes. Key and PSK IDs are public opaque values of 1 to 255
-bytes. A PSK needs at least 32 bytes of entropy. A Python `bytes` object
-cannot be erased in place; keep secret copies to a minimum.
+Generate a recipient key pair with `generate_key_pair()`. Follow the
+[credential rules](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#request-hpke-steps)
+when you provision keys and PSKs. A Python `bytes` object cannot be erased
+in place; keep secret copies to a minimum.
 
 ### Transport errors
 
@@ -200,33 +200,17 @@ those logical errors. A failed POST is not retried.
 
 ### Limits and payload coding
 
-| Limit | Default | Hard maximum |
-| --- | ---: | ---: |
-| Request clear bytes | 1 GiB | 4 GiB |
-| Finite reply body or one SSE block | 8 MiB | 64 MiB |
-| Request DATA part | 64 KiB | 64 KiB |
-| Header name and value bytes | 16 KiB | 64 KiB |
-| Header fields | 64 | 256 |
-| Authority and path bytes | 8 KiB | 8 KiB |
-
+The [central limits and DATA rules](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#current-engine-limits)
+give each default and hard cap, and explain raw and zstd record coding.
 Set `Limits(max_request_bytes=...)` on both client and server for a service
 request cap. The HTTPX and aiohttp clients use this stream limit for every
 request. The low-level `Client.protect(Request(...))` helper holds a full body
-in memory and uses `max_body_len` (8 MiB by default) as its cap.
-`max_body_len` also sets the finite reply and per-SSE-block cap. A host must
-also set limits for concurrent uploads, upload time, and temporary disk. An
-ASGI host can deliver one outer event larger than 64 KiB, so that event can
-use more memory.
+in memory and uses `max_body_len` as its cap. That limit also sets the finite
+reply and per-SSE-block cap.
 
-Rust selects raw bytes or zstd for each request DATA part, finite reply body,
-and SSE block, then encrypts it. The recipient checks each tag before it
-decodes the part. This coding is part of the protected payload; it is not HTTP
-`Content-Encoding`.
-
-The protocol does not hide payload size, record count, or timing, and it adds
-no random padding. HTTPS remains required. The request media type is
-`message/hpke-http-request`, and the reply media type is
-`message/hpke-http-response`.
+A host must set limits for concurrent uploads, upload time, and temporary
+disk. An ASGI host can deliver one outer event larger than 64 KiB, so that
+event can use more memory.
 
 ### Low-level streamed requests
 
@@ -269,7 +253,8 @@ Use `response_right` to check the reply, then close it.
 `OpenedStreamRequest.feed()` yields checked DATA parts. Store those parts until
 END and the outer body end pass. Then `finish_eof()` returns a
 `StreamResponseRight`, which can protect one reply. It has no `request` body;
-use the checked parts and `OpenedStreamRequest.head` to dispatch the request.
+check the logical target policy before you use the stored parts and
+`OpenedStreamRequest.head` to dispatch the request.
 
 ### Runtime support
 

@@ -16,6 +16,9 @@ pub const HARD_MAX_ID_LEN: usize = 255;
 pub const HARD_MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Per-engine limits. Set values within the hard limits.
+///
+/// All sizes count bytes. Each value can be zero except `max_request_bytes`,
+/// which must be at least one. Defaults appear in `Default::default`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     /// Maximum body for complete request helpers, finite replies, and SSE blocks.
