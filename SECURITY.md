@@ -22,6 +22,7 @@ when it affects an `hpke-http` release or one of its default build paths.
 
 | Release line | Status |
 | --- | --- |
+| 3.x | Supported published line |
 | 2.x | Supported published line |
 | 1.x and earlier | Unsupported |
 
