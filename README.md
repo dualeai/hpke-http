@@ -4,32 +4,34 @@
 aiohttp, or TypeScript Fetch. Serve them with a Python ASGI app. The shared
 Rust engine checks each payload.
 
+This guide describes the current checkout. Its shared key source and HHKD v2
+discovery record are not in the published 3.0.0 packages. Build this checkout
+before you use the examples below; see
+[Build and runtime support](#build-and-runtime-support).
+
 ## Use the library
 
 ### Send a request with Python
 
-Set `endpoint`, `psk`, and `psk_id` from your app config. `Discover()` gets the
-server's public key from the HTTPS endpoint.
+Set `endpoint`, `psk`, and `psk_id` from your app config. Keep one key source
+open for each full protected endpoint path while your app sends calls. Use
+separate sources for Bridge and Library. Short-lived clients can share a source.
 
 ```python
-from hpke_http.middleware import Discover
-from hpke_http.middleware.httpx import HPKEAsyncClient
+from hpke_http.middleware.httpx import DiscoveredEndpoint, HPKEAsyncClient
 
-async with HPKEAsyncClient(endpoint, Discover(), psk, psk_id) as client:
-    response = await client.post("https://api.example.test/items", json={"name": "Ada"})
-    print(response.status_code, response.json())
+async with DiscoveredEndpoint(endpoint) as key_source:
+    async with HPKEAsyncClient(key_source, psk, psk_id) as client:
+        response = await client.post("https://api.example.test/items", json={"name": "Ada"})
+        print(response.status_code, response.json())
+    async with HPKEAsyncClient(key_source, psk, psk_id) as client:
+        response = await client.post("https://api.example.test/items", json={"name": "Grace"})
+        print(response.status_code, response.json())
 ```
 
-The same call takes normal HTTPX file input. The library sends the file through
-checked request records without a mode setting.
-
-```python
-async with HPKEAsyncClient(endpoint, Discover(), psk, psk_id) as client:
-    with open("report.bin", "rb") as source:
-        response = await client.post(
-            "https://api.example.test/uploads", files={"file": source}
-        )
-```
+The first call sends GET then POST. The second sends POST alone while the key
+lease is valid. The client also accepts normal HTTPX file input; see the
+[Python file example](python/README.md#send-requests-with-httpx).
 
 ### Serve protected requests with Python
 
@@ -41,6 +43,7 @@ from hpke_http.middleware.fastapi import HPKEMiddleware
 
 protected_app = HPKEMiddleware(
     app, private_key, key_id, resolve_psk, admit_replay,
+    key_use_for_s=lease_seconds,
     transport_path="/protected",
 )
 ```
@@ -52,12 +55,12 @@ for aiohttp, forms, SSE, and cross-origin browser setup.
 ### Use Fetch in TypeScript
 
 ```ts
-import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
+import { DiscoveredEndpoint, createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
 
 await initialize();
+const keySource = new DiscoveredEndpoint("https://api.example.test/protected");
 const hpkeFetch = createHpkeFetch({
-  endpoint: "https://api.example.test/protected",
-  key: { kind: "discover" },
+  key: keySource,
   psk,
   pskId,
 });
@@ -68,10 +71,20 @@ try {
     body: "payload",
   });
   console.log(response.status);
+  const next = await hpkeFetch("https://api.example.test/items", {
+    method: "POST",
+    body: "another payload",
+  });
+  console.log(next.status);
 } finally {
   hpkeFetch.close();
+  keySource.close();
 }
 ```
+
+The first call sends GET then POST. The second sends POST alone while the key
+lease is valid. Other clients can use `keySource` while it stays open. Use a
+different source for Library's endpoint path.
 
 Fetch keeps its normal body types. Large uploads need a runtime that can send
 a request stream; browser support and HTTP/1.x routes can limit that path. A
@@ -86,8 +99,9 @@ Use `Client` and `Server` from `hpke-http` with your HTTP stack. The
 ## Build and runtime support
 
 Build this checkout with the commands in [Development](#development) to use
-`hpke-http/3`. [Published releases](https://github.com/dualeai/hpke-http/releases)
-link to their package builds.
+the shared key source and HHKD v2 record shown here.
+[Published releases](https://github.com/dualeai/hpke-http/releases) link to
+their package builds.
 
 The Rust crate requires Rust 1.87 or newer. Python supports CPython 3.10 through
 3.14; release wheels target Linux x86-64 and AArch64 and macOS universal2.
@@ -146,28 +160,44 @@ caller-owned Python `bytes` or JavaScript `Uint8Array` values.
 ### Key discovery
 
 One configured HTTPS endpoint serves the public key through GET and receives
-protected requests through POST. A client gets the key before each discovered
-call. The GET sends no logical authorization, cookies, or PSK ID. The client
-accepts no redirect and stores no app key cache. A pinned key uses the same
-POST endpoint and sends no GET. The client accepts logical requests at one
-fixed HTTPS origin; a gateway can set a different `target_origin` or
-`targetOrigin` and the ASGI server's `expected_authority`.
-Origin checks fold DNS case and IDNA names, normalize IPv6 and the default
-port 443, and keep other ports distinct. A wrong logical origin fails before
-the client reads its body or sends GET.
+protected requests through POST. A shared source gets the key once and uses it
+until its lease ends. The client starts the lease clock before GET, so a slow
+GET leaves less time for POST. The client checks the lease again before it
+sends POST START. It can get a new key if it can still use the request body;
+otherwise it reports `discovery_expired` before it yields POST START. The
+service's POST START delivery bound covers time after the last lease check.
+Concurrent first calls share one GET. Keep separate sources for Bridge and
+Library, even when they have one HTTPS origin. The GET sends no logical
+authorization, cookies, or PSK ID. The client accepts no
+redirect. A pinned key uses the same POST endpoint and sends no GET. The client
+accepts logical requests at one fixed HTTPS origin. For a gateway, set
+`target_origin` or `targetOrigin` on the client and `expected_authority` on the
+ASGI server. Origin checks fold DNS case and IDNA names, normalize IPv6 and
+the default port 443, and keep other ports distinct. A wrong logical origin
+fails before the client reads its body or sends GET.
 
-The GET body is exactly `"HHKD" || 0x01 || id_len:u8 || id || x25519_public_key[32]`.
-The ID length is 1 through 255, so the full record is 39 through 293 bytes.
+The GET body is exactly `"HHKD" || 0x02 || id_len:u8 || id || x25519_public_key[32] || use_for_s:u32be`.
+The ID length is 1 through 255 and `use_for_s` is a positive number of seconds.
+The full record is 43 through 297 bytes. The service sets the lease.
 The server sends `application/octet-stream` and `Cache-Control: no-store`.
-Clients reject any other record form or extra bytes. Version `0x01` describes
-this key record; request and response bytes use `hpke-http/3`.
+Clients reject any other record form or extra bytes. Version `0x02` describes
+this key record; request and response bytes still use `hpke-http/3`. There is
+no v1 discovery fallback. A client that reads only HHKD v1 cannot use a v2
+host, and a v2 client cannot use a v1 host. Switch clients and hosts together,
+or use separate endpoints during the switch. HTTP `no-store` controls HTTP
+caches; the explicit source keeps one checked key for its lease.
 
-The server holds one recipient key. All workers for an endpoint must use that
-key; a key change across mixed workers can make a request fail. The adapters
-do not retry a protected POST. If its reply is lost, the caller does not know
-whether the app ran. The added GET is one more network round trip on each
-discovered call. For browser calls, outer CORS must cover GET, POST preflight,
-POST, and fault replies.
+Each worker advertises one key and can accept other keys. For a planned switch
+from A to B, use these worker states in order: advertise A and accept B;
+advertise B and accept A; then advertise B alone. Complete each state on all
+workers before the next state. Keep A accepted after its last advertisement
+for its full last lease plus the bound to deliver and parse POST START and a
+worker clock margin. Never reuse a KID while keys overlap. The service sets
+the lease and POST START delivery bound. A failed POST stays failed; the
+adapters do not resend it. If a reply is lost, the caller does not know whether
+the app ran. An emergency key removal can cause calls to fail until their
+leases end. For browser calls, outer CORS must cover GET, POST preflight, POST,
+and fault replies, and expose `Content-Encoding` on GET and POST replies.
 
 ### Native engine
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import tempfile
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from contextlib import suppress
 from urllib.parse import unquote
 
@@ -102,6 +102,13 @@ class HPKEMiddleware:
     mount prefix. It serves a public key through GET and accepts a protected
     request through POST. Other paths go to the host application.
 
+    ``key_use_for_s`` sets the HHKD v2 lease in whole seconds, from 1 through
+    4,294,967,295. ``accepted_keys`` holds other private-key and public-ID
+    pairs. For a key switch, first make all workers advertise A and accept B,
+    then advertise B and accept A. Keep A accepted for its last lease, POST
+    START delivery bound, and clock margin before making all workers advertise
+    B alone.
+
     ``expected_authority`` fixes the authenticated authority accepted by this
     endpoint. Without it, the middleware compares the inner authority with the
     outer ASGI ``Host`` field.
@@ -126,14 +133,22 @@ class HPKEMiddleware:
         replay_admitter: ReplayAdmitter,
         *,
         transport_path: str,
+        key_use_for_s: int,
+        accepted_keys: Sequence[tuple[bytes, bytes]] = (),
         limits: Limits = _DEFAULT_LIMITS,
         expected_authority: str | None = None,
     ) -> None:
         if not transport_path.startswith("/") or "?" in transport_path or "#" in transport_path:
             raise ValueError("transport_path must be one local path")
+        server = Server(recipient_private_key, recipient_key_id, limits=limits, accepted_keys=accepted_keys)
+        try:
+            key_record = encode_key_record(recipient_key_id, server.public_key, key_use_for_s)
+        except BaseException:
+            server.close()
+            raise
         self.app = app
-        self._server = Server(recipient_private_key, recipient_key_id, limits=limits)
-        self._key_record = encode_key_record(recipient_key_id, self._server.public_key)
+        self._server = server
+        self._key_record = key_record
         self._psk_resolver = psk_resolver
         self._replay_admitter = replay_admitter
         self._transport_path = transport_path

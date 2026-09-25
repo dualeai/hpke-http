@@ -5,7 +5,8 @@ engine. Use the HTTPX or aiohttp client with an ASGI app.
 
 ## Build this checkout
 
-Build this checkout with the `hpke-http/3` protocol:
+This guide uses the shared key source and HHKD v2 record in this checkout.
+The published 3.0.0 package does not have this API. Build this checkout first:
 
 ```sh
 make install-deps-python build-python
@@ -27,6 +28,7 @@ protected_app = HPKEMiddleware(
     key_id,
     resolve_psk,
     admit_replay,
+    key_use_for_s=lease_seconds,
     transport_path="/protected",
 )
 ```
@@ -41,6 +43,12 @@ requests at `POST /protected`. The `transport_path` must match the full ASGI
 path. Set `expected_authority` if the logical host differs from the outer
 `Host` header. A lifespan shutdown closes the native server; call
 `protected_app.close()` at shutdown if the host sends no lifespan events.
+The service sets `lease_seconds` and a bound to deliver and parse POST START.
+For a planned switch from A to B, set all workers to advertise A with
+`accepted_keys=[(b_private_key, b_key_id)]`. Then set all workers to advertise B
+with `accepted_keys=[(a_private_key, a_key_id)]`. After the last A lease, POST
+START delivery bound, and worker clock margin end, set all workers to advertise
+B with no other accepted key. Each pair holds a private key, then its public ID.
 
 The app receives its usual HTTP request fields and body. The wrapper checks
 START, every DATA part, END, and the outer body end before it starts the app.
@@ -60,33 +68,33 @@ browser_app = CORSMiddleware(
     allow_origins=["https://app.example.test"],
     allow_methods=["GET", "POST"],
     allow_headers=["cache-control", "content-type"],
+    expose_headers=["content-encoding"],
 )
 ```
+
+The browser must read outer `Content-Encoding` on GET and POST replies. If a
+proxy adds this header, CORS must expose it so the client can check it.
 
 ## Send requests with HTTPX
 
 ```python
-from hpke_http.middleware import Discover
-from hpke_http.middleware.httpx import HPKEAsyncClient
+from hpke_http.middleware.httpx import DiscoveredEndpoint, HPKEAsyncClient
 
-async with HPKEAsyncClient(
-    "https://api.example.test/protected",
-    Discover(),
-    psk,
-    b"tenant-42",
-) as client:
-    response = await client.post(
-        "https://api.example.test/items",
-        json={"name": "Ada"},
-    )
-    response.raise_for_status()
-
-    with open("large.bin", "rb") as source:
-        response = await client.post(
-            "https://api.example.test/upload",
-            files={"upload": source},
-        )
+endpoint = "https://api.example.test/protected"
+async with DiscoveredEndpoint(endpoint) as key_source:
+    async with HPKEAsyncClient(key_source, psk, b"tenant-42") as client:
+        response = await client.post("https://api.example.test/items", json={"name": "Ada"})
+        response.raise_for_status()
+    async with HPKEAsyncClient(key_source, psk, b"tenant-42") as client:
+        with open("large.bin", "rb") as file:
+            response = await client.post(
+                "https://api.example.test/upload",
+                files={"upload": file},
+            )
 ```
+
+The first call sends a key GET and a protected POST. The second sends only a
+POST while the lease is valid. Keep the source open across client lifetimes.
 
 `request()` returns a fully checked `httpx.Response`. Normal HTTPX `content`,
 `data`, `json`, and `files` arguments work. The Rust writer reads source bytes
@@ -109,15 +117,15 @@ For a finite reply in a stream context, call `await response.read()`.
 
 ```python
 import aiohttp
-from hpke_http.middleware import Discover
-from hpke_http.middleware.aiohttp import HPKEClientSession
+from hpke_http.middleware.aiohttp import DiscoveredEndpoint, HPKEClientSession
 
 form = aiohttp.FormData()
 with open("large.bin", "rb") as source:
     form.add_field("upload", source, filename="large.bin")
-    async with HPKEClientSession(endpoint, Discover(), psk, psk_id) as session:
-        async with session.post(logical_url, data=form) as response:
-            result = await response.read()
+    async with DiscoveredEndpoint(endpoint) as key_source:
+        async with HPKEClientSession(key_source, psk, psk_id) as session:
+            async with session.post(logical_url, data=form) as response:
+                result = await response.read()
 ```
 
 `HPKEClientSession` accepts bytes, text, form mappings, `FormData`, async byte
@@ -129,17 +137,68 @@ sources, and JSON. It keeps the ordinary aiohttp request shape. The finite
 
 ### Keys and transport
 
-`Discover()` gets the current public key before each call. Use
-`PinnedKey(recipient_public_key, key_id)` to use a fixed key without a GET.
-Both clients send the protected POST to their configured endpoint. Set
+`DiscoveredEndpoint(endpoint)` holds one checked key until its service-set
+`use_for_s` lease ends. Concurrent callers share one GET. Keep a distinct
+source for each full endpoint URL, including Bridge and Library paths.
+
+The lease clock starts before GET, so a slow GET leaves less time to start
+POST. The client checks the lease before POST START. It can get a new key if it
+can still use the request body; otherwise it reports `discovery_expired` before
+it yields POST START. The service's POST START delivery bound covers time after
+that check.
+
+A source owns its outer HTTP pool and endpoint URL; short-lived credential
+clients borrow it.
+Set HTTPX TLS and pool options on the HTTPX source, and aiohttp connector and
+session options on the aiohttp source. HTTPX client default headers, params,
+and timeout apply to its logical requests. Each Python source belongs to one
+event loop. If one caller cancels its wait for a shared GET, the GET continues
+for other callers. Close each client before you close the source.
+
+`get_timeout_s` defaults to 10 seconds and limits one key GET. It does not
+limit the protected POST. Set an HTTPX client or request `timeout` for POST I/O.
+With aiohttp, set a source session or request `timeout` for POST. To limit the
+full GET and POST call, set an app deadline around the call.
+
+`get_key()` returns a public `hpke_http.middleware.KeyLease` with `key_id`,
+`public_key`, and `valid()`. Check `valid()` when you use the key, since the
+lease can end after `get_key()` returns.
+
+Use `PinnedKey(recipient_public_key, key_id)` to use a fixed key without a GET.
+Pass `endpoint=` with a pin. A shared source supplies its own endpoint URL.
+Both clients send the protected POST to that URL. Set
 `target_origin="https://api.example.test"` if a gateway serves a different
 logical host. The clients require HTTPS, check the logical target, and do not
-follow outer redirects. They do not retry a protected POST.
+follow outer redirects. They do not retry a protected POST. The GET has no
+bearer, cookies, or PSK ID. Business headers stay in the protected request. A
+lost reply leaves the request result unknown.
+
+HHKD v2 requires a positive lease; these clients have no v1 discovery
+fallback. A client that reads only HHKD v1 cannot use a v2 host, and a v2
+client cannot use a v1 host. Switch clients and hosts together, or use
+separate endpoints.
 
 Generate a recipient key pair with `generate_key_pair()`. Recipient keys use
 X25519 and have 32 bytes. Key and PSK IDs are public opaque values of 1 to 255
 bytes. A PSK needs at least 32 bytes of entropy. A Python `bytes` object
 cannot be erased in place; keep secret copies to a minimum.
+
+### Transport errors
+
+`hpke_http.TransportError.code` tells callers why an adapter could not finish
+a protected call:
+
+| Discovery code | Meaning |
+| --- | --- |
+| `discovery_network` | GET failed or timed out. |
+| `discovery_status` | GET returned a status other than 200. |
+| `discovery_response` | GET headers or key record were invalid. |
+| `discovery_expired` | The lease ended before POST START. |
+
+`status_code` is set for `discovery_status` and `outer_status`. Other outer
+transport failures also raise `TransportError`; authenticated logical HTTP
+errors return a normal response. Use `response.raise_for_status()` to raise on
+those logical errors. A failed POST is not retried.
 
 ### Limits and payload coding
 
@@ -178,31 +237,33 @@ transport, use the low-level writer. `send_part` writes one outer POST body part
 `end_outer_body` closes that body, and `source` supplies byte chunks:
 
 ```python
-from hpke_http import Method, RequestHead
+from contextlib import closing
+from hpke_http import Client, Method, RequestHead
 
-head = RequestHead(method=Method.POST, authority="api.example.test", path="/upload")
-writer, start = client.begin_stream(head)
-response_right = None
-try:
-    await send_part(start)
-    async for chunk in source:
-        offset = 0
-        while offset < len(chunk):
-            used, record = writer.push(chunk[offset:])
-            if used == 0 and record is None:
-                raise RuntimeError("request writer made no progress")
-            offset += used
-            if record is not None:
-                await send_part(record)
-    end, response_right = writer.finish()
-    await send_part(end)
-    await end_outer_body()
-except BaseException:
-    if response_right is not None:
-        response_right.close()
-    raise
-finally:
-    writer.close()
+with closing(Client(recipient_public_key, key_id, psk, psk_id)) as client:
+    head = RequestHead(method=Method.POST, authority="api.example.test", path="/upload")
+    writer, start = client.begin_stream(head)
+    response_right = None
+    try:
+        await send_part(start)
+        async for chunk in source:
+            offset = 0
+            while offset < len(chunk):
+                used, record = writer.push(chunk[offset:])
+                if used == 0 and record is None:
+                    raise RuntimeError("request writer made no progress")
+                offset += used
+                if record is not None:
+                    await send_part(record)
+        end, response_right = writer.finish()
+        await send_part(end)
+        await end_outer_body()
+    except BaseException:
+        if response_right is not None:
+            response_right.close()
+        raise
+    finally:
+        writer.close()
 ```
 
 Use `response_right` to check the reply, then close it.

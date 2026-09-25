@@ -218,15 +218,21 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (recipient_private_key, recipient_key_id, limits))]
+    #[pyo3(signature = (recipient_private_key, recipient_key_id, limits, accepted_keys=None))]
     fn new(
         recipient_private_key: &[u8],
         recipient_key_id: Vec<u8>,
         limits: NativeLimitTuple,
+        accepted_keys: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> PyResult<Self> {
         let limits = make_limits(limits)?;
-        let inner =
-            Server::new(recipient_private_key, recipient_key_id, limits).map_err(native_error)?;
+        let inner = Server::with_accepted_keys(
+            recipient_private_key,
+            recipient_key_id,
+            accepted_keys.unwrap_or_default(),
+            limits,
+        )
+        .map_err(native_error)?;
         Ok(Self { inner })
     }
 

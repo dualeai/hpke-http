@@ -18,16 +18,12 @@ from hpke_http.protocol import (
 from hpke_http.transport import TransportError, media_type
 
 KEY_MEDIA_TYPE = "application/octet-stream"
-MAX_KEY_RECORD = 293
+MAX_KEY_RECORD = 297
+_MAX_USE_FOR_S = (1 << 32) - 1
 _KEY_OK_STATUS = 200
 _MAX_ID_LEN = 255
 _PUBLIC_KEY_LEN = 32
-_MIN_KEY_RECORD = 39
-
-
-@dataclass(frozen=True, slots=True)
-class Discover:
-    """Fetch the current public key before each protected call."""
+_MIN_KEY_RECORD = 43
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,24 +41,32 @@ def validate_client_configuration(psk: bytes, psk_id: bytes, limits: Limits) -> 
         raise ProtocolError("invalid_configuration", "invalid PSK or PSK identity")
 
 
-def encode_key_record(key_id: bytes, public_key: bytes) -> bytes:
-    """Encode one fixed X25519 key record."""
-    if not 1 <= len(key_id) <= _MAX_ID_LEN or len(public_key) != _PUBLIC_KEY_LEN:
+def encode_key_record(key_id: bytes, public_key: bytes, use_for_s: int) -> bytes:
+    """Encode one X25519 key and its service-set lifetime."""
+    if (
+        not 1 <= len(key_id) <= _MAX_ID_LEN
+        or len(public_key) != _PUBLIC_KEY_LEN
+        or type(use_for_s) is not int
+        or not 1 <= use_for_s <= _MAX_USE_FOR_S
+    ):
         raise ValueError("invalid discovery key")
-    return b"HHKD\x01" + bytes((len(key_id),)) + key_id + public_key
+    return b"HHKD\x02" + bytes((len(key_id),)) + key_id + public_key + use_for_s.to_bytes(4, "big")
 
 
-def parse_key_record(record: bytes) -> tuple[bytes, bytes]:
+def parse_key_record(record: bytes) -> tuple[bytes, bytes, int]:
     """Reject all records except the exact one-key format."""
     if (
         not _MIN_KEY_RECORD <= len(record) <= MAX_KEY_RECORD
-        or record[:5] != b"HHKD\x01"
+        or record[:5] != b"HHKD\x02"
         or record[5] == 0
-        or len(record) != 38 + record[5]
+        or len(record) != 42 + record[5]
     ):
         raise TransportError("discovery_response", "key endpoint returned an invalid key record")
     end = 6 + record[5]
-    return record[6:end], record[end:]
+    use_for_s = int.from_bytes(record[-4:], "big")
+    if use_for_s == 0:
+        raise TransportError("discovery_response", "key endpoint returned an invalid key lifetime")
+    return record[6:end], record[end:-4], use_for_s
 
 
 def validate_key_response(status: int, content_types: Sequence[str], content_encodings: Sequence[str]) -> None:
@@ -75,12 +79,12 @@ def validate_key_response(status: int, content_types: Sequence[str], content_enc
         raise TransportError("discovery_response", "key endpoint returned encoded key bytes")
 
 
-async def read_key_record(chunks: AsyncIterable[bytes]) -> tuple[bytes, bytes]:
+async def read_key_record(chunks: AsyncIterable[bytes]) -> tuple[bytes, bytes, int]:
     """Read at most one bounded key record from raw response chunks."""
     record = bytearray()
     async for chunk in chunks:
         if len(chunk) > MAX_KEY_RECORD - len(record):
-            raise TransportError("discovery_response", "key record exceeds 293 bytes")
+            raise TransportError("discovery_response", "key record exceeds 297 bytes")
         record.extend(chunk)
     return parse_key_record(bytes(record))
 

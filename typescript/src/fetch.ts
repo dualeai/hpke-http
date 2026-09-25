@@ -10,7 +10,7 @@ export const RESPONSE_MEDIA_TYPE = "message/hpke-http-response";
 
 const DEFAULT_MAX_BODY_LENGTH = 8 * 1024 * 1024;
 const MAX_BUFFER_CHUNK = 64 * 1024;
-const MAX_KEY_RECORD = 293;
+const MAX_KEY_RECORD = 297;
 const KEY_MEDIA_TYPE = "application/octet-stream";
 
 const NON_FORWARDABLE_REQUEST_HEADERS = new Set([
@@ -44,7 +44,8 @@ export type FetchTransport = typeof globalThis.fetch;
  * `request_too_large` comes from the bounded byte-body path. A streamed source
  * can reach the native request limit during POST and raise `limit_exceeded`.
  * Network and `outer_*` failures occur during the envelope
- * exchange. `inner_content_encoding` can also describe an authenticated
+ * exchange. `discovery_expired` means the key lease ended before POST START.
+ * `inner_content_encoding` can also describe an authenticated
  * response; `invalid_inner_response` describes a response that Web Fetch
  * cannot represent.
  */
@@ -59,7 +60,8 @@ export type FetchTransportErrorCode =
   | "invalid_inner_response"
   | "discovery_network"
   | "discovery_status"
-  | "discovery_response";
+  | "discovery_response"
+  | "discovery_expired";
 
 /** A transport or logical-message error from the Fetch adapter. */
 export class FetchTransportError extends Error {
@@ -74,18 +76,147 @@ export class FetchTransportError extends Error {
   }
 }
 
-/** Choose one key GET per call or one fixed key with no GET. */
+/** One discovered key with a service-set lease that starts before GET. */
+export interface DiscoveredKeyLease {
+  /** A copy of the public key ID. */
+  readonly keyId: Uint8Array;
+  /** A copy of the X25519 public key. */
+  readonly publicKey: Uint8Array;
+  /** Whether the service-set lease has time left at this call. */
+  valid(): boolean;
+}
+
+class KeyLease implements DiscoveredKeyLease {
+  readonly #keyId: Uint8Array;
+  readonly #publicKey: Uint8Array;
+  readonly #useForS: number;
+  readonly #startedMonotonic: number;
+  readonly #startedWall: number;
+  #ageHighWater = 0;
+
+  public constructor(
+    record: { readonly keyId: Uint8Array; readonly publicKey: Uint8Array; readonly useForS: number },
+    startedMonotonic: number,
+    startedWall: number,
+  ) {
+    this.#keyId = Uint8Array.from(record.keyId);
+    this.#publicKey = Uint8Array.from(record.publicKey);
+    this.#useForS = record.useForS;
+    this.#startedMonotonic = startedMonotonic;
+    this.#startedWall = startedWall;
+  }
+
+  /** Return a copy of the public key ID. */
+  public get keyId(): Uint8Array { return Uint8Array.from(this.#keyId); }
+  /** Return a copy of the X25519 public key. */
+  public get publicKey(): Uint8Array { return Uint8Array.from(this.#publicKey); }
+
+  /** Test whether the lease has time left at this call. */
+  public valid(): boolean {
+    this.#ageHighWater = Math.max(
+      this.#ageHighWater,
+      Math.max(0, performance.now() - this.#startedMonotonic) / 1000,
+      Math.max(0, Date.now() - this.#startedWall) / 1000,
+    );
+    return this.#ageHighWater < this.#useForS;
+  }
+}
+
+/** One HTTPS endpoint, trusted Fetch function, and shared key lease. */
+export class DiscoveredEndpoint {
+  private readonly endpointUrl: URL;
+  private readonly fetchTransport: FetchTransport;
+  private readonly getTimeoutMs: number;
+  private key: KeyLease | undefined;
+  private pending: Promise<KeyLease> | undefined;
+  private controller: AbortController | undefined;
+  private closed = false;
+
+  public constructor(endpoint: string, options: { readonly fetch?: FetchTransport; readonly getTimeoutMs?: number } = {}) {
+    this.endpointUrl = parseKeyEndpoint(endpoint);
+    this.fetchTransport = options.fetch ?? globalThis.fetch;
+    if (typeof this.fetchTransport !== "function") {
+      throw new FetchTransportError("network_error", "native Fetch is unavailable; provide options.fetch");
+    }
+    this.getTimeoutMs = options.getTimeoutMs ?? 10_000;
+    if (!Number.isFinite(this.getTimeoutMs) || this.getTimeoutMs <= 0) {
+      throw new RangeError("key GET timeout must be positive");
+    }
+  }
+
+  /** Return a copy of the full HTTPS endpoint URL. */
+  public get endpoint(): URL { return new URL(this.endpointUrl.href); }
+
+  /** Return the trusted Fetch function bound to this source. */
+  public get transport(): FetchTransport { return this.fetchTransport; }
+
+  /** Get a lease and share a needed GET with other callers.
+   *
+   * Aborting `signal` stops this caller's wait. Other callers can still use
+   * the GET. The lease can end before this caller starts a POST.
+   */
+  public async getKey(signal: AbortSignal): Promise<DiscoveredKeyLease> {
+    if (this.closed) { throw new StateError(); }
+    throwIfAborted(signal);
+    if (this.key !== undefined && this.key.valid()) { return this.key; }
+    if (this.pending === undefined) {
+      const controller = new AbortController();
+      this.controller = controller;
+      const startedMonotonic = performance.now();
+      const startedWall = Date.now();
+      const timeout = setTimeout(() => controller.abort(new Error("key GET timed out")), this.getTimeoutMs);
+      const pending = fetchKey(this.fetchTransport, this.endpointUrl, controller.signal).then((record): KeyLease => {
+        if (this.closed) { throw new StateError(); }
+        const key = new KeyLease(record, startedMonotonic, startedWall);
+        if (!key.valid()) {
+          throw new FetchTransportError("discovery_response", "key GET consumed its lifetime");
+        }
+        this.key = key;
+        return key;
+      }).finally(() => {
+        clearTimeout(timeout);
+        if (this.pending === pending) {
+          this.pending = undefined;
+          this.controller = undefined;
+        }
+      });
+      this.pending = pending;
+      void pending.catch(() => undefined);
+    }
+    return await waitForCaller(this.pending, signal);
+  }
+
+  /**
+   * Stop new key lookups, clear the stored key, and abort a pending GET.
+   *
+   * This call is idempotent. Close clients that use this source separately.
+   */
+  public close(): void {
+    if (this.closed) { return; }
+    this.closed = true;
+    this.key = undefined;
+    this.controller?.abort(new StateError());
+  }
+}
+
+function waitForCaller<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => { signal.removeEventListener("abort", onAbort); reject(abortReason(signal)); };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void pending.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error: unknown) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
+}
+
+/** Share one discovered key or use one fixed key with no GET. */
 export type HpkeKeySource =
-  | { readonly kind: "discover" }
+  | DiscoveredEndpoint
   | { readonly kind: "pin"; readonly publicKey: Uint8Array; readonly keyId: Uint8Array };
 
-export interface HpkeFetchConfiguration {
-  /** Fixed HTTPS URL for key GET and protected POST; no query, fragment, or credentials. */
-  readonly endpoint: string;
-
-  /** One-key discovery or a fixed public key. */
-  readonly key: HpkeKeySource;
-
+interface HpkeFetchCommonConfiguration {
   /**
    * Logical HTTPS origin; defaults to the endpoint origin.
    * No nonroot path, query, fragment, or credentials.
@@ -104,9 +235,18 @@ export interface HpkeFetchConfiguration {
   /** Optional message limits. Omitted fields use the shared engine defaults. */
   readonly limits?: Limits;
 
-  /** Inject a Fetch-compatible transport. The default is `globalThis.fetch`. */
-  readonly fetch?: FetchTransport;
 }
+
+/** Use a shared endpoint source or one fixed key with its full HTTPS endpoint. */
+export type HpkeFetchConfiguration = HpkeFetchCommonConfiguration & (
+  | { readonly key: DiscoveredEndpoint; readonly endpoint?: never; readonly fetch?: never }
+  | {
+      readonly key: Exclude<HpkeKeySource, DiscoveredEndpoint>;
+      readonly endpoint: string;
+      /** Inject a Fetch-compatible transport. The default is `globalThis.fetch`. */
+      readonly fetch?: FetchTransport;
+    }
+);
 
 /** A Fetch-shaped client with checked live SSE and finite replies. */
 export interface HpkeFetch {
@@ -132,8 +272,8 @@ export interface HpkeFetch {
  * and the shared Rust/WASM protocol engine.
  *
  * The returned function uses the URL, method, headers, body, and signal from a
- * Fetch request input. Discovery gets one public key from the fixed endpoint
- * before each call; a pin sends no GET. It sends one protected POST with a
+ * Fetch request input. A shared source gets one public key for its lease;
+ * a pin sends no GET. It sends one protected POST with a
  * byte body or a streamed body, based on the runtime and request size. It
  * checks START and returns a live `Response` for SSE. The platform's
  * `Headers` implementation may combine repeated authenticated fields;
@@ -147,14 +287,21 @@ export interface HpkeFetch {
  */
 export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetch {
   const limits = normalizeLimits(configuration.limits ?? {});
-  const transport = configuration.fetch ?? globalThis.fetch;
+  const source = configuration.key instanceof DiscoveredEndpoint ? configuration.key : undefined;
+  if (source !== undefined && configuration.fetch !== undefined) {
+    throw new TypeError("the shared endpoint owns Fetch");
+  }
+  const transport = source?.transport ?? configuration.fetch ?? globalThis.fetch;
   if (typeof transport !== "function") {
     throw new FetchTransportError(
       "network_error",
       "native Fetch is unavailable; provide configuration.fetch",
     );
   }
-  const endpoint = parseKeyEndpoint(configuration.endpoint);
+  if (source !== undefined && configuration.endpoint !== undefined) {
+    throw new TypeError("the shared source owns the endpoint");
+  }
+  const endpoint = source?.endpoint ?? parseKeyEndpoint(configuration.endpoint ?? "");
   const targetOrigin = configuration.targetOrigin === undefined
     ? endpoint.origin
     : parseTargetOrigin(configuration.targetOrigin);
@@ -163,14 +310,13 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
   if (psk.byteLength < 32 || pskId.byteLength < 1 || pskId.byteLength > 255 || bytesEqual(psk, pskId)) {
     throw new ProtocolError("invalid_configuration", "invalid PSK or PSK identity");
   }
-  const pinnedClient = configuration.key.kind === "pin"
-    ? new Client(
-      configuration.key.publicKey, configuration.key.keyId,
-      psk, pskId, limits,
-    )
-    : undefined;
-  if (configuration.key.kind !== "pin" && configuration.key.kind !== "discover") {
-    throw new TypeError("key must be a tagged pin or discover choice");
+  let pinnedClient: Client | undefined;
+  if (source === undefined) {
+    const key = configuration.key;
+    if (!("kind" in key) || key.kind !== "pin") {
+      throw new TypeError("key must be a shared source or a tagged pin");
+    }
+    pinnedClient = new Client(key.publicKey, key.keyId, psk, pskId, limits);
   }
   const maxRequestLength = limits.maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
   const active = new Set<RecordPump>();
@@ -200,13 +346,13 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       path: `${target.pathname}${target.search}`,
       headers,
     };
-    const discovered = pinnedClient === undefined;
+    const discovered = source !== undefined;
+    let lease = source === undefined ? undefined : await source.getKey(request.signal);
     let requestClient = pinnedClient;
-    if (requestClient === undefined) {
-      const { keyId, publicKey } = await fetchKey(transport, endpoint, request.signal);
+    if (lease !== undefined) {
       if (closed) { throw new StateError(); }
       try {
-        requestClient = new Client(publicKey, keyId, psk, pskId, limits);
+        requestClient = new Client(lease.publicKey, lease.keyId, psk, pskId, limits);
       } catch (error: unknown) {
         if (error instanceof ProtocolError) {
           throw new FetchTransportError("discovery_response", "key endpoint returned an unusable public key");
@@ -214,17 +360,20 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
         throw error;
       }
     }
+    if (requestClient === undefined) { throw new StateError(); }
     let envelope: RequestEnvelope;
+    let finiteBody: Uint8Array | undefined;
     try {
       if (request.body !== null && isNodeRuntime() && supportsRequestStreaming()) {
-        envelope = makeStreamEnvelope(requestClient.beginStream(head), request.body, request.signal);
+        envelope = makeStreamEnvelope(requestClient.beginStream(head), request.body, request.signal, lease);
       } else if (request.body !== null && !isNodeRuntime()) {
         const inspected = await inspectBody(request.body, maxRequestLength, request.signal);
         if (inspected.kind === "complete") {
+          finiteBody = inspected.body;
           envelope = makeFiniteEnvelope(requestClient.protect({ ...head, body: inspected.body }));
         } else if (supportsRequestStreaming()) {
           try {
-            envelope = makeStreamEnvelope(requestClient.beginStream(head), inspected.body, request.signal);
+            envelope = makeStreamEnvelope(requestClient.beginStream(head), inspected.body, request.signal, lease);
           } catch (error: unknown) {
             requestCancel(inspected.body, error);
             throw error;
@@ -235,6 +384,7 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
         }
       } else {
         const body = await readBodyBounded(request.body, maxRequestLength, request.signal);
+        finiteBody = body;
         envelope = makeFiniteEnvelope(requestClient.protect({ ...head, body }));
       }
     } catch (error: unknown) {
@@ -245,6 +395,23 @@ export function createHpkeFetch(configuration: HpkeFetchConfiguration): HpkeFetc
       throw error;
     } finally {
       if (discovered) { requestClient.close(); }
+    }
+
+    if (lease !== undefined && !lease.valid()) {
+      const expired = new FetchTransportError("discovery_expired", "key lifetime ended before protected POST");
+      envelope.close(expired);
+      if (finiteBody === undefined || source === undefined) { throw expired; }
+      lease = await source.getKey(request.signal);
+      const fresh = new Client(lease.publicKey, lease.keyId, psk, pskId, limits);
+      try {
+        envelope = makeFiniteEnvelope(fresh.protect({ ...head, body: finiteBody }));
+      } finally {
+        fresh.close();
+      }
+      if (!lease.valid()) {
+        envelope.close(expired);
+        throw expired;
+      }
     }
 
     activeUploads.add(envelope.close);
@@ -384,7 +551,7 @@ async function fetchKey(
   transport: FetchTransport,
   endpoint: URL,
   signal: AbortSignal,
-): Promise<{ keyId: Uint8Array; publicKey: Uint8Array }> {
+): Promise<{ keyId: Uint8Array; publicKey: Uint8Array; useForS: number }> {
   throwIfAborted(signal);
   let response: globalThis.Response;
   try {
@@ -421,23 +588,28 @@ async function fetchKey(
   } catch (error: unknown) {
     if (signal.aborted) { throw abortReason(signal); }
     if (error instanceof FetchTransportError && error.code === "request_too_large") {
-      throw new FetchTransportError("discovery_response", "key record exceeds 293 bytes");
+      throw new FetchTransportError("discovery_response", "key record exceeds 297 bytes");
     }
     throw new FetchTransportError("discovery_network", "key GET body failed");
   }
   return parseKeyRecord(record);
 }
 
-function parseKeyRecord(record: Uint8Array): { keyId: Uint8Array; publicKey: Uint8Array } {
+function parseKeyRecord(record: Uint8Array): { keyId: Uint8Array; publicKey: Uint8Array; useForS: number } {
   const length = record[5];
-  if (record.byteLength < 39 || record.byteLength > MAX_KEY_RECORD ||
+  if (record.byteLength < 43 || record.byteLength > MAX_KEY_RECORD ||
       record[0] !== 0x48 || record[1] !== 0x48 || record[2] !== 0x4b || record[3] !== 0x44 ||
-      record[4] !== 1 || length === undefined || length === 0 || record.byteLength !== 38 + length) {
+      record[4] !== 2 || length === undefined || length === 0 || record.byteLength !== 42 + length) {
     throw new FetchTransportError("discovery_response", "key endpoint returned an invalid key record");
+  }
+  const useForS = new DataView(record.buffer, record.byteOffset + record.byteLength - 4, 4).getUint32(0);
+  if (useForS === 0) {
+    throw new FetchTransportError("discovery_response", "key endpoint returned an invalid key lifetime");
   }
   return {
     keyId: Uint8Array.from(record.subarray(6, 6 + length)),
-    publicKey: Uint8Array.from(record.subarray(6 + length)),
+    publicKey: Uint8Array.from(record.subarray(6 + length, -4)),
+    useForS,
   };
 }
 
@@ -474,6 +646,7 @@ function makeStreamEnvelope(
   writer: StreamRequestSealer,
   source: ReadableStream<Uint8Array> | null,
   signal: AbortSignal,
+  lease?: DiscoveredKeyLease,
 ): RequestEnvelope {
   const reader = source?.getReader();
   let part: Uint8Array<ArrayBufferLike> = new Uint8Array();
@@ -482,6 +655,7 @@ function makeStreamEnvelope(
   let finished: StreamFinishedRequest | undefined;
   let closed = false;
   let streamEnded = false;
+  let startQueued = false;
   let failed: unknown;
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
   const close = (reason?: unknown): void => {
@@ -501,10 +675,17 @@ function makeStreamEnvelope(
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
-      controller.enqueue(writer.start);
     },
     async pull(controller) {
       try {
+        if (!startQueued) {
+          if (lease !== undefined && !lease.valid()) {
+            throw new FetchTransportError("discovery_expired", "key lifetime ended before protected POST START");
+          }
+          startQueued = true;
+          controller.enqueue(writer.start);
+          return;
+        }
         while (true) {
           if (closed) { throw new StateError(); }
           throwIfAborted(signal);

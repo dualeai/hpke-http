@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import test from "node:test";
+import { createHash } from "node:crypto";
 
 import {
   Client,
+  DiscoveredEndpoint,
   FetchTransportError,
   ProtocolError,
   REQUEST_MEDIA_TYPE,
@@ -19,10 +21,20 @@ import {
 const KEY_ID = new TextEncoder().encode("primary-2026-09");
 const PSK = new TextEncoder().encode("a 32-byte minimum test credential!");
 const PSK_ID = new TextEncoder().encode("tenant-42");
-const DISCOVERY_FIXTURE = JSON.parse(readFileSync(new URL("../../rust/hpke-http/tests/vectors/key-discovery-v1.json", import.meta.url)));
+const DISCOVERY_FIXTURE = JSON.parse(readFileSync(new URL("../../rust/hpke-http/tests/vectors/key-discovery-v2.json", import.meta.url)));
 
-function keyRecord(keyId, publicKey) {
-  return new Uint8Array([0x48, 0x48, 0x4b, 0x44, 1, keyId.byteLength, ...keyId, ...publicKey]);
+function keyRecord(keyId, publicKey, useForS = 60) {
+  return new Uint8Array([0x48, 0x48, 0x4b, 0x44, 2, keyId.byteLength, ...keyId, ...publicKey,
+    (useForS >>> 24) & 255, (useForS >>> 16) & 255, (useForS >>> 8) & 255, useForS & 255]);
+}
+
+function createDiscoveredFetch({ endpoint, fetch, ...configuration }) {
+  const source = new DiscoveredEndpoint(endpoint, { fetch });
+  const client = createHpkeFetch({ ...configuration, key: source });
+  const run = (input, init) => client(input, init);
+  run.close = () => { client.close(); source.close(); };
+  run.source = source;
+  return run;
 }
 
 test("Fetch accepts the fixed record and both legal record sizes", async () => {
@@ -36,16 +48,16 @@ test("Fetch accepts the fixed record and both legal record sizes", async () => {
   const oneByteId = Uint8Array.of(0x6b);
   const maxId = new Uint8Array(255).fill(0x6b);
   for (const { record, keyId, size } of [
-    { record: fixtureBytes, keyId: undefined, size: 53 },
-    { record: keyRecord(oneByteId, keys.publicKey), keyId: oneByteId, size: 39 },
-    { record: keyRecord(maxId, keys.publicKey), keyId: maxId, size: 293 },
+    { record: fixtureBytes, keyId: undefined, size: 57 },
+    { record: keyRecord(oneByteId, keys.publicKey), keyId: oneByteId, size: 43 },
+    { record: keyRecord(maxId, keys.publicKey), keyId: maxId, size: 297 },
   ]) {
     assert.equal(record.byteLength, size);
     const server = keyId === undefined ? undefined : new Server(keys.privateKey, keyId);
     const calls = [];
-    const client = createHpkeFetch({
+    const client = createDiscoveredFetch({
       endpoint: "https://api.example.test/protected",
-      key: { kind: "discover" }, psk: PSK, pskId: PSK_ID,
+      psk: PSK, pskId: PSK_ID,
       fetch: async (input, init) => {
         const request = new Request(input, init);
         calls.push(request.method);
@@ -72,14 +84,37 @@ test("Fetch accepts the fixed record and both legal record sizes", async () => {
   }
 });
 
-test("Fetch reads a fresh key for each call", async () => {
+test("Fetch reads the high byte of the key lifetime from fixed wire data", async (context) => {
+  await initialize();
+  let wallNow = Date.now();
+  context.mock.method(Date, "now", () => wallNow);
+  const calls = [];
+  const record = Uint8Array.from(Buffer.from(DISCOVERY_FIXTURE.long_record, "hex"));
+  assert.equal(DISCOVERY_FIXTURE.long_use_for_s, 257);
+  assert.deepEqual(record.subarray(-4), Uint8Array.of(0, 0, 1, 1));
+  const source = new DiscoveredEndpoint("https://api.example.test/protected", {
+    fetch: async (_input, init) => {
+      calls.push(init.method);
+      return new Response(record, { headers: { "content-type": "application/octet-stream" } });
+    },
+  });
+  try {
+    const lease = await source.getKey(new AbortController().signal);
+    wallNow += 2000;
+    assert.equal(lease.valid(), true);
+    await source.getKey(new AbortController().signal);
+    assert.deepEqual(calls, ["GET"]);
+  } finally { source.close(); }
+});
+
+test("Fetch shares a key across calls", async () => {
   await initialize();
   const keys = generateKeyPair();
   const server = new Server(keys.privateKey, KEY_ID);
   const calls = [];
-  const client = createHpkeFetch({
+  const client = createDiscoveredFetch({
     endpoint: "https://api.example.test/protected",
-    key: { kind: "discover" }, psk: PSK, pskId: PSK_ID,
+    psk: PSK, pskId: PSK_ID,
     fetch: async (input, init) => {
       const request = new Request(input, init);
       calls.push(request.method);
@@ -104,8 +139,187 @@ test("Fetch reads a fresh key for each call", async () => {
   try {
     assert.equal(await (await client("https://API.example.test:443/items")).text(), "ok");
     assert.equal(await (await client("https://api.example.test/items")).text(), "ok");
-    assert.deepEqual(calls, ["GET", "POST", "GET", "POST"]);
+    assert.deepEqual(calls, ["GET", "POST", "POST"]);
   } finally { client.close(); server.close(); }
+});
+
+test("concurrent clients share one key GET and keep credentials in protected POST", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
+  const token = new TextEncoder().encode("a complete API token with more than 32 bytes");
+  const pskId = createHash("sha512").update(token).digest();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const calls = [];
+  const source = new DiscoveredEndpoint("https://api.example.test/libraries/v1/hpke", {
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      calls.push(request.method);
+      if (request.method === "GET") {
+        assert.equal(request.headers.get("authorization"), null);
+        await gate;
+        return new Response(keyRecord(KEY_ID, keys.publicKey), {
+          headers: { "content-type": "application/octet-stream" },
+        });
+      }
+      assert.equal(request.headers.get("authorization"), null);
+      const preparsed = server.preparse(new Uint8Array(await request.arrayBuffer()));
+      assert.deepEqual(preparsed.pskId, new Uint8Array(pskId));
+      const opened = preparsed.authenticate(token).admit({ accepted: true });
+      assert.ok(opened.request.headers.some((field) => field.name === "authorization" && field.value === "Bearer library"));
+      return new Response(opened.protectResponse({ status: 200 }), {
+        headers: { "content-type": RESPONSE_MEDIA_TYPE },
+      });
+    },
+  });
+  const first = createHpkeFetch({ key: source, psk: token, pskId });
+  const second = createHpkeFetch({ key: source, psk: token, pskId });
+  try {
+    const one = first("https://api.example.test/items", { headers: { authorization: "Bearer library" } });
+    const two = second("https://api.example.test/items", { headers: { authorization: "Bearer library" } });
+    await Promise.resolve();
+    release();
+    assert.equal((await one).status, 200);
+    assert.equal((await two).status, 200);
+    assert.deepEqual(calls, ["GET", "POST", "POST"]);
+  } finally {
+    release();
+    first.close();
+    second.close();
+    source.close();
+    server.close();
+  }
+});
+
+test("same-origin endpoints keep separate keys", async () => {
+  await initialize();
+  const bridgeKeys = generateKeyPair();
+  const libraryKeys = generateKeyPair();
+  const bridgeId = new TextEncoder().encode("bridge-key");
+  const libraryId = new TextEncoder().encode("library-key");
+  const bridgeServer = new Server(bridgeKeys.privateKey, bridgeId);
+  const libraryServer = new Server(libraryKeys.privateKey, libraryId);
+  const calls = [];
+  const fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const library = request.url.endsWith("/libraries/v1/hpke");
+    const server = library ? libraryServer : bridgeServer;
+    const publicKey = library ? libraryKeys.publicKey : bridgeKeys.publicKey;
+    const id = library ? libraryId : bridgeId;
+    calls.push([library ? "library" : "bridge", request.method]);
+    if (request.method === "GET") {
+      return new Response(keyRecord(id, publicKey), {
+        headers: { "content-type": "application/octet-stream" },
+      });
+    }
+    const opened = server.preparse(new Uint8Array(await request.arrayBuffer()))
+      .authenticate(PSK).admit({ accepted: true });
+    return new Response(opened.protectResponse({ status: 200 }), {
+      headers: { "content-type": RESPONSE_MEDIA_TYPE },
+    });
+  };
+  const bridgeSource = new DiscoveredEndpoint("https://api.example.test/http-bridge/v1/hpke", { fetch });
+  const librarySource = new DiscoveredEndpoint("https://api.example.test/libraries/v1/hpke", { fetch });
+  try {
+    assert.throws(() => createHpkeFetch({
+      key: bridgeSource, endpoint: bridgeSource.endpoint.href, psk: PSK, pskId: PSK_ID,
+    }), /shared source owns the endpoint/);
+    const endpointView = bridgeSource.endpoint;
+    endpointView.pathname = "/libraries/v1/hpke";
+    assert.equal(bridgeSource.endpoint.pathname, "/http-bridge/v1/hpke");
+    const keyView = await bridgeSource.getKey(new AbortController().signal);
+    keyView.keyId.fill(0);
+    keyView.publicKey.fill(0);
+    const nextView = await bridgeSource.getKey(new AbortController().signal);
+    assert.deepEqual(nextView.keyId, bridgeId);
+    assert.deepEqual(nextView.publicKey, bridgeKeys.publicKey);
+    for (const source of [bridgeSource, librarySource]) {
+      for (let index = 0; index < 2; index += 1) {
+        const client = createHpkeFetch({ key: source, psk: PSK, pskId: PSK_ID });
+        try { assert.equal((await client("https://api.example.test/items")).status, 200); }
+        finally { client.close(); }
+      }
+    }
+    assert.deepEqual(calls, [
+      ["bridge", "GET"], ["bridge", "POST"], ["bridge", "POST"],
+      ["library", "GET"], ["library", "POST"], ["library", "POST"],
+    ]);
+  } finally {
+    bridgeSource.close();
+    librarySource.close();
+    bridgeServer.close();
+    libraryServer.close();
+  }
+});
+
+test("an expired lease gets a new key and a lost reply never repeats POST", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
+  const calls = [];
+  let loseReply = true;
+  const source = new DiscoveredEndpoint("https://api.example.test/protected", {
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      calls.push(request.method);
+      if (request.method === "GET") {
+        return new Response(keyRecord(KEY_ID, keys.publicKey, 1), {
+          headers: { "content-type": "application/octet-stream" },
+        });
+      }
+      const opened = server.preparse(new Uint8Array(await request.arrayBuffer()))
+        .authenticate(PSK).admit({ accepted: true });
+      if (loseReply) { loseReply = false; throw new TypeError("reply lost after admission"); }
+      return new Response(opened.protectResponse({ status: 200 }), {
+        headers: { "content-type": RESPONSE_MEDIA_TYPE },
+      });
+    },
+  });
+  const client = createHpkeFetch({ key: source, psk: PSK, pskId: PSK_ID });
+  try {
+    await assert.rejects(client("https://api.example.test/items"), FetchTransportError);
+    assert.deepEqual(calls, ["GET", "POST"]);
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.equal((await client("https://api.example.test/items")).status, 200);
+    assert.deepEqual(calls, ["GET", "POST", "GET", "POST"]);
+  } finally { client.close(); source.close(); server.close(); }
+});
+
+test("Fetch stops a stream before POST START when its key lease ends", async (context) => {
+  await initialize();
+  let wallNow = Date.now();
+  context.mock.method(Date, "now", () => wallNow);
+  const keys = generateKeyPair();
+  const calls = [];
+  let startChunks = 0;
+  const source = new DiscoveredEndpoint("https://api.example.test/protected", {
+    fetch: async (input, init) => {
+      calls.push(init.method);
+      if (init.method === "GET") {
+        return new Response(keyRecord(KEY_ID, keys.publicKey), {
+          headers: { "content-type": "application/octet-stream" },
+        });
+      }
+      wallNow += 61_000;
+      const reader = init.body.getReader();
+      try {
+        const first = await reader.read();
+        if (!first.done) startChunks += 1;
+      } finally { reader.releaseLock(); }
+      throw new Error(`protected START reached ${String(input)}`);
+    },
+  });
+  const client = createHpkeFetch({ key: source, psk: PSK, pskId: PSK_ID });
+  const body = new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode("one-use")); controller.close(); },
+  });
+  try {
+    await assert.rejects(client("https://api.example.test/items", { method: "POST", body, duplex: "half" }),
+      (error) => error instanceof FetchTransportError && error.code === "discovery_expired");
+    assert.deepEqual(calls, ["GET", "POST"]);
+    assert.equal(startChunks, 0);
+  } finally { client.close(); source.close(); }
 });
 
 test("Fetch rejects bad key GET before any protected POST", async () => {
@@ -113,8 +327,8 @@ test("Fetch rejects bad key GET before any protected POST", async () => {
   const valid = Uint8Array.from(Buffer.from(DISCOVERY_FIXTURE.record, "hex"));
   for (const fault of ["status", "type", "coding", "size", "shape", "point", "network"]) {
     const calls = [];
-    const client = createHpkeFetch({
-      endpoint: "https://api.example.test/protected", key: { kind: "discover" }, psk: PSK, pskId: PSK_ID,
+    const client = createDiscoveredFetch({
+      endpoint: "https://api.example.test/protected", psk: PSK, pskId: PSK_ID,
       fetch: async (input, init) => {
         const request = new Request(input, init);
         calls.push(request.method);
@@ -122,7 +336,7 @@ test("Fetch rejects bad key GET before any protected POST", async () => {
         if (fault === "network") { throw new TypeError("key source unavailable"); }
         const headers = { "content-type": fault === "type" ? "text/plain" : "application/octet-stream" };
         if (fault === "coding") { headers["content-encoding"] = "gzip"; }
-        const record = fault === "size" ? new Uint8Array(294)
+        const record = fault === "size" ? new Uint8Array(298)
           : fault === "shape" ? new Uint8Array([...valid, 0])
           : fault === "point" ? keyRecord(KEY_ID, new Uint8Array(32)) : valid;
         return new Response(record, { status: fault === "status" ? 503 : 200, headers });
@@ -146,15 +360,15 @@ test("Fetch key errors settle when body cancellation stays pending", async () =>
     let cancels = 0;
     const body = new ReadableStream({
       start(controller) {
-        if (fault === "oversize") controller.enqueue(new Uint8Array(294));
+        if (fault === "oversize") controller.enqueue(new Uint8Array(298));
       },
       cancel() {
         cancels += 1;
         return new Promise(() => {});
       },
     });
-    const client = createHpkeFetch({
-      endpoint: "https://api.example.test/protected", key: { kind: "discover" }, psk: PSK, pskId: PSK_ID,
+    const client = createDiscoveredFetch({
+      endpoint: "https://api.example.test/protected", psk: PSK, pskId: PSK_ID,
       fetch: async () => new Response(body, {
         status: fault === "status" ? 503 : 200,
         headers: { "content-type": fault === "type" ? "text/plain" : "application/octet-stream" },
@@ -196,8 +410,8 @@ test("Fetch checks origin before body read and close blocks a late key GET", asy
   let calls = 0;
   let release;
   const pending = new Promise((resolve) => { release = resolve; });
-  const client = createHpkeFetch({
-    endpoint: "https://api.example.test/protected", key: { kind: "discover" }, psk: PSK, pskId: PSK_ID,
+  const client = createDiscoveredFetch({
+    endpoint: "https://api.example.test/protected", psk: PSK, pskId: PSK_ID,
     fetch: async () => {
       calls += 1;
       await pending;
@@ -235,8 +449,8 @@ test("Fetch caller abort during key GET sends no protected POST", async () => {
   let release;
   const pendingGet = new Promise((resolve) => { release = resolve; });
   const calls = [];
-  const client = createHpkeFetch({
-    endpoint: "https://api.example.test/protected", key: { kind: "discover" }, psk: PSK, pskId: PSK_ID,
+  const client = createDiscoveredFetch({
+    endpoint: "https://api.example.test/protected", psk: PSK, pskId: PSK_ID,
     fetch: async (input, init) => {
       const request = new Request(input, init);
       calls.push(request.method);
@@ -695,6 +909,39 @@ test("Fetch adapter rejects method spellings that Fetch does not normalize", asy
   );
   assert.equal(transportCalled, false);
   hpkeFetch.close();
+});
+
+test("Fetch adapter rejects bad outer protected reply headers", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
+  try {
+    for (const { headers, code } of [
+      { headers: { "content-type": "application/octet-stream" }, code: "outer_content_type" },
+      { headers: { "content-type": RESPONSE_MEDIA_TYPE, "content-encoding": "gzip" }, code: "outer_content_encoding" },
+    ]) {
+      let postCount = 0;
+      const client = createHpkeFetch({
+        endpoint: "https://api.example.test/protected",
+        key: { kind: "pin", publicKey: keys.publicKey, keyId: KEY_ID },
+        psk: PSK, pskId: PSK_ID,
+        fetch: async (input, init) => {
+          postCount += 1;
+          const request = new Request(input, init);
+          const opened = server.preparse(new Uint8Array(await request.arrayBuffer()))
+            .authenticate(PSK).admit({ accepted: true });
+          return new Response(opened.protectResponse({ status: 200, body: new TextEncoder().encode("ok") }), {
+            status: 200, headers,
+          });
+        },
+      });
+      try {
+        await assert.rejects(client("https://api.example.test/items"),
+          (error) => error instanceof FetchTransportError && error.code === code);
+        assert.equal(postCount, 1);
+      } finally { client.close(); }
+    }
+  } finally { server.close(); }
 });
 
 test("Fetch adapter rejects nonidentity logical content coding", async () => {

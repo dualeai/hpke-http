@@ -427,10 +427,11 @@ pub struct OpenedRequest {
     pub response: ResponseCapability,
 }
 
-/// A server configured for one static recipient key.
+/// A server with one advertised recipient key and other accepted keys.
 pub struct Server {
     recipient_private_key: <Kem as KemTrait>::PrivateKey,
     recipient_key_id: Vec<u8>,
+    accepted_keys: Vec<(Vec<u8>, <Kem as KemTrait>::PrivateKey)>,
     limits: Limits,
 }
 
@@ -440,6 +441,7 @@ impl fmt::Debug for Server {
             .debug_struct("Server")
             .field("recipient_private_key", &"[REDACTED]")
             .field("recipient_key_id_len", &self.recipient_key_id.len())
+            .field("accepted_key_count", &self.accepted_keys.len())
             .field("limits", &self.limits)
             .finish()
     }
@@ -457,16 +459,59 @@ impl Server {
         recipient_key_id: Vec<u8>,
         limits: Limits,
     ) -> Result<Self, Error> {
+        Self::with_accepted_keys(recipient_private_key, recipient_key_id, Vec::new(), limits)
+    }
+
+    /// Create a server that advertises one key and also accepts other keys.
+    ///
+    /// Each accepted pair holds a private key followed by its public key ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for invalid or duplicate IDs,
+    /// invalid private keys, or invalid limits.
+    pub fn with_accepted_keys(
+        recipient_private_key: &[u8],
+        recipient_key_id: Vec<u8>,
+        accepted: Vec<(Vec<u8>, Vec<u8>)>,
+        limits: Limits,
+    ) -> Result<Self, Error> {
         validate_id(&recipient_key_id)?;
         let limits = limits.validate()?;
         let recipient_private_key =
             <Kem as KemTrait>::PrivateKey::from_bytes(recipient_private_key)
                 .map_err(|_| Error::InvalidConfiguration)?;
+        let accepted = accepted
+            .into_iter()
+            .map(|(private_key, key_id)| (Zeroizing::new(private_key), key_id))
+            .collect::<Vec<_>>();
+        let mut accepted_keys = Vec::with_capacity(accepted.len());
+        for (private_key, key_id) in accepted {
+            validate_id(&key_id)?;
+            if key_id == recipient_key_id || accepted_keys.iter().any(|(id, _)| *id == key_id) {
+                return Err(Error::InvalidConfiguration);
+            }
+            let private_key = <Kem as KemTrait>::PrivateKey::from_bytes(&private_key)
+                .map_err(|_| Error::InvalidConfiguration)?;
+            accepted_keys.push((key_id, private_key));
+        }
         Ok(Self {
             recipient_private_key,
             recipient_key_id,
+            accepted_keys,
             limits,
         })
+    }
+
+    fn private_key_for(&self, key_id: &[u8]) -> Result<&<Kem as KemTrait>::PrivateKey, Error> {
+        if key_id == self.recipient_key_id {
+            return Ok(&self.recipient_private_key);
+        }
+        self.accepted_keys
+            .iter()
+            .find(|(id, _)| id == key_id)
+            .map(|(_, private_key)| private_key)
+            .ok_or(Error::UnknownRecipientKey)
     }
 
     /// Return the encoded public key for this server's private key.
@@ -534,9 +579,7 @@ impl Server {
             &envelope[..first_len],
             max_stream_start_ciphertext(self.limits),
         )?;
-        if parsed.key_id != self.recipient_key_id {
-            return Err(Error::UnknownRecipientKey);
-        }
+        self.private_key_for(parsed.key_id)?;
         Ok(CredentialRequest {
             psk_id: parsed.psk_id.to_vec(),
         })
@@ -622,7 +665,70 @@ impl Server {
 #[cfg(test)]
 mod stream_tests {
     use super::STREAM_MAX_DATA_RECORDS;
-    use crate::{Client, Error, Limits, Method, RequestHead, Server, generate_key_pair};
+    use crate::{Client, Error, Limits, Method, Request, RequestHead, Server, generate_key_pair};
+
+    #[test]
+    fn server_accepts_old_key_during_rotation() -> Result<(), Error> {
+        let old = generate_key_pair()?;
+        let new = generate_key_pair()?;
+        let old_public = old.public_key().to_vec();
+        let new_public = new.public_key().to_vec();
+        let (old_private, _) = old.into_parts();
+        let (new_private, _) = new.into_parts();
+        let psk = b"a 32-byte minimum rotation credential";
+        let server = Server::with_accepted_keys(
+            &new_private,
+            b"new".to_vec(),
+            vec![(old_private.to_vec(), b"old".to_vec())],
+            Limits::default(),
+        )?;
+        assert_eq!(server.public_key(), new_public);
+        let request = Request {
+            method: Method::Get,
+            authority: b"api.example.test".to_vec(),
+            path: b"/status".to_vec(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        for (public_key, id) in [
+            (&old_public, b"old".as_slice()),
+            (&new_public, b"new".as_slice()),
+        ] {
+            let client = Client::new(
+                public_key,
+                id.to_vec(),
+                psk.to_vec(),
+                b"token-id".to_vec(),
+                Limits::default(),
+            )?;
+            let protected = client.protect(&request)?;
+            let preparsed = server.preparse(protected.envelope())?;
+            let _authenticated = server.authenticate(preparsed.token, psk)?;
+        }
+        let unknown = Client::new(
+            &old_public,
+            b"unknown".to_vec(),
+            psk.to_vec(),
+            b"token-id".to_vec(),
+            Limits::default(),
+        )?;
+        let protected = unknown.protect(&request)?;
+        assert_eq!(
+            server.preparse(protected.envelope()).err(),
+            Some(Error::UnknownRecipientKey)
+        );
+        assert_eq!(
+            Server::with_accepted_keys(
+                &new_private,
+                b"new".to_vec(),
+                vec![(new_private.to_vec(), b"new".to_vec())],
+                Limits::default(),
+            )
+            .err(),
+            Some(Error::InvalidConfiguration),
+        );
+        Ok(())
+    }
 
     #[test]
     fn data_record_count_guard_closes_both_sides() -> Result<(), Error> {
@@ -1427,9 +1533,7 @@ impl Server {
     /// Returns a parse, limit, or recipient-key error.
     pub fn preparse_stream(&self, first: &[u8]) -> Result<PreparsedStreamRequest, Error> {
         let parsed = parse_stream_start(first, max_stream_start_ciphertext(self.limits))?;
-        if parsed.key_id != self.recipient_key_id {
-            return Err(Error::UnknownRecipientKey);
-        }
+        self.private_key_for(parsed.key_id)?;
         Ok(PreparsedStreamRequest {
             credential: CredentialRequest {
                 psk_id: parsed.psk_id.to_vec(),
@@ -1465,9 +1569,7 @@ impl Server {
         let StreamStartToken { first } = token;
         let max_upload_bytes = self.limits.max_request_bytes;
         let parsed = parse_stream_start(&first, max_stream_start_ciphertext(self.limits))?;
-        if parsed.key_id != self.recipient_key_id {
-            return Err(Error::UnknownRecipientKey);
-        }
+        let private_key = self.private_key_for(parsed.key_id)?;
         validate_credential(psk, parsed.psk_id).map_err(|_| Error::InvalidCredential)?;
         let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(parsed.enc)
             .map_err(|_| Error::AuthenticationFailed)?;
@@ -1475,7 +1577,7 @@ impl Server {
             PskBundle::new(psk, parsed.psk_id).map_err(|_| Error::InvalidCredential)?;
         let mut context = setup_receiver::<HpkeAead, Kdf, Kem>(
             &OpModeR::Psk(psk_bundle),
-            &self.recipient_private_key,
+            private_key,
             &encapped_key,
             &stream_request_info(parsed.header),
         )

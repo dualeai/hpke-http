@@ -19,7 +19,7 @@ from typing_extensions import Self
 from hpke_http import _native
 
 PROTOCOL_ID = "hpke-http/3"
-BINDING_ABI_VERSION = 7
+BINDING_ABI_VERSION = 8
 PACKAGE_VERSION = version("hpke_http")
 
 _HARD_LIMITS = (
@@ -416,12 +416,13 @@ class _ServerState:
 
 
 class Server:
-    """Reusable server configuration for one static recipient key.
+    """Reusable server with one advertised key and other accepted keys.
 
     The private key is an encoded 32-byte X25519 key. ``recipient_key_id`` is
-    public, non-empty, and at most 255 bytes. Closing the server releases its
-    native key copy and revokes pending pre-authentication stages. It accepts
-    bounded raw or zstd DATA records.
+    public, non-empty, and at most 255 bytes. Each ``accepted_keys`` pair holds
+    a private key followed by its public key ID. Closing the server releases
+    its native key copies and revokes pending pre-authentication stages. It
+    accepts bounded raw or zstd DATA records.
     """
 
     __slots__ = ("_state",)
@@ -432,6 +433,7 @@ class Server:
         recipient_key_id: bytes,
         *,
         limits: Limits = _DEFAULT_LIMITS,
+        accepted_keys: Sequence[tuple[bytes, bytes]] = (),
     ) -> None:
         native_limits = _native_limits(limits)
         self._state = _ServerState(
@@ -440,6 +442,7 @@ class Server:
                 bytes(recipient_private_key),
                 bytes(recipient_key_id),
                 native_limits,
+                [(bytes(private_key), bytes(key_id)) for private_key, key_id in accepted_keys],
             ),
             limits,
         )

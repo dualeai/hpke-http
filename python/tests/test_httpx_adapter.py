@@ -91,12 +91,12 @@ async def test_httpx_adapter_protects_complete_exchange_without_ambient_headers(
         return httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, content=envelope)
 
     adapter = HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         headers={"x-default": "logical-default"},
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     )
     async with adapter:
         response = await adapter.post(
@@ -123,22 +123,33 @@ async def test_httpx_adapter_rejects_ambient_client_state() -> None:
     key_pair = generate_key_pair()
     with pytest.raises(ValueError, match="ambient request state"):
         HPKEAsyncClient(
-            "https://api.example.test/protected",
             PinnedKey(key_pair.public_key, KEY_ID),
             PSK,
             PSK_ID,
             cookies={"session": "outer-state"},
+            endpoint="https://api.example.test/protected",
         )
     with pytest.raises(ValueError, match="trust_env"):
         HPKEAsyncClient(
-            "https://api.example.test/protected", PinnedKey(key_pair.public_key, KEY_ID), PSK, PSK_ID, trust_env=True
+            PinnedKey(key_pair.public_key, KEY_ID),
+            PSK,
+            PSK_ID,
+            trust_env=True,
+            endpoint="https://api.example.test/protected",
         )
     async with HPKEAsyncClient(
-        "https://api.example.test/protected", PinnedKey(key_pair.public_key, KEY_ID), PSK, PSK_ID
+        PinnedKey(key_pair.public_key, KEY_ID),
+        PSK,
+        PSK_ID,
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         assert adapter._http.trust_env is False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     async with HPKEAsyncClient(
-        "https://api.example.test/protected", PinnedKey(key_pair.public_key, KEY_ID), PSK, PSK_ID, trust_env=False
+        PinnedKey(key_pair.public_key, KEY_ID),
+        PSK,
+        PSK_ID,
+        trust_env=False,
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         assert adapter._http.trust_env is False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
@@ -213,11 +224,11 @@ async def test_httpx_outer_set_cookie_never_reaches_a_later_exchange() -> None:
         return httpx.Response(200, headers=headers, content=envelope)
 
     async with HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         assert (await adapter.get("https://api.example.test/first")).content == b"ok"
         assert (await adapter.get("https://api.example.test/second")).content == b"ok"
@@ -242,11 +253,11 @@ async def test_httpx_adapter_rejects_nonidentity_authenticated_content() -> None
         return httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, content=envelope)
 
     async with HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         with pytest.raises(TransportError) as captured:
             await adapter.get("https://api.example.test/items")
@@ -273,12 +284,12 @@ async def test_httpx_adapter_rejects_invalid_outer_responses(
 
     key_pair = generate_key_pair()
     async with HPKEAsyncClient(
-        "https://gateway.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         target_origin="https://api.example.test",
         transport=httpx.MockTransport(transport),
+        endpoint="https://gateway.example.test/protected",
     ) as adapter:
         with pytest.raises(TransportError) as captured:
             await adapter.get("https://api.example.test/items")
@@ -310,12 +321,12 @@ async def test_httpx_adapter_bounds_unannounced_outer_response_bytes() -> None:
         return response
 
     async with HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         limits=Limits(max_body_len=1),
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         with pytest.raises(ProtocolError) as captured:
             await adapter.get("https://api.example.test/items")
@@ -349,11 +360,11 @@ async def test_httpx_adapter_holds_finite_body_until_outer_eof() -> None:
         return httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, stream=HeldStream(envelope))
 
     async with HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         waiting = asyncio.create_task(adapter.get("https://api.example.test/items"))
         try:
@@ -385,11 +396,11 @@ async def test_httpx_adapter_maps_response_stream_failure_to_network_error() -> 
 
     key_pair = generate_key_pair()
     async with HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         with pytest.raises(TransportError) as captured:
             await adapter.get("https://api.example.test/items")
@@ -407,12 +418,12 @@ async def test_httpx_adapter_enforces_https_and_request_limit() -> None:
 
     key_pair = generate_key_pair()
     async with HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(key_pair.public_key, KEY_ID),
         PSK,
         PSK_ID,
         limits=Limits(max_request_bytes=1),
         transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+        endpoint="https://api.example.test/protected",
     ) as adapter:
         with pytest.raises(TransportError) as insecure:
             await adapter.get("http://api.example.test/items")

@@ -96,6 +96,7 @@ async def test_app_starts_only_after_end_and_outer_eof() -> None:
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
     )
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
@@ -150,7 +151,9 @@ async def test_one_asgi_event_carries_many_upload_records() -> None:
         await send({"type": "http.response.start", "status": 201, "headers": []})
         await send({"type": "http.response.body", "body": b"saved", "more_body": False})
 
-    middleware = HPKEMiddleware(app, keys.private_key, KEY_ID, _resolve, _admit, transport_path="/protected")
+    middleware = HPKEMiddleware(
+        app, keys.private_key, KEY_ID, _resolve, _admit, key_use_for_s=60, transport_path="/protected"
+    )
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
     writer, first = client.begin_stream(RequestHead(Method.POST, "api.example.test", "/upload"))
     data = _push_all(writer, clear)
@@ -187,6 +190,7 @@ async def test_late_bad_record_never_calls_app() -> None:
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
     )
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
@@ -230,6 +234,7 @@ async def test_incomplete_upload_never_calls_app(failure: str) -> None:
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
     )
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
@@ -286,6 +291,7 @@ async def test_spool_write_error_never_calls_app(monkeypatch: pytest.MonkeyPatch
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
     )
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
@@ -333,6 +339,7 @@ async def test_bad_part_closes_middleware_spool(monkeypatch: pytest.MonkeyPatch)
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
     )
     client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
@@ -384,6 +391,7 @@ async def test_key_get_returns_one_key_record() -> None:
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
     )
     sent: list[Message] = []
@@ -399,7 +407,7 @@ async def test_key_get_returns_one_key_record() -> None:
     scope["headers"] = [(b"host", b"api.example.test")]
     await middleware(scope, receive, send)
     assert sent[0]["status"] == 200
-    assert sent[1]["body"] == b"HHKD\x01" + bytes((len(KEY_ID),)) + KEY_ID + keys.public_key
+    assert sent[1]["body"] == b"HHKD\x02" + bytes((len(KEY_ID),)) + KEY_ID + keys.public_key + b"\x00\x00\x00\x3c"
     middleware.close()
 
 
@@ -416,6 +424,7 @@ async def test_stream_host_rejects_upload_limit_before_app() -> None:
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
         limits=Limits(max_request_bytes=3),
     )
@@ -458,11 +467,11 @@ async def test_cancelled_httpx_async_source_closes_without_end() -> None:
         pytest.fail("source must be cancelled before END")
 
     async with HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(keys.public_key, KEY_ID),
         PSK,
         PSK_ID,
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     ) as client:
         task = asyncio.create_task(client.post("https://api.example.test/upload", content=source()))
         await asyncio.wait_for(entered.wait(), 2)
@@ -491,11 +500,11 @@ async def test_httpx_files_and_async_content_keep_their_normal_body_shape() -> N
         return httpx.Response(200, headers={"content-type": RESPONSE_MEDIA_TYPE}, content=reply)
 
     adapter = HPKEAsyncClient(
-        "https://api.example.test/protected",
         PinnedKey(keys.public_key, KEY_ID),
         PSK,
         PSK_ID,
         transport=httpx.MockTransport(transport),
+        endpoint="https://api.example.test/protected",
     )
     caller_file = io.BytesIO(b"file-content")
 
@@ -577,17 +586,18 @@ async def test_file_backed_httpx_upload_over_64_mib_over_tls(tmp_path: Path, mon
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
         expected_authority="api.example.test",
     )
     async with live_host(middleware, tmp_path) as (endpoint, tls):
         async with HPKEAsyncClient(
-            endpoint,
             PinnedKey(keys.public_key, KEY_ID),
             PSK,
             PSK_ID,
             target_origin="https://api.example.test",
             verify=tls,
+            endpoint=endpoint,
         ) as client:
             with path.open("rb") as upload:
                 response = await asyncio.wait_for(
@@ -622,17 +632,18 @@ async def test_live_form_parser_gets_fields_and_file_over_tls(tmp_path: Path) ->
         KEY_ID,
         _resolve,
         _admit,
+        key_use_for_s=60,
         transport_path="/protected",
         expected_authority="api.example.test",
     )
     async with live_host(middleware, tmp_path) as (endpoint, tls):
         async with HPKEAsyncClient(
-            endpoint,
             PinnedKey(keys.public_key, KEY_ID),
             PSK,
             PSK_ID,
             target_origin="https://api.example.test",
             verify=tls,
+            endpoint=endpoint,
         ) as client:
             response = await client.post(
                 "https://api.example.test/upload",

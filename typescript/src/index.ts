@@ -22,7 +22,7 @@ import type { Method } from "./method.js";
 export const PROTOCOL_ID = "hpke-http/3";
 
 /** ABI version shared by the TypeScript facade and its private WASM module. */
-export const BINDING_ABI_VERSION = 7;
+export const BINDING_ABI_VERSION = 8;
 
 /** npm package version used to reject a mismatched private WASM module. */
 export { PACKAGE_VERSION };
@@ -466,7 +466,7 @@ export class ResponseOpener {
   }
 }
 
-/** Reusable server configuration for one static recipient key. */
+/** Reusable server with one advertised key and other accepted keys. */
 export class Server {
   /**
    * Validate and copy one server key configuration.
@@ -474,11 +474,13 @@ export class Server {
    * @param recipientPrivateKey - Encoded 32-byte X25519 private key.
    * @param recipientKeyId - Non-empty public key identifier, at most 255 bytes.
    * @param limits - Optional limits applied to every request and response.
+   * @param acceptedKeys - Other private-key and public-ID pairs to accept.
    */
   public constructor(
     recipientPrivateKey: Uint8Array,
     recipientKeyId: Uint8Array,
     limits: Limits = {},
+    acceptedKeys: ReadonlyArray<readonly [Uint8Array, Uint8Array]> = [],
   ) {
     const module = requireNative();
     const normalized = normalizeLimits(limits);
@@ -490,6 +492,7 @@ export class Server {
             ownedBytes(recipientPrivateKey),
             ownedBytes(recipientKeyId),
             nativeLimits,
+            acceptedKeys.map(([privateKey, keyId]) => [ownedBytes(privateKey), ownedBytes(keyId)] as const),
           ),
       );
       const envelope = callNative(() => native.max_complete_envelope_len());
@@ -528,8 +531,8 @@ export class Server {
   }
 
   /**
-   * Release the native private-key copy and revoke pending pre-authentication stages.
-   * This method is idempotent and cannot clear the caller-owned key array.
+   * Release the native private-key copies and revoke pending pre-authentication stages.
+   * This method is idempotent and cannot clear caller-owned key arrays.
    */
   public close(): void {
     const native = serverHandles.get(this);

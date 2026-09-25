@@ -46,10 +46,29 @@
 //!
 //! # Public key discovery
 //!
-//! The crate does no HTTP I/O. [`Server::public_key`] returns the server's
-//! X25519 public key. The host key GET record is `"HHKD" || 0x01 ||
-//! id_len:u8 || id || public_key[32]`. Its format version is separate from
-//! [`PROTOCOL_ID`]. The host must keep the same key across its workers.
+//! The crate does no HTTP I/O. [`Server::public_key`] returns the advertised
+//! X25519 public key. The host key GET record is `"HHKD" || 0x02 ||
+//! id_len:u8 || id || public_key[32] || use_for_s:u32be`. The ID has 1 to
+//! 255 bytes. The service sets a positive `use_for_s` lease in seconds. The
+//! record has 43 to 297 bytes. Its format version is separate from
+//! [`PROTOCOL_ID`]. There is no HHKD v1 discovery path.
+//!
+//! A host serves the record on GET at the protected HTTPS endpoint. A valid
+//! GET reply has status 200, `Content-Type: application/octet-stream`,
+//! `Cache-Control: no-store`, and an unencoded body that holds only the record.
+//! The same URL accepts a protected POST with
+//! `Content-Type: message/hpke-http-request`. A successful POST has outer
+//! status 200, `Content-Type: message/hpke-http-response`, and an unencoded
+//! body. See the [HTTP discovery guide](https://github.com/dualeai/hpke-http#key-discovery)
+//! for client checks and host key-switch rules.
+//!
+//! [`Server::with_accepted_keys`] advertises one key and accepts other keys.
+//! To switch from A to B, first make all workers advertise A and accept B.
+//! Then make all workers advertise B and accept A. After the last A lease,
+//! the bound to deliver and parse POST START, and a worker clock margin end,
+//! make all workers advertise B alone. Each accepted pair holds a private key
+//! followed by its public key ID. Do not reuse a KID while keys overlap. The
+//! host must not replay a POST after a failed or lost reply.
 //!
 //! # Replay check
 //!
@@ -219,7 +238,7 @@ pub use sse::SseSplitter;
 /// Language-neutral protocol identifier.
 pub const PROTOCOL_ID: &str = "hpke-http/3";
 /// Boundary ABI version used by the first-party bindings.
-pub const BINDING_ABI_VERSION: u32 = 7;
+pub const BINDING_ABI_VERSION: u32 = 8;
 /// Time for which a newly created request can be accepted (five minutes).
 pub const REQUEST_LIFETIME_SECS: u64 = 300;
 /// Maximum accepted client/server clock difference (30 seconds).

@@ -15,9 +15,11 @@ import uvicorn
 from starlette.types import Receive, Scope, Send
 
 from hpke_http import TransportError, generate_key_pair
-from hpke_http.middleware import Discover, PinnedKey
+from hpke_http.middleware import PinnedKey
+from hpke_http.middleware.aiohttp import DiscoveredEndpoint as AiohttpDiscoveredEndpoint
 from hpke_http.middleware.aiohttp import HPKEClientSession
 from hpke_http.middleware.fastapi import HPKEMiddleware
+from hpke_http.middleware.httpx import DiscoveredEndpoint as HttpxDiscoveredEndpoint
 from hpke_http.middleware.httpx import HPKEAsyncClient
 
 KEY_ID = b"live-sse-key"
@@ -79,31 +81,28 @@ async def test_both_clients_discover_over_https_and_reject_untrusted_tls(tmp_pat
         KEY_ID,
         lambda _id, _scope: PSK,
         lambda _id, _deadline, _scope: True,
+        key_use_for_s=60,
         transport_path="/protected",
         expected_authority="api.example.test",
     )
     async with live_host(middleware, tmp_path) as (endpoint, client_tls):
-        async with HPKEAsyncClient(
-            endpoint, Discover(), PSK, PSK_ID, target_origin="https://api.example.test", verify=client_tls
-        ) as client:
-            assert (await client.get("https://api.example.test/items")).content == b"discovered"
+        async with HttpxDiscoveredEndpoint(endpoint, verify=client_tls) as source:
+            async with HPKEAsyncClient(source, PSK, PSK_ID, target_origin="https://api.example.test") as client:
+                assert (await client.get("https://api.example.test/items")).content == b"discovered"
         connector = aiohttp.TCPConnector(ssl=client_tls)
-        async with HPKEClientSession(
-            endpoint, Discover(), PSK, PSK_ID, target_origin="https://api.example.test", connector=connector
-        ) as client:
-            assert await (await client.get("https://api.example.test/items")).read() == b"discovered"
-        async with HPKEAsyncClient(
-            endpoint, Discover(), PSK, PSK_ID, target_origin="https://api.example.test"
-        ) as client:
-            with pytest.raises(TransportError) as captured:
-                await client.get("https://api.example.test/items")
-            assert captured.value.code == "discovery_network"
-        async with HPKEClientSession(
-            endpoint, Discover(), PSK, PSK_ID, target_origin="https://api.example.test"
-        ) as client:
-            with pytest.raises(TransportError) as captured:
-                await client.get("https://api.example.test/items")
-            assert captured.value.code == "discovery_network"
+        async with AiohttpDiscoveredEndpoint(endpoint, connector=connector) as source:
+            async with HPKEClientSession(source, PSK, PSK_ID, target_origin="https://api.example.test") as client:
+                assert await (await client.get("https://api.example.test/items")).read() == b"discovered"
+        async with HttpxDiscoveredEndpoint(endpoint) as source:
+            async with HPKEAsyncClient(source, PSK, PSK_ID, target_origin="https://api.example.test") as client:
+                with pytest.raises(TransportError) as captured:
+                    await client.get("https://api.example.test/items")
+                assert captured.value.code == "discovery_network"
+        async with AiohttpDiscoveredEndpoint(endpoint) as source:
+            async with HPKEClientSession(source, PSK, PSK_ID, target_origin="https://api.example.test") as client:
+                with pytest.raises(TransportError) as captured:
+                    await client.get("https://api.example.test/items")
+                assert captured.value.code == "discovery_network"
 
 
 @pytest.mark.asyncio
@@ -139,6 +138,7 @@ async def test_each_checked_block_arrives_before_app_finishes(library: str, tmp_
         KEY_ID,
         lambda _id, _scope: PSK,
         lambda _id, _deadline, _scope: True,
+        key_use_for_s=60,
         transport_path="/protected",
         expected_authority="api.example.test",
     )
@@ -146,12 +146,12 @@ async def test_each_checked_block_arrives_before_app_finishes(library: str, tmp_
         try:
             if library == "httpx":
                 async with HPKEAsyncClient(
-                    endpoint,
                     PinnedKey(keys.public_key, KEY_ID),
                     PSK,
                     PSK_ID,
                     target_origin="https://api.example.test",
                     verify=client_tls,
+                    endpoint=endpoint,
                 ) as client:
                     async with client.stream("GET", "https://api.example.test/events") as response:
                         assert response.status_code == 200
@@ -169,12 +169,12 @@ async def test_each_checked_block_arrives_before_app_finishes(library: str, tmp_
             else:
                 connector = aiohttp.TCPConnector(ssl=client_tls)
                 async with HPKEClientSession(
-                    endpoint,
                     PinnedKey(keys.public_key, KEY_ID),
                     PSK,
                     PSK_ID,
                     target_origin="https://api.example.test",
                     connector=connector,
+                    endpoint=endpoint,
                 ) as client:
                     async with client.stream("GET", "https://api.example.test/events") as response:
                         assert response.status == 200
@@ -214,30 +214,31 @@ async def test_live_context_exit_stops_the_server_call(library: str, tmp_path: P
         KEY_ID,
         lambda _id, _scope: PSK,
         lambda _id, _deadline, _scope: True,
+        key_use_for_s=60,
         transport_path="/protected",
         expected_authority="api.example.test",
     )
     async with live_host(middleware, tmp_path) as (endpoint, client_tls):
         if library == "httpx":
             async with HPKEAsyncClient(
-                endpoint,
                 PinnedKey(keys.public_key, KEY_ID),
                 PSK,
                 PSK_ID,
                 target_origin="https://api.example.test",
                 verify=client_tls,
+                endpoint=endpoint,
             ) as client:
                 async with client.stream("GET", "https://api.example.test/events") as response:
                     assert await asyncio.wait_for(anext(response.iter_sse()), 5) == b": ready\n\n"
         else:
             connector = aiohttp.TCPConnector(ssl=client_tls)
             async with HPKEClientSession(
-                endpoint,
                 PinnedKey(keys.public_key, KEY_ID),
                 PSK,
                 PSK_ID,
                 target_origin="https://api.example.test",
                 connector=connector,
+                endpoint=endpoint,
             ) as client:
                 async with client.stream("GET", "https://api.example.test/events") as response:
                     assert await asyncio.wait_for(anext(response.iter_sse()), 5) == b": ready\n\n"
@@ -261,18 +262,19 @@ async def test_finite_status_is_checked_at_stream_entry(library: str, tmp_path: 
         KEY_ID,
         lambda _id, _scope: PSK,
         lambda _id, _deadline, _scope: True,
+        key_use_for_s=60,
         transport_path="/protected",
         expected_authority="api.example.test",
     )
     async with live_host(middleware, tmp_path) as (endpoint, client_tls):
         if library == "httpx":
             async with HPKEAsyncClient(
-                endpoint,
                 PinnedKey(keys.public_key, KEY_ID),
                 PSK,
                 PSK_ID,
                 target_origin="https://api.example.test",
                 verify=client_tls,
+                endpoint=endpoint,
             ) as client:
                 async with client.stream("GET", "https://api.example.test/invalid") as response:
                     assert response.status_code == 422 and response.mode == "finite"
@@ -280,12 +282,12 @@ async def test_finite_status_is_checked_at_stream_entry(library: str, tmp_path: 
         else:
             connector = aiohttp.TCPConnector(ssl=client_tls)
             async with HPKEClientSession(
-                endpoint,
                 PinnedKey(keys.public_key, KEY_ID),
                 PSK,
                 PSK_ID,
                 target_origin="https://api.example.test",
                 connector=connector,
+                endpoint=endpoint,
             ) as client:
                 async with client.stream("GET", "https://api.example.test/invalid") as response:
                     assert response.status == 422 and response.mode == "finite"
