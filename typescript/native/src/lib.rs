@@ -9,6 +9,7 @@ use hpke_http::{
     StreamRequestOpener, StreamRequestRecord, StreamRequestSealer, StreamStartToken, SystemEntropy,
     generate_key_pair,
 };
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
@@ -502,7 +503,7 @@ pub struct WasmServer {
 
 #[wasm_bindgen(js_class = Server)]
 impl WasmServer {
-    /// Create a server for one static recipient key.
+    /// Create a server with one advertised key and optional older keys.
     ///
     /// # Errors
     ///
@@ -512,9 +513,33 @@ impl WasmServer {
         recipient_private_key: &[u8],
         recipient_key_id: &[u8],
         limits: &WasmLimits,
+        accepted_keys: &js_sys::Array,
     ) -> Result<WasmServer, JsValue> {
-        let inner = CoreServer::new(recipient_private_key, recipient_key_id.to_vec(), limits.0)
-            .map_err(js_error)?;
+        let mut accepted = Vec::with_capacity(accepted_keys.length() as usize);
+        for value in accepted_keys.iter() {
+            let pair: js_sys::Array = value
+                .dyn_into()
+                .map_err(|_| js_error(Error::InvalidConfiguration))?;
+            if pair.length() != 2 {
+                return Err(js_error(Error::InvalidConfiguration));
+            }
+            let private_key: js_sys::Uint8Array = pair
+                .get(0)
+                .dyn_into()
+                .map_err(|_| js_error(Error::InvalidConfiguration))?;
+            let key_id: js_sys::Uint8Array = pair
+                .get(1)
+                .dyn_into()
+                .map_err(|_| js_error(Error::InvalidConfiguration))?;
+            accepted.push((private_key.to_vec(), key_id.to_vec()));
+        }
+        let inner = CoreServer::with_accepted_keys(
+            recipient_private_key,
+            recipient_key_id.to_vec(),
+            accepted,
+            limits.0,
+        )
+        .map_err(js_error)?;
         Ok(Self { inner })
     }
 

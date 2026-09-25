@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from threading import Event
 
 import pytest
@@ -42,6 +43,18 @@ async def test_native_work_finishes_before_cancellation_is_delivered(outcome: st
 @pytest.mark.asyncio
 async def test_native_work_returns_and_reports_errors() -> None:
     assert await run_native(lambda: 7) == 7
+
+    def add(left: int, *, right: int) -> int:
+        return left + right
+
+    assert await run_native(add, 3, right=4) == 7
+
+    marker: ContextVar[str] = ContextVar("native-worker-marker")
+    token = marker.set("caller")
+    try:
+        assert await run_native(marker.get) == "caller"
+    finally:
+        marker.reset(token)
 
     def fail() -> int:
         raise ValueError("worker failed")

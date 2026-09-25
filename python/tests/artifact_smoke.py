@@ -28,7 +28,7 @@ def main() -> None:
     expected_version = sys.argv[1] if len(sys.argv) > 1 else distribution_version("hpke_http")
     if expected_version != PACKAGE_VERSION or expected_version != distribution_version("hpke_http"):
         raise RuntimeError("installed Python package version does not match the release candidate")
-    if PROTOCOL_ID != "hpke-http/3" or BINDING_ABI_VERSION != 7:
+    if PROTOCOL_ID != "hpke-http/3" or BINDING_ABI_VERSION != 8:
         raise RuntimeError("installed Python binding identity is incoherent")
 
     keys = generate_key_pair()
@@ -93,52 +93,66 @@ def main() -> None:
 
 
 async def check_adapter_discovery(private_key: bytes) -> None:
-    """Use the installed HTTPX adapter and import all optional adapters."""
+    """Use the installed host and HTTPX adapter through their public APIs."""
     import httpx
+    from starlette.types import Receive, Scope, Send
 
-    from hpke_http.middleware import Discover
     from hpke_http.middleware.aiohttp import HPKEClientSession
     from hpke_http.middleware.fastapi import HPKEMiddleware
-    from hpke_http.middleware.httpx import HPKEAsyncClient
+    from hpke_http.middleware.httpx import DiscoveredEndpoint, HPKEAsyncClient
 
     if not (
         HPKEClientSession.__module__.startswith("hpke_http.") and HPKEMiddleware.__module__.startswith("hpke_http.")
     ):
         raise RuntimeError("installed Python package omitted an adapter")
-    server = Server(private_key, KEY_ID)
     calls: list[str] = []
+    replay_ids: set[bytes] = set()
 
-    async def transport(request: httpx.Request) -> httpx.Response:
-        calls.append(request.method)
-        if request.method == "GET":
-            record = b"HHKD\x01" + bytes((len(KEY_ID),)) + KEY_ID + server.public_key
-            return httpx.Response(200, headers={"content-type": "application/octet-stream"}, content=record)
-        raw = await request.aread()
-        first_length = server.stream_start_length(raw)
-        if first_length is None:
-            raise RuntimeError("installed Python adapter sent no request START")
-        opened_stream = server.preparse_stream(raw[:first_length]).authenticate(PSK).admit(accepted=True)
-        offset = first_length
-        while offset < len(raw):
-            used, _record = opened_stream.feed(raw, offset)
-            offset += used
-        opened = opened_stream.finish_eof()
-        body = opened.protect_response(Response(status=200, body=b"artifact-discovery-ok"))
-        return httpx.Response(200, headers={"content-type": "message/hpke-http-response"}, content=body)
+    def resolve(credential_id: bytes, _scope: Scope) -> bytes:
+        if credential_id != PSK_ID:
+            raise LookupError("unknown artifact credential")
+        return PSK
+
+    def admit(replay_id: bytes, _deadline: int, _scope: Scope) -> bool:
+        if replay_id in replay_ids:
+            return False
+        replay_ids.add(replay_id)
+        return True
+
+    async def app(scope: Scope, _receive: Receive, send: Send) -> None:
+        if scope["path"] != "/items":
+            raise RuntimeError("installed Python host sent the wrong logical path")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"artifact-discovery-ok"})
+
+    middleware = HPKEMiddleware(
+        app,
+        private_key,
+        KEY_ID,
+        resolve,
+        admit,
+        key_use_for_s=60,
+        transport_path="/protected",
+        expected_authority="artifact.example.test",
+    )
+
+    async def host(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            calls.append(scope["method"])
+        await middleware(scope, receive, send)
 
     try:
-        async with HPKEAsyncClient(
-            "https://artifact.example.test/protected",
-            Discover(),
-            PSK,
-            PSK_ID,
-            transport=httpx.MockTransport(transport),
-        ) as client:
-            response = await client.get("https://artifact.example.test/items")
-            if response.content != b"artifact-discovery-ok" or calls != ["GET", "POST"]:
-                raise RuntimeError("installed Python discovery call failed")
+        endpoint = "https://artifact.example.test/protected"
+        async with DiscoveredEndpoint(endpoint, transport=httpx.ASGITransport(app=host)) as source:
+            for _ in range(2):
+                async with HPKEAsyncClient(source, PSK, PSK_ID) as client:
+                    response = await client.get("https://artifact.example.test/items")
+                    if response.content != b"artifact-discovery-ok":
+                        raise RuntimeError("installed Python discovery call failed")
+            if calls != ["GET", "POST", "POST"]:
+                raise RuntimeError("installed Python shared discovery failed")
     finally:
-        server.close()
+        middleware.close()
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ test("Node loader and complete hpke-http transaction", async () => {
   assert.equal(isInitialized(), true);
   assert.equal(PACKAGE_VERSION, packageMetadata.version);
   assert.equal(PROTOCOL_ID, "hpke-http/3");
-  assert.equal(BINDING_ABI_VERSION, 7);
+  assert.equal(BINDING_ABI_VERSION, 8);
 
   const keys = generateKeyPair();
   const client = new Client(keys.publicKey, KEY_ID, PSK, PSK_ID);
@@ -68,6 +68,30 @@ test("Node loader and complete hpke-http transaction", async () => {
 
   client.close();
   server.close();
+});
+
+test("server accepts the old KID while it advertises a new key", async () => {
+  await initialize();
+  const oldKeys = generateKeyPair();
+  const newKeys = generateKeyPair();
+  const oldId = new TextEncoder().encode("old-key");
+  const newId = new TextEncoder().encode("new-key");
+  const server = new Server(newKeys.privateKey, newId, {}, [[oldKeys.privateKey, oldId]]);
+  const oldClient = new Client(oldKeys.publicKey, oldId, PSK, PSK_ID);
+  const newClient = new Client(newKeys.publicKey, newId, PSK, PSK_ID);
+  try {
+    for (const client of [oldClient, newClient]) {
+      const protectedRequest = client.protect({ method: "GET", authority: "api.example.test", path: "/items" });
+      const opened = server.preparse(protectedRequest.envelope).authenticate(PSK).admit({ accepted: true });
+      assert.equal(opened.request.path, "/items");
+      protectedRequest.openResponse(opened.protectResponse({ status: 200 }));
+    }
+    assert.throws(() => new Server(newKeys.privateKey, newId, {}, [[oldKeys.privateKey, newId]]), ProtocolError);
+  } finally {
+    oldClient.close();
+    newClient.close();
+    server.close();
+  }
 });
 
 test("native request writer accepts uneven cuts and one v3 wire form", async () => {

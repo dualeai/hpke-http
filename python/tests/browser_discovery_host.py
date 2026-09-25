@@ -11,7 +11,7 @@ import trustme
 import uvicorn
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request as StarletteRequest
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from hpke_http import generate_key_pair
 from hpke_http.middleware.fastapi import HPKEMiddleware
@@ -33,6 +33,9 @@ class Probe:
         self.key_get_had_credentials = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        add_identity = (
+            scope["type"] == "http" and scope.get("path") == "/protected" and scope.get("method") in {"GET", "POST"}
+        )
         if scope["type"] == "http":
             method = scope.get("method")
             path = scope.get("path")
@@ -46,7 +49,13 @@ class Probe:
                 self.protected_post += 1
             elif path == "/missing" and method == "GET":
                 self.bad_get += 1
-        await self.app(scope, receive, send)
+
+        async def send_with_coding(message: Message) -> None:
+            if add_identity and message["type"] == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", []), (b"content-encoding", b"identity")]}
+            await send(message)
+
+        await self.app(scope, receive, send_with_coding)
 
 
 async def main(directory: Path) -> None:
@@ -110,6 +119,7 @@ async def main(directory: Path) -> None:
         KEY_ID,
         resolve,
         admit,
+        key_use_for_s=60,
         transport_path="/protected",
         expected_authority="api.example.test",
     )
@@ -118,6 +128,7 @@ async def main(directory: Path) -> None:
         allow_origin_regex=r"https://127\.0\.0\.1:\d+",
         allow_methods=["GET", "POST"],
         allow_headers=["*"],
+        expose_headers=["content-encoding"],
         allow_credentials=False,
     )
     probe = Probe(cors)

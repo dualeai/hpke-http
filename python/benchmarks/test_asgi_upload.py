@@ -41,7 +41,9 @@ def test_asgi_upload_8_mib(benchmark: Any, event_size: int) -> None:
         await send({"type": "http.response.start", "status": _REPLY_STATUS, "headers": []})
         await send({"type": "http.response.body", "body": received.to_bytes(8, "big"), "more_body": False})
 
-    middleware = HPKEMiddleware(app, keys.private_key, key_id, resolve, admit, transport_path="/protected")
+    middleware = HPKEMiddleware(
+        app, keys.private_key, key_id, resolve, admit, key_use_for_s=60, transport_path="/protected"
+    )
     scope = cast(
         Scope,
         {

@@ -12,7 +12,6 @@ from typing_extensions import Self
 
 from hpke_http.middleware._discovery import (
     KEY_MEDIA_TYPE,
-    Discover,
     PinnedKey,
     make_discovered_client,
     read_key_record,
@@ -24,6 +23,7 @@ from hpke_http.middleware._discovery import (
 )
 from hpke_http.middleware._native_async import run_native
 from hpke_http.middleware._records import CheckedStream, seal_request_chunk
+from hpke_http.middleware._shared_key import KeyLease, SharedKey
 from hpke_http.protocol import (
     Client,
     Limits,
@@ -56,14 +56,118 @@ class _RejectAllCookiePolicy(DefaultCookiePolicy):
         return False
 
 
+class _RequestOnlyTransport(httpx.AsyncBaseTransport):
+    """Let HTTPX build logical requests without opening a second pool."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        del request
+        raise StateError("logical request client cannot send outer HTTP")
+
+
+class DiscoveredEndpoint:
+    """Share one checked key and one HTTPX pool for one HTTPS endpoint.
+
+    Set TLS and pool options here. Use this source on one event loop. A
+    cancelled caller does not stop a key GET needed by other callers.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        get_timeout_s: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+        **transport_options: Any,
+    ) -> None:
+        endpoint = validate_endpoint(endpoint)
+        forbidden = {
+            "auth",
+            "cookies",
+            "event_hooks",
+            "follow_redirects",
+            "transport",
+            "base_url",
+            "headers",
+            "params",
+            "transport_endpoint",
+            "proxy",
+        }.intersection(transport_options)
+        if forbidden:
+            raise ValueError(f"outer transport cannot use request defaults: {', '.join(sorted(forbidden))}")
+        if transport_options.pop("trust_env", False) is not False:
+            raise ValueError("outer transport cannot use ambient proxy credentials: trust_env")
+        self._endpoint = httpx.URL(endpoint)
+        self._http = httpx.AsyncClient(
+            transport=transport,
+            cookies=CookieJar(policy=_RejectAllCookiePolicy()),
+            follow_redirects=False,
+            trust_env=False,
+            **transport_options,
+        )
+        self._key = SharedKey(self._fetch_key, get_timeout_s=get_timeout_s)
+        self._closed = False
+
+    @property
+    def endpoint(self) -> str:
+        """Return the full HTTPS endpoint bound to this source."""
+        return str(self._endpoint)
+
+    async def _fetch_key(self) -> tuple[bytes, bytes, int]:
+        request = httpx.Request(
+            "GET",
+            self._endpoint,
+            headers={"accept": KEY_MEDIA_TYPE, "accept-encoding": "identity", "cache-control": "no-store"},
+        )
+        request.extensions["timeout"] = self._http.timeout.as_dict()
+        try:
+            response = await self._http.send(request, stream=True, auth=None, follow_redirects=False)
+        except httpx.HTTPError as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        try:
+            validate_key_response(
+                response.status_code,
+                response.headers.get_list("content-type"),
+                response.headers.get_list("content-encoding"),
+            )
+            return await read_key_record(_raw_chunks(response))
+        except httpx.HTTPError as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        finally:
+            await response.aclose()
+
+    async def get_key(self) -> KeyLease:
+        """Get a lease and share a needed GET with other callers.
+
+        The lease has ``key_id``, ``public_key``, and ``valid()``.
+        Its remaining life can end before the caller starts a POST.
+        """
+        return await self._key.get()
+
+    async def aclose(self) -> None:
+        """Stop new calls and close the outer pool."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._key.aclose()
+        await self._http.aclose()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
+
+
 class HPKEAsyncClient:
     """Compose ``httpx.AsyncClient`` with one fixed key endpoint.
 
     Requests are bounded. Live SSE replies yield one checked block at a time.
     Redirects are never followed for the outer exchange.
 
-    ``Discover()`` fetches one key per call. ``PinnedKey`` uses its fixed key.
-    ``transport``, TLS, and pool options configure the dedicated outer connection.
+    A ``DiscoveredEndpoint`` shares one key GET and owns the outer connection.
+    It also supplies the endpoint URL. Set TLS and pool options on that source.
+    ``PinnedKey`` uses its fixed key and requires ``endpoint=``;
+    ``transport``, TLS, and pool options then set the outer connection.
     Default headers and params become logical request fields and target bytes.
     Logical headers are authenticated after transport fields are removed.
     Ambient auth, cookies, event hooks, redirects, and environment
@@ -72,21 +176,30 @@ class HPKEAsyncClient:
 
     def __init__(
         self,
-        endpoint: str,
-        key_source: Discover | PinnedKey,
+        key_source: DiscoveredEndpoint | PinnedKey,
         psk: bytes,
         psk_id: bytes,
         *,
+        endpoint: str | None = None,
         target_origin: str | None = None,
         limits: Limits = _DEFAULT_LIMITS,
         transport: httpx.AsyncBaseTransport | None = None,
         **client_options: Any,
     ) -> None:
-        endpoint = validate_endpoint(endpoint)
+        if type(key_source) not in (DiscoveredEndpoint, PinnedKey):
+            raise TypeError("key_source must be DiscoveredEndpoint or PinnedKey")
+        if isinstance(key_source, DiscoveredEndpoint):
+            if endpoint is not None:
+                raise ValueError("the shared source owns the endpoint")
+            endpoint = key_source.endpoint
+            if transport is not None:
+                raise ValueError("the shared source owns the outer transport")
+        else:
+            if endpoint is None:
+                raise ValueError("endpoint is required with PinnedKey")
+            endpoint = validate_endpoint(endpoint)
         target_key = validate_target_origin(target_origin, endpoint)
         validate_client_configuration(psk, psk_id, limits)
-        if type(key_source) not in (Discover, PinnedKey):
-            raise TypeError("key_source must be Discover() or PinnedKey")
         forbidden = {
             "auth",
             "cookies",
@@ -95,6 +208,7 @@ class HPKEAsyncClient:
             "transport",
             "base_url",
             "transport_endpoint",
+            "proxy",
         }.intersection(client_options)
         if forbidden:
             names = ", ".join(sorted(forbidden))
@@ -102,6 +216,10 @@ class HPKEAsyncClient:
             raise ValueError(msg)
         if client_options.pop("trust_env", False) is not False:
             raise ValueError("outer transport cannot use ambient proxy credentials: trust_env")
+        if isinstance(key_source, DiscoveredEndpoint):
+            unused = set(client_options) - {"headers", "params", "timeout"}
+            if unused:
+                raise ValueError(f"the shared source owns outer transport options: {', '.join(sorted(unused))}")
 
         with ExitStack() as cleanup:
             client = (
@@ -112,7 +230,7 @@ class HPKEAsyncClient:
             if client is not None:
                 cleanup.callback(client.close)
             http = httpx.AsyncClient(
-                transport=transport,
+                transport=_RequestOnlyTransport() if isinstance(key_source, DiscoveredEndpoint) else transport,
                 cookies=CookieJar(policy=_RejectAllCookiePolicy()),
                 follow_redirects=False,
                 trust_env=False,
@@ -120,10 +238,14 @@ class HPKEAsyncClient:
             )
             cleanup.pop_all()
         self._http = http
+        self._source = key_source if isinstance(key_source, DiscoveredEndpoint) else None
+        self._outer_http = (
+            self._source._http if self._source is not None else http  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        )
         self._client = client
         self._endpoint = httpx.URL(endpoint)
         self._target_origin = target_key
-        self._psk = bytes(psk) if isinstance(key_source, Discover) else b""
+        self._psk = bytes(psk) if self._source is not None else b""
         self._psk_id = bytes(psk_id)
         self._limits = limits
         self._closed = False
@@ -136,7 +258,10 @@ class HPKEAsyncClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Release credentials and close the HTTP connection pool."""
+        """Release credentials and close this client's HTTPX resources.
+
+        A shared source owns the outer pool; close that source separately.
+        """
         self._closed = True
         for stream in tuple(self._streams):
             await stream.aclose()
@@ -202,32 +327,43 @@ class HPKEAsyncClient:
         sealer: StreamRequestSealer | None = None
         response_right: list[ProtectedRequest] = []
         discovered: Client | None = None
+        lease: KeyLease | None = None
         try:
             client = self._client
             if client is None:
-                discovered = await self._discover_client(logical)
+                discovered, lease = await self._discover_client()
                 client = discovered
-            try:
-                sealer, first = await run_native(
-                    client.begin_stream,
-                    RequestHead(
-                        method=protocol_method,
-                        authority=target.netloc.decode("ascii"),
-                        path=target.raw_path.decode("ascii"),
-                        headers=logical_headers,
-                    ),
-                )
-            except ProtocolError as error:
-                if discovered is not None and error.code in {"invalid_configuration", "crypto_failure"}:
-                    raise TransportError(
-                        "discovery_response", "key endpoint returned an unusable public key"
-                    ) from error
-                raise
+            head = RequestHead(
+                method=protocol_method,
+                authority=target.netloc.decode("ascii"),
+                path=target.raw_path.decode("ascii"),
+                headers=logical_headers,
+            )
+
+            async def begin(selected: Client) -> tuple[StreamRequestSealer, bytes]:
+                try:
+                    return await run_native(selected.begin_stream, head)
+                except ProtocolError as error:
+                    if discovered is not None and error.code in {"invalid_configuration", "crypto_failure"}:
+                        raise TransportError(
+                            "discovery_response", "key endpoint returned an unusable public key"
+                        ) from error
+                    raise
+
+            sealer, first = await begin(client)
+            if lease is not None and not lease.valid():
+                sealer.close()
+                if discovered is not None:
+                    discovered.close()
+                discovered, lease = await self._discover_client()
+                sealer, first = await begin(discovered)
             writer = sealer
             source = logical.stream
 
             async def encoded_request() -> AsyncIterator[bytes]:
                 try:
+                    if lease is not None and not lease.valid():
+                        raise TransportError("discovery_expired", "key lifetime ended before protected POST")
                     yield first
                     async for chunk in _request_chunks(source):
                         async for frame in seal_request_chunk(writer, chunk):
@@ -266,7 +402,7 @@ class HPKEAsyncClient:
                 timeout["read"] = None
             outer.extensions["timeout"] = timeout
             try:
-                response = await self._http.send(outer, stream=True, auth=None, follow_redirects=False)
+                response = await self._outer_http.send(outer, stream=True, auth=None, follow_redirects=False)
             except httpx.HTTPError as error:
                 raise TransportError("network_error", "protected HTTP request failed") from error
             driver: CheckedStream | None = None
@@ -301,35 +437,13 @@ class HPKEAsyncClient:
                 right.close()
             await _close_request_stream(logical.stream)
 
-    async def _discover_client(self, logical: httpx.Request) -> Client:
-        key_id, public_key = await self._discover_peer(logical)
-        return make_discovered_client(public_key, key_id, self._psk, self._psk_id, self._limits)
-
-    async def _discover_peer(self, logical: httpx.Request) -> tuple[bytes, bytes]:
-        request = httpx.Request(
-            "GET",
-            self._endpoint,
-            headers={"accept": KEY_MEDIA_TYPE, "accept-encoding": "identity", "cache-control": "no-store"},
-        )
-        request.extensions["timeout"] = dict(logical.extensions.get("timeout", self._http.timeout.as_dict()))
-        try:
-            response = await self._http.send(request, stream=True, auth=None, follow_redirects=False)
-        except httpx.HTTPError as error:
-            raise TransportError("discovery_network", "key GET failed") from error
-        try:
-            validate_key_response(
-                response.status_code,
-                response.headers.get_list("content-type"),
-                response.headers.get_list("content-encoding"),
-            )
-            key_id, public_key = await read_key_record(_raw_chunks(response))
-            if self._closed:
-                raise StateError("client is closed")
-            return key_id, public_key
-        except httpx.HTTPError as error:
-            raise TransportError("discovery_network", "key GET failed") from error
-        finally:
-            await response.aclose()
+    async def _discover_client(self) -> tuple[Client, KeyLease]:
+        source = self._source
+        if source is None:
+            raise StateError("client has no discovered endpoint")
+        lease = await source.get_key()
+        client = make_discovered_client(lease.public_key, lease.key_id, self._psk, self._psk_id, self._limits)
+        return client, lease
 
     async def get(self, url: str | httpx.URL, **options: Any) -> httpx.Response:
         """Send one protected ``GET`` request."""
@@ -451,4 +565,4 @@ def _https_url(value: httpx.URL) -> httpx.URL:
     return value.copy_with(fragment=None)
 
 
-__all__ = ["HPKEAsyncClient", "HPKEStreamResponse"]
+__all__ = ["DiscoveredEndpoint", "HPKEAsyncClient", "HPKEStreamResponse"]

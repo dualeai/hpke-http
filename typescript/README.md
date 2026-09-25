@@ -5,7 +5,9 @@ Rust engine in WebAssembly.
 
 ## Build and runtime support
 
-Build the package from this checkout. From the repository root, run:
+This guide uses the shared key source and HHKD v2 record in this checkout.
+The published 3.0.0 package does not have this API. From the repository root,
+build this checkout first:
 
 ```sh
 make install-deps-typescript install-wasm-bindgen build-typescript
@@ -32,30 +34,45 @@ WASM module.
 ## Send a request and read its reply
 
 ```ts
-import { createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
+import { DiscoveredEndpoint, createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
 
 await initialize();
+const keySource = new DiscoveredEndpoint("https://api.example.test/protected");
 const hpkeFetch = createHpkeFetch({
-  endpoint: "https://api.example.test/protected",
-  key: { kind: "discover" },
+  key: keySource,
   psk,
   pskId,
 });
 
-const reply = await hpkeFetch("https://api.example.test/items", {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ name: "Ada" }),
-});
-if (!reply.ok) throw new Error(`request failed: ${reply.status}`);
-const item = await reply.json();
+try {
+  const reply = await hpkeFetch("https://api.example.test/items", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Ada" }),
+  });
+  if (!reply.ok) throw new Error(`request failed: ${reply.status}`);
+  const item = await reply.json();
+
+  const next = await hpkeFetch("https://api.example.test/items", {
+    method: "POST",
+    body: "another item",
+  });
+  if (!next.ok) throw new Error(`request failed: ${next.status}`);
+} finally {
+  hpkeFetch.close();
+  keySource.close();
+}
 ```
 
 The call accepts the same URL, method, headers, body, and abort signal as
-Fetch. It returns a Fetch `Response` with checked status, headers, and body.
+Fetch. It returns a Fetch `Response` with checked status and headers. A finite
+body is complete and checked when the call returns; each SSE block is checked
+when the caller reads it.
 In Node.js, use the same call with imports from `@dualeai/hpke-http/node`.
-The next examples use this open `hpkeFetch` client. Call `hpkeFetch.close()`
-when the application no longer needs it.
+The first call sends GET then POST. The second sends POST alone while the key
+lease is valid. Other clients can use `keySource` while it stays open. Keep a
+different source for each full endpoint path, including Bridge and Library.
+Put the next examples inside the `try` block above, before it closes the client.
 
 ## Upload a file or body stream
 
@@ -174,17 +191,43 @@ function must honor the abort signal and deliver decoded response body bytes
 like native Fetch. The adapter checks browser request stream support before
 it sends a large body.
 
-Discovery sends one GET per call with no logical authorization, cookies, or
-PSK ID. It uses `credentials: "omit"`, `redirect: "error"`, and
-`cache: "no-store"`. It accepts only status 200, `application/octet-stream`,
-identity coding, and an exact key record of at most 293 bytes. See
+One `DiscoveredEndpoint` shares a key and one GET among clients for the same
+full endpoint URL. Keep Bridge and Library sources separate. It refreshes the
+key only when the service-set lease ends. The source starts the lease clock
+before GET, so a slow GET leaves less time to start POST. It checks the lease
+before POST START. It can get a new key if it can still use the request body;
+otherwise it reports `discovery_expired` before it yields POST START. The
+service's POST START delivery bound covers time after that check.
+
+`getTimeoutMs` defaults to 10,000 milliseconds and limits only the key GET.
+It does not limit the protected POST. Pass a Fetch abort signal with a deadline
+when a caller needs to limit the full GET, upload, and reply. One caller's
+abort does not stop a shared GET needed by other callers.
+
+Discovery GET sends no logical authorization, cookies, or PSK ID. It uses
+`credentials: "omit"`, `redirect: "error"`, and `cache: "no-store"`. It accepts
+only status 200, `application/octet-stream`, identity coding, and an exact
+HHKD v2 key record of at most 297 bytes. See
 [key discovery](../README.md#key-discovery) for the record bytes. A pinned key
-skips GET. The caller's abort signal covers GET, upload, and reply. The adapter
-keeps no key cache and does not retry a protected POST.
+skips GET. `Cache-Control: no-store` controls HTTP caches; the shared source
+holds one checked key for its lease.
+
+`getKey(signal)` returns a `DiscoveredKeyLease` with copies of `keyId` and
+`publicKey`, plus `valid()`. Its lease can end after `getKey()` returns. An
+aborted caller stops waiting for a shared GET; other callers can still use
+that GET. The abort signal also covers that caller's upload and reply.
+
+The adapter does not retry a protected POST. A lost reply does not prove that
+the server skipped the operation. HHKD v1 has no fallback. A client that reads
+only HHKD v1 cannot use a v2 host, and a v2 client cannot use a v1 host.
+Switch clients and hosts together, or use separate endpoints.
 
 For cross-origin browser calls, the outer endpoint must allow the public GET,
 the browser's OPTIONS check, the protected POST, and fault replies. The outer
 POST uses `Content-Type: message/hpke-http-request` and `Cache-Control: no-store`.
+The browser must read outer `Content-Encoding` on GET and POST replies to
+check their coding. It is [not a CORS-safelisted response header](https://fetch.spec.whatwg.org/#cors-safelisted-response-header-name).
+Set `Access-Control-Expose-Headers: Content-Encoding` on these replies.
 Configure CORS before the HPKE handler or at a proxy. See the
 [Python CORS example](../python/README.md#protect-an-asgi-app) and the
 [Fetch CORS rules](https://fetch.spec.whatwg.org/#http-cors-protocol).
@@ -292,6 +335,18 @@ try {
 }
 ```
 
+For a planned key switch from A to B, first make every worker advertise A
+and accept B. Then make every worker advertise B and accept A:
+
+```ts
+const server = new Server(bPrivateKey, bKeyId, {}, [[aPrivateKey, aKeyId]]);
+```
+
+After the last A lease, POST START delivery bound, and worker clock margin
+end, make every worker advertise B with no other accepted key. Each accepted
+pair holds a private key, then its public ID. The HTTP host serves the HHKD v2
+record for the advertised key; the Rust engine does no HTTP I/O.
+
 The replay operation must be one atomic reserve-if-absent decision shared by
 all workers that can receive the same credentials. Keep the reservation through
 the supplied exclusive Unix deadline. Report errors and uncertain outcomes as
@@ -348,9 +403,10 @@ be zero when present on 205, and is forbidden for 204.
 or mismatched WASM module. `FetchTransportError.code` distinguishes invalid
 targets, request body bounds, network failure, invalid outer status or media
 type, unsupported authenticated content coding, and authenticated responses
-that Web Fetch cannot represent. Key GET failures use `discovery_network`,
-`discovery_status`, or `discovery_response`. Only `discovery_status` has a
-`statusCode`. A bad GET sends no POST or plaintext fallback. Protected response
+that Web Fetch cannot represent. Key failures use `discovery_network`,
+`discovery_status`, `discovery_response`, or `discovery_expired`. Only
+`discovery_status` has a `statusCode`. A bad GET sends no POST or plaintext
+fallback. Protected response
 record bounds use `ProtocolError`.
 
 Every live client, server, request stage, response right, and `HpkeFetch` has an idempotent

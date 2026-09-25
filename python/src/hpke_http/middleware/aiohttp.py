@@ -17,7 +17,6 @@ from yarl import URL
 
 from hpke_http.middleware._discovery import (
     KEY_MEDIA_TYPE,
-    Discover,
     PinnedKey,
     make_discovered_client,
     read_key_record,
@@ -29,6 +28,7 @@ from hpke_http.middleware._discovery import (
 )
 from hpke_http.middleware._native_async import run_native
 from hpke_http.middleware._records import CheckedStream, seal_request_chunk
+from hpke_http.middleware._shared_key import KeyLease, SharedKey
 from hpke_http.protocol import (
     Client,
     Limits,
@@ -170,34 +170,138 @@ class _RequestContextManager:
             self._response.release()
 
 
-class HPKEClientSession:
-    """Compose a dedicated aiohttp transport with one fixed key endpoint.
+class DiscoveredEndpoint:
+    """Share one checked key and one aiohttp session for one endpoint.
 
-    ``Discover()`` fetches one key per call. ``PinnedKey`` uses its fixed key.
-    The connector and accepted session
-    options configure only the dedicated outer connection pool. Session default
-    credentials, cookies, headers, and environment proxy state are rejected or
-    disabled. This is a supported subset, not a drop-in ``ClientSession``.
-    Every body uses protected records.
+    Set connector and session options here. Use this source on one event
+    loop. A cancelled caller does not stop a GET needed by other callers.
     """
 
     def __init__(
         self,
         endpoint: str,
-        key_source: Discover | PinnedKey,
+        *,
+        get_timeout_s: float = 10.0,
+        connector: aiohttp.BaseConnector | None = None,
+        **session_options: Any,
+    ) -> None:
+        endpoint = validate_endpoint(endpoint)
+        forbidden = {
+            "auth",
+            "connector",
+            "cookie_jar",
+            "cookies",
+            "headers",
+            "base_url",
+            "transport_endpoint",
+        }.intersection(session_options)
+        if forbidden:
+            raise ValueError(f"outer transport cannot use request defaults: {', '.join(sorted(forbidden))}")
+        if session_options.pop("trust_env", False) is not False:
+            raise ValueError("outer transport cannot use ambient proxy credentials: trust_env")
+        self._endpoint = URL(endpoint)
+        self._http = aiohttp.ClientSession(
+            connector=connector,
+            cookie_jar=aiohttp.DummyCookieJar(),
+            trust_env=False,
+            **session_options,
+        )
+        self._key = SharedKey(self._fetch_key, get_timeout_s=get_timeout_s)
+        self._closed = False
+
+    @property
+    def endpoint(self) -> str:
+        """Return the full HTTPS endpoint bound to this source."""
+        return str(self._endpoint)
+
+    async def _fetch_key(self) -> tuple[bytes, bytes, int]:
+        try:
+            response = await self._http.get(
+                self._endpoint,
+                headers={"accept": KEY_MEDIA_TYPE, "accept-encoding": "identity", "cache-control": "no-store"},
+                allow_redirects=False,
+                auth=None,
+                auto_decompress=False,
+                raise_for_status=False,
+                timeout=self._http.timeout,
+            )
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        try:
+            validate_key_response(
+                response.status,
+                response.headers.getall("content-type", ()),
+                response.headers.getall("content-encoding", ()),
+            )
+            return await read_key_record(response.content.iter_chunked(64 * 1024))
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise TransportError("discovery_network", "key GET failed") from error
+        finally:
+            response.close()
+
+    async def get_key(self) -> KeyLease:
+        """Get a lease and share a needed GET with other callers.
+
+        The lease has ``key_id``, ``public_key``, and ``valid()``.
+        Its remaining life can end before the caller starts a POST.
+        """
+        return await self._key.get()
+
+    async def close(self) -> None:
+        """Stop new calls and close the outer session."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._key.aclose()
+        await self._http.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.close()
+
+
+class HPKEClientSession:
+    """Protect aiohttp requests through one fixed HTTPS key endpoint.
+
+    A ``DiscoveredEndpoint`` shares one key GET, owns the outer session, and
+    supplies the endpoint URL. Set its connector and session options on the
+    source. ``PinnedKey`` uses its fixed key and requires ``endpoint=``;
+    the client then owns its outer session. Set connector and
+    session options on that client. Session default credentials, cookies,
+    headers, and environment proxy state are rejected or disabled. This is a
+    supported subset, not a drop-in ``ClientSession``.
+    Every body uses protected records.
+    """
+
+    def __init__(
+        self,
+        key_source: DiscoveredEndpoint | PinnedKey,
         psk: bytes,
         psk_id: bytes,
         *,
+        endpoint: str | None = None,
         target_origin: str | None = None,
         limits: Limits = _DEFAULT_LIMITS,
         connector: aiohttp.BaseConnector | None = None,
         **session_options: Any,
     ) -> None:
-        endpoint = validate_endpoint(endpoint)
+        if type(key_source) not in (DiscoveredEndpoint, PinnedKey):
+            raise TypeError("key_source must be DiscoveredEndpoint or PinnedKey")
+        source = key_source if isinstance(key_source, DiscoveredEndpoint) else None
+        if source is not None:
+            if endpoint is not None:
+                raise ValueError("the shared source owns the endpoint")
+            endpoint = source.endpoint
+            if connector is not None or session_options:
+                raise ValueError("the shared source owns the outer transport options")
+        else:
+            if endpoint is None:
+                raise ValueError("endpoint is required with PinnedKey")
+            endpoint = validate_endpoint(endpoint)
         target_key = validate_target_origin(target_origin, endpoint)
         validate_client_configuration(psk, psk_id, limits)
-        if type(key_source) not in (Discover, PinnedKey):
-            raise TypeError("key_source must be Discover() or PinnedKey")
         sensitive_options = {
             "auth",
             "connector",
@@ -222,18 +326,23 @@ class HPKEClientSession:
             )
             if client is not None:
                 cleanup.callback(client.close)
-            http = aiohttp.ClientSession(
-                connector=connector,
-                cookie_jar=aiohttp.DummyCookieJar(),
-                trust_env=False,
-                **session_options,
+            http = (
+                source._http  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                if source is not None
+                else aiohttp.ClientSession(
+                    connector=connector,
+                    cookie_jar=aiohttp.DummyCookieJar(),
+                    trust_env=False,
+                    **session_options,
+                )
             )
             cleanup.pop_all()
         self._http = http
+        self._source = source
         self._endpoint = URL(endpoint)
         self._target_origin = target_key
         self._client = client
-        self._psk = bytes(psk) if isinstance(key_source, Discover) else b""
+        self._psk = bytes(psk) if source is not None else b""
         self._psk_id = bytes(psk_id)
         self._limits = limits
         self._closed = False
@@ -247,18 +356,22 @@ class HPKEClientSession:
 
     @property
     def closed(self) -> bool:
-        """Return whether the dedicated outer connection pool is closed."""
+        """Return whether this client is closed."""
         return self._closed
 
     async def close(self) -> None:
-        """Release credential copies and close the outer connection pool."""
+        """Release credentials and close this client's outer session, if owned.
+
+        A shared source keeps its outer session until the source closes.
+        """
         self._closed = True
         for stream in tuple(self._streams):
             await stream.aclose()
         self._psk = b""
         if self._client is not None:
             self._client.close()
-        await self._http.close()
+        if self._source is None:
+            await self._http.close()
 
     def stream(
         self,
@@ -398,8 +511,9 @@ class HPKEClientSession:
         response_right: list[ProtectedRequest] = []
         payload: aiohttp.payload.Payload | None = None
         client = self._client
+        lease: KeyLease | None = None
         if client is None:
-            client = await self._discover_client(timeout)
+            client, lease = await self._discover_client()
         try:
             if isinstance(data, aiohttp.FormData):
                 payload = data()
@@ -409,26 +523,34 @@ class HPKEClientSession:
                         raise ValueError("content-type does not match the form boundary")
                     fields["content-type"] = payload_content_type
                     logical_headers = filter_request_headers(fields.items())
-            try:
-                sealer, first = await run_native(
-                    client.begin_stream,
-                    RequestHead(
-                        method=protocol_method,
-                        authority=target.raw_authority,
-                        path=target.raw_path_qs,
-                        headers=logical_headers,
-                    ),
-                )
-            except ProtocolError as error:
-                if client is not self._client and error.code in {"invalid_configuration", "crypto_failure"}:
-                    raise TransportError(
-                        "discovery_response", "key endpoint returned an unusable public key"
-                    ) from error
-                raise
+            head = RequestHead(
+                method=protocol_method,
+                authority=target.raw_authority,
+                path=target.raw_path_qs,
+                headers=logical_headers,
+            )
+
+            async def begin(selected: Client) -> tuple[StreamRequestSealer, bytes]:
+                try:
+                    return await run_native(selected.begin_stream, head)
+                except ProtocolError as error:
+                    if selected is not self._client and error.code in {"invalid_configuration", "crypto_failure"}:
+                        raise TransportError(
+                            "discovery_response", "key endpoint returned an unusable public key"
+                        ) from error
+                    raise
+
+            sealer, first = await begin(client)
+            if lease is not None and not lease.valid():
+                sealer.close()
+                if client is not self._client:
+                    client.close()
+                client, lease = await self._discover_client()
+                sealer, first = await begin(client)
             source: bytes | AsyncIterable[bytes] | aiohttp.payload.Payload = (
                 payload if payload is not None else cast(AsyncIterable[bytes], data) if source_backed else body
             )
-            outer_data = _encode_request(sealer, first, source, response_right)
+            outer_data = _encode_request(sealer, first, source, response_right, lease)
         except BaseException:
             if payload is not None:
                 await payload.close()
@@ -468,6 +590,10 @@ class HPKEClientSession:
                     timeout=chosen_timeout,
                 )
             except (aiohttp.ClientError, TimeoutError) as error:
+                # aiohttp wraps request-body errors in a connection error.
+                cause = error.__cause__
+                if isinstance(cause, (TransportError, ProtocolError)):
+                    raise cause from error
                 raise TransportError("network_error", "protected HTTP request failed") from error
             driver: CheckedStream | None = None
             try:
@@ -505,37 +631,13 @@ class HPKEClientSession:
             if payload is not None:
                 await payload.close()
 
-    async def _discover_client(self, timeout: aiohttp.ClientTimeout | None) -> Client:
-        key_id, public_key = await self._read_key_record(timeout)
-        return make_discovered_client(public_key, key_id, self._psk, self._psk_id, self._limits)
-
-    async def _read_key_record(self, timeout: aiohttp.ClientTimeout | None) -> tuple[bytes, bytes]:
-        try:
-            response = await self._http.get(
-                self._endpoint,
-                headers={"accept": KEY_MEDIA_TYPE, "accept-encoding": "identity", "cache-control": "no-store"},
-                allow_redirects=False,
-                auth=None,
-                auto_decompress=False,
-                raise_for_status=False,
-                timeout=timeout or self._http.timeout,
-            )
-        except (aiohttp.ClientError, TimeoutError) as error:
-            raise TransportError("discovery_network", "key GET failed") from error
-        try:
-            validate_key_response(
-                response.status,
-                response.headers.getall("content-type", ()),
-                response.headers.getall("content-encoding", ()),
-            )
-            key_id, public_key = await read_key_record(response.content.iter_chunked(64 * 1024))
-            if self.closed:
-                raise StateError("client is closed")
-            return key_id, public_key
-        except (aiohttp.ClientError, TimeoutError) as error:
-            raise TransportError("discovery_network", "key GET failed") from error
-        finally:
-            response.close()
+    async def _discover_client(self) -> tuple[Client, KeyLease]:
+        source = self._source
+        if source is None:
+            raise StateError("client has no discovered endpoint")
+        lease = await source.get_key()
+        client = make_discovered_client(lease.public_key, lease.key_id, self._psk, self._psk_id, self._limits)
+        return client, lease
 
     def _resolve(self, value: str | URL) -> URL:
         candidate = URL(value)
@@ -647,8 +749,11 @@ async def _encode_request(
     first: bytes,
     source: bytes | AsyncIterable[bytes] | aiohttp.payload.Payload,
     response_right: list[ProtectedRequest],
+    lease: KeyLease | None,
 ) -> AsyncIterator[bytes]:
     try:
+        if lease is not None and not lease.valid():
+            raise TransportError("discovery_expired", "key lifetime ended before protected POST")
         yield first
         if isinstance(source, aiohttp.payload.Payload):
             queue: asyncio.Queue[bytes | Exception | None] = asyncio.Queue(maxsize=1)
@@ -741,4 +846,4 @@ def _reason_phrase(status: int) -> str:
         return ""
 
 
-__all__ = ["HPKEClientSession", "HPKEResponse", "HPKEStreamResponse"]
+__all__ = ["DiscoveredEndpoint", "HPKEClientSession", "HPKEResponse", "HPKEStreamResponse"]

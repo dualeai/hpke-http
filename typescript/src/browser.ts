@@ -29,10 +29,12 @@ export type { CheckedRecord, CheckedRequestRecord, Header, KeyPair, Limits, Meth
 export {
   REQUEST_MEDIA_TYPE,
   RESPONSE_MEDIA_TYPE,
+  DiscoveredEndpoint,
   FetchTransportError,
   createHpkeFetch,
 } from "./fetch.js";
 export type {
+  DiscoveredKeyLease,
   FetchTransport,
   FetchTransportErrorCode,
   HpkeFetch,

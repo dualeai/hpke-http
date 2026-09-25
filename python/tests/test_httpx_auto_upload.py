@@ -9,9 +9,9 @@ import httpx
 import pytest
 
 from hpke_http import Response, Server, generate_key_pair
-from hpke_http.middleware import Discover, PinnedKey
+from hpke_http.middleware import PinnedKey
 from hpke_http.middleware._discovery import encode_key_record
-from hpke_http.middleware.httpx import HPKEAsyncClient
+from hpke_http.middleware.httpx import DiscoveredEndpoint, HPKEAsyncClient
 from hpke_http.transport import REQUEST_MEDIA_TYPE, RESPONSE_MEDIA_TYPE
 from tests.stream_request import open_stream_request
 
@@ -47,7 +47,11 @@ async def test_pinned_key_uses_one_post_for_each_body_shape() -> None:
 
     try:
         async with HPKEAsyncClient(
-            ENDPOINT, PinnedKey(keys.public_key, KEY_ID), PSK, PSK_ID, transport=httpx.MockTransport(transport)
+            PinnedKey(keys.public_key, KEY_ID),
+            PSK,
+            PSK_ID,
+            transport=httpx.MockTransport(transport),
+            endpoint=ENDPOINT,
         ) as client:
             assert (await client.post(LOGICAL_URL, content=b"bytes")).content == b"ok"
             assert (await client.post(LOGICAL_URL, content=source())).content == b"ok"
@@ -80,7 +84,7 @@ async def test_discovery_reads_key_before_one_use_source() -> None:
             return httpx.Response(
                 200,
                 headers={"content-type": "application/octet-stream"},
-                content=encode_key_record(KEY_ID, keys.public_key),
+                content=encode_key_record(KEY_ID, keys.public_key, 60),
             )
         opened = open_stream_request(server, await request.aread(), PSK)
         assert opened.request.body == b"body"
@@ -91,10 +95,9 @@ async def test_discovery_reads_key_before_one_use_source() -> None:
         )
 
     try:
-        async with HPKEAsyncClient(
-            ENDPOINT, Discover(), PSK, PSK_ID, transport=httpx.MockTransport(transport)
-        ) as client:
-            assert (await client.post(LOGICAL_URL, content=source())).content == b"ok"
+        async with DiscoveredEndpoint(ENDPOINT, transport=httpx.MockTransport(transport)) as key_source:
+            async with HPKEAsyncClient(key_source, PSK, PSK_ID) as client:
+                assert (await client.post(LOGICAL_URL, content=source())).content == b"ok"
         assert calls == ["GET", "POST"]
         assert source_reads == 1
     finally:

@@ -5,7 +5,7 @@ const browser = await import("@dualeai/hpke-http/browser");
 await binding.initialize();
 assert.equal(binding.isInitialized(), true);
 assert.equal(binding.PROTOCOL_ID, "hpke-http/3");
-assert.equal(binding.BINDING_ABI_VERSION, 7);
+assert.equal(binding.BINDING_ABI_VERSION, 8);
 assert.equal(typeof browser.createHpkeFetch, "function");
 if (process.env.EXPECTED_VERSION !== undefined) {
   assert.equal(binding.PACKAGE_VERSION, process.env.EXPECTED_VERSION);
@@ -97,16 +97,13 @@ try {
 
 const discoveryServer = new binding.Server(keys.privateKey, keyId);
 const calls = [];
-const discovery = binding.createHpkeFetch({
-  endpoint: "https://artifact.example.test/protected",
-  key: { kind: "discover" },
-  psk,
-  pskId,
+const endpoint = "https://artifact.example.test/protected";
+const source = new binding.DiscoveredEndpoint(endpoint, {
   fetch: async (input, init) => {
     const request = new Request(input, init);
     calls.push(request.method);
     if (request.method === "GET") {
-      const record = new Uint8Array([0x48, 0x48, 0x4b, 0x44, 1, keyId.byteLength, ...keyId, ...keys.publicKey]);
+      const record = new Uint8Array([0x48, 0x48, 0x4b, 0x44, 2, keyId.byteLength, ...keyId, ...keys.publicKey, 0, 0, 0, 60]);
       return new Response(record, { status: 200, headers: { "content-type": "application/octet-stream" } });
     }
     const opened = discoveryServer.preparse(new Uint8Array(await request.arrayBuffer()))
@@ -116,10 +113,15 @@ const discovery = binding.createHpkeFetch({
   },
 });
 try {
-  const response = await discovery("https://artifact.example.test/items");
-  assert.equal(await response.text(), "artifact-discovery-ok");
-  assert.deepEqual(calls, ["GET", "POST"]);
+  for (let i = 0; i < 2; i += 1) {
+    const discovery = binding.createHpkeFetch({ key: source, psk, pskId });
+    try {
+      const response = await discovery("https://artifact.example.test/items");
+      assert.equal(await response.text(), "artifact-discovery-ok");
+    } finally { discovery.close(); }
+  }
+  assert.deepEqual(calls, ["GET", "POST", "POST"]);
 } finally {
-  discovery.close();
+  source.close();
   discoveryServer.close();
 }

@@ -158,5 +158,8 @@ export interface NativeModule {
     NativeClient,
     [Uint8Array, Uint8Array, Uint8Array, Uint8Array, NativeLimits]
   >;
-  Server: NativeConstructor<NativeServer, [Uint8Array, Uint8Array, NativeLimits]>;
+  Server: NativeConstructor<
+    NativeServer,
+    [Uint8Array, Uint8Array, NativeLimits, Array<readonly [Uint8Array, Uint8Array]>]
+  >;
 }
