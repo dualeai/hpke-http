@@ -3,17 +3,13 @@
 `hpke_http` protects HTTP requests and replies with the Rust `hpke-http/3`
 engine. Use the HTTPX or aiohttp client with an ASGI app.
 
-## Build this checkout
+## Install the published package
 
-This guide uses the shared key source and HHKD v2 record in this checkout.
-The published 3.0.0 package does not have this API. Build this checkout first:
+Install the v4 release with the HTTPX, aiohttp, and FastAPI adapters used below:
 
 ```sh
-make install-deps-python build-python
+python -m pip install 'hpke-http[httpx,aiohttp,fastapi]~=4.0'
 ```
-
-This installs the HTTPX, aiohttp, and FastAPI extras and builds the Rust binding
-from this checkout.
 
 ## Protect an ASGI app
 
@@ -83,7 +79,9 @@ from hpke_http.middleware.httpx import DiscoveredEndpoint, HPKEAsyncClient
 endpoint = "https://api.example.test/protected"
 async with DiscoveredEndpoint(endpoint) as key_source:
     async with HPKEAsyncClient(key_source, psk, b"tenant-42") as client:
-        response = await client.post("https://api.example.test/items", json={"name": "Ada"})
+        response = await client.post(
+            "https://api.example.test/items", json={"name": "Ada"}
+        )
         response.raise_for_status()
     async with HPKEAsyncClient(key_source, psk, b"tenant-42") as client:
         with open("large.bin", "rb") as file:
