@@ -126,7 +126,9 @@ class Limits:
     4 GiB hard maximum. Finite reply bytes and one SSE block default to 8 MiB
     with a 64 MiB hard maximum. Header bytes default to 16 KiB with a 64 KiB
     hard maximum. Header count defaults to 64 with a hard maximum of 256.
-    Authority and path bytes cannot exceed 8 KiB.
+    Authority and path bytes cannot exceed 8 KiB. All sizes count bytes.
+    Every value can be zero except ``max_request_bytes``, which must be at
+    least one.
     """
 
     max_body_len: int | None = None
@@ -229,8 +231,8 @@ class Client:
     are non-empty and at most 255 bytes. The PSK must be at least 32 bytes long
     and contain at least 32 bytes of entropy; ``psk_id`` must not equal it.
     Inputs are copied into native storage; closing the client cannot clear byte
-    strings retained by the caller. Rust compresses request data before it
-    encrypts the stream records.
+    strings retained by the caller. Rust may compress request DATA before it
+    encrypts each record.
     """
 
     __slots__ = ("_inner", "_maximum_body")
@@ -336,7 +338,7 @@ class ProtectedRequest:
         return self._inner.consumed
 
     def open_response(self, envelope: bytes) -> Response:
-        """Check a complete finite reply with the record reader."""
+        """Check a complete finite reply; collect an HTTP body through real EOF first."""
         status, headers, body = _call(self._inner.open_finite_response, bytes(envelope))
         return Response(status=status, headers=_import_headers(headers), body=body)
 
@@ -373,9 +375,10 @@ class StreamRequestSealer:
             raise
 
     def finish(self) -> tuple[bytes, ProtectedRequest]:
-        """Return final DATA and END bytes, then the response right.
+        """Return final DATA, if any, and END bytes, then the response right.
 
-        The right has an empty ``envelope``.
+        Send all returned bytes before ending the outer HTTP body. The right
+        has an empty ``envelope``.
         """
         inner = self._inner
         if inner is None:
@@ -448,7 +451,11 @@ class Server:
         )
 
     def preparse(self, envelope: bytes) -> PreparsedRequest:
-        """Read bounded public fields before credential lookup."""
+        """Read bounded public fields from a supplied complete envelope.
+
+        An HTTP host checks real outer EOF first; this method checks only
+        supplied bytes.
+        """
         inner = self._state.require()
         _check_length(len(envelope), self._state.maximum_envelope)
         return PreparsedRequest(_call(inner.preparse, bytes(envelope)), self._state)
@@ -499,7 +506,7 @@ class PreparsedRequest:
 
     @property
     def psk_id(self) -> bytes:
-        """Return the public PSK identity for the host resolver."""
+        """Return an untrusted public PSK ID for lookup before START authentication."""
         return self._inner.psk_id
 
     @property
@@ -535,7 +542,7 @@ class PreparsedStreamRequest:
 
     @property
     def psk_id(self) -> bytes:
-        """Return the public PSK ID for host credential lookup."""
+        """Return an untrusted public PSK ID for lookup before START authentication."""
         return self._inner.psk_id
 
     def authenticate(self, psk: bytes) -> AuthenticatedStreamRequest:
@@ -590,7 +597,11 @@ class AuthenticatedStreamRequest:
 
 
 class OpenedStreamRequest:
-    """Checked head and bounded DATA reader; success waits for END and EOF."""
+    """Checked head and bounded DATA reader; success waits for END and EOF.
+
+    The host checks its logical target policy and holds DATA from the app
+    until END and real outer EOF.
+    """
 
     __slots__ = ("_inner", "_maximum_body", "head")
 
@@ -620,7 +631,10 @@ class OpenedStreamRequest:
             raise
 
     def finish_eof(self) -> StreamResponseRight:
-        """Return the response right only after checked END and outer EOF."""
+        """Call after real outer EOF; check END and return the response right.
+
+        The caller checks transport EOF; this method checks only record state.
+        """
         inner = self._inner
         if inner is None:
             raise StateError()
@@ -688,7 +702,11 @@ class _ResponseRight:
         return self._inner.response_consumed
 
     def protect_response(self, response: Response) -> bytes:
-        """Protect one complete finite reply with the record writer."""
+        """Protect one complete finite reply with the record writer.
+
+        A native write consumes the right even if it fails. Close the right
+        after any error; do not send a partial protected reply.
+        """
         status = _bounded_integer(response.status, "response status", _MIN_STATUS, _MAX_STATUS)
         if len(response.body) > self._maximum_body:
             self.close()
@@ -701,7 +719,11 @@ class _ResponseRight:
         )
 
     def into_sealer(self, status: int, headers: Sequence[Header]) -> tuple[ResponseSealer, bytes]:
-        """Start a checked reply and return its prefix and START record."""
+        """Start a checked reply and return its prefix and START record.
+
+        A native start consumes the right even if it fails. Close the right
+        after any error.
+        """
         checked_status = _bounded_integer(status, "response status", _MIN_STATUS, _MAX_STATUS)
         inner, first = _call(self._inner.take_sealer, checked_status, _export_headers(headers))
         return ResponseSealer(inner), first
@@ -712,10 +734,10 @@ class _ResponseRight:
 
 
 class StreamResponseRight(_ResponseRight):
-    """Response right after streamed DATA, END, and outer EOF pass all checks.
+    """Response right after DATA, END, and outer EOF seen by the caller pass.
 
-    The caller stores the checked DATA parts before it dispatches the request.
-    This right does not hold the request body.
+    The caller checks its target policy and stores checked DATA before app
+    dispatch. This right does not hold the request body.
     """
 
     __slots__ = ()
@@ -724,7 +746,8 @@ class StreamResponseRight(_ResponseRight):
 class OpenedRequest(_ResponseRight):
     """Complete checked request and its right to send one protected response.
 
-    ``request`` includes the full body and is ready for application dispatch.
+    ``request`` includes the full body. The host checks its logical target
+    policy before it dispatches the request.
     """
 
     __slots__ = ("request",)
@@ -781,7 +804,10 @@ class ResponseOpener:
         )
 
     def finish_eof(self) -> Response | None:
-        """Check END at true outer body EOF and return a finite response."""
+        """Call after real outer body EOF; check END and return a finite reply, if any.
+
+        The caller checks transport EOF; this method checks only record state.
+        """
         inner = self._inner
         if inner is None:
             raise StateError()
@@ -800,7 +826,11 @@ class ResponseOpener:
 
 
 class ResponseSealer:
-    """One checked response writer for a finite body or clear SSE blocks."""
+    """One checked response writer for a finite body or clear SSE blocks.
+
+    A failed native seal or finish leaves the writer unable to send END.
+    Close it and abort any partial outer response after such an error.
+    """
 
     __slots__ = ("_inner",)
 
@@ -822,7 +852,11 @@ class ResponseSealer:
         return _call(inner.seal_sse_block, bytes(block))
 
     def finish(self) -> bytes:
-        """Protect END; the outer sender must then end its HTTP body."""
+        """Protect END; the outer sender must then end its HTTP body.
+
+        For a finite reply, call ``seal_finite_body`` once first, even when
+        the body is empty.
+        """
         inner = self._inner
         if inner is None:
             raise StateError()

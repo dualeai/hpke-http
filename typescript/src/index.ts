@@ -71,7 +71,11 @@ export interface Response {
   readonly body?: Uint8Array;
 }
 
-/** Optional per-engine limits. An omitted value selects the documented default. */
+/**
+ * Optional per-engine limits. An omitted value selects the documented default.
+ * All sizes count bytes. Every value can be zero except `maxRequestBytes`,
+ * which must be at least one.
+ */
 export interface Limits {
   /**
    * One-shot request or finite response body bytes, or one SSE block.
@@ -288,7 +292,7 @@ export class ProtectedRequest {
     return this.#native === undefined || this.#native.consumed;
   }
 
-  /** Check one complete finite response through the record reader. */
+  /** Check a complete finite reply; collect an HTTP body through real EOF first. */
   public openResponse(envelope: Uint8Array): Response {
     const opener = this.intoOpener();
     try {
@@ -359,7 +363,7 @@ export class StreamRequestSealer {
     }
   }
 
-  /** Seal final DATA and END, then receive the one-use response right. */
+  /** Seal final DATA, if any, and END, then receive the one-use response right. */
   public finish(): StreamFinishedRequest {
     const native = requireHandle(this.#native);
     try {
@@ -379,7 +383,7 @@ export class StreamRequestSealer {
   }
 }
 
-/** Final DATA and END bytes, with the one-use response right. */
+/** Final DATA, if any, and END bytes, with the one-use response right. */
 export class StreamFinishedRequest {
   #native: NativeProtectedRequest | undefined;
   /** Final DATA, if any, and END bytes. Send these before outer EOF. */
@@ -423,8 +427,9 @@ export class ResponseOpener {
   public constructor(native: NativeResponseOpener) { this.#native = native; }
 
   /**
-   * Consume at most one record. Pass `input.subarray(consumed)` to the next
-   * call until all bytes are used. Finite DATA returns no public record.
+   * Consume at most one record. Pass at most 64 KiB per call to bound the
+   * copy into WASM. Pass `input.subarray(consumed)` to the next call until
+   * all bytes are used. Finite DATA returns no public record.
    */
   public feed(input: Uint8Array): { readonly consumed: number; readonly record?: CheckedRecord } {
     const native = requireHandle(this.#native);
@@ -448,7 +453,10 @@ export class ResponseOpener {
     }
   }
 
-  /** Confirm true outer body EOF after END. */
+  /**
+   * Call after the transport reports real outer body EOF. Check END and return
+   * a finite response, if any. This method cannot observe transport EOF itself.
+   */
   public finishEof(): Response | undefined {
     const native = requireHandle(this.#native);
     const response = callNative(() => native.finish_eof());
@@ -506,7 +514,10 @@ export class Server {
     }
   }
 
-  /** Parse bounded public fields without accepting credentials or releasing plaintext. */
+  /**
+   * Parse bounded public fields from a supplied complete envelope. An HTTP
+   * host checks real outer EOF first; this method checks only supplied bytes.
+   */
   public preparse(envelope: Uint8Array): PreparsedRequest {
     const native = requireServerHandle(this);
     checkLength(envelope.byteLength, requireServerLimits(this).envelope);
@@ -546,7 +557,7 @@ export class Server {
 export class PreparsedStreamRequest {
   #native: NativePreparsedStreamRequest | undefined;
   readonly #server: Server;
-  /** Public PSK ID for host credential lookup; this is not the PSK. */
+  /** Untrusted public PSK ID for lookup before START authentication; not the PSK. */
   public readonly pskId: Uint8Array;
 
   public constructor(native: NativePreparsedStreamRequest, server: Server) {
@@ -625,7 +636,10 @@ export type CheckedRequestRecord =
   | { readonly kind: "data"; readonly block: Uint8Array }
   | { readonly kind: "end" };
 
-/** Checked START and an incremental DATA reader. */
+/**
+ * Checked START and an incremental DATA reader. Check the host target policy
+ * and hold DATA from the app until END and real outer EOF.
+ */
 export class OpenedStreamRequest {
   #native: NativeOpenedStreamRequest | undefined;
   readonly #maximumBody: number;
@@ -659,7 +673,10 @@ export class OpenedStreamRequest {
     }
   }
 
-  /** Check true outer EOF after END and grant the one-use response right. */
+  /**
+   * Call after the transport reports real outer EOF. Check END and grant the
+   * one-use response right. This method cannot observe transport EOF itself.
+   */
   public finishEof(): StreamResponseRight {
     const native = requireHandle(this.#native);
     try {
@@ -693,7 +710,10 @@ class ResponseRight {
     return this.#native === undefined || this.#native.response_consumed;
   }
 
-  /** Protect a complete finite response. */
+  /**
+   * Protect a complete finite response. An error after status validation
+   * closes this right. Close it after any error; do not send a partial reply.
+   */
   public protectResponse(response: Response): Uint8Array {
     const native = requireHandle(this.#native);
     validateResponseStatus(response.status);
@@ -707,7 +727,10 @@ class ResponseRight {
     }
   }
 
-  /** Start a checked response stream. */
+  /**
+   * Start a checked response stream. An error after status validation closes
+   * this right. Close it after any error.
+   */
   public startResponse(status: number, headers: readonly Header[]): ResponseSealer {
     const native = requireHandle(this.#native);
     validateResponseStatus(status);
@@ -728,7 +751,7 @@ class ResponseRight {
   }
 }
 
-/** Response right granted only after checked request END and true outer EOF. */
+/** Response right granted after checked END and real outer EOF seen by the caller. */
 export class StreamResponseRight extends ResponseRight {
   public constructor(native: NativeOpenedRequest, maximumBody: number) {
     super(native, maximumBody);
@@ -739,7 +762,7 @@ export class StreamResponseRight extends ResponseRight {
 export class PreparsedRequest {
   #native: NativePreparsedRequest | undefined;
   readonly #server: Server;
-  /** Owned copy of the public opaque PSK identifier. It is not the PSK. */
+  /** Untrusted public PSK ID for lookup before START authentication; not the PSK. */
   public readonly pskId: Uint8Array;
 
   public constructor(native: NativePreparsedRequest, server: Server) {
@@ -838,7 +861,7 @@ export class AuthenticatedRequest {
 
 /** Verified plaintext request plus its one-shot response protector. */
 export class OpenedRequest extends ResponseRight {
-  /** Owned authenticated request data that is safe for application dispatch. */
+  /** Owned authenticated request data. Check host target policy before dispatch. */
   public readonly request: Required<Request>;
 
   public constructor(native: NativeOpenedRequest, maximumBody: number) {
@@ -853,7 +876,11 @@ export class OpenedRequest extends ResponseRight {
   }
 }
 
-/** One checked response writer for a finite body or complete LF-normalized SSE blocks. */
+/**
+ * One checked response writer for a finite body or complete LF-normalized SSE
+ * blocks. A failed native seal or finish leaves the writer unable to send END.
+ * Close it and abort any partial outer response after such an error.
+ */
 export class ResponseSealer {
   #native: NativeResponseSealer | undefined;
   /** Protected response prefix and START bytes. Send these first. */
@@ -874,7 +901,10 @@ export class ResponseSealer {
     return callNative(() => requireHandle(this.#native).seal_sse_block(ownedBytes(block)));
   }
 
-  /** Protect END. The caller must then end the outer HTTP body. */
+  /**
+   * Protect END. For a finite reply, call `sealFiniteBody` once first, even
+   * when the body is empty. The caller must then end the outer HTTP body.
+   */
   public finish(): Uint8Array {
     const native = requireHandle(this.#native);
     try { return callNative(() => native.finish()); }

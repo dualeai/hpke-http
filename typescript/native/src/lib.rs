@@ -1099,7 +1099,8 @@ impl WasmResponseSealer {
             .map_err(js_error)
     }
 
-    /// Protect END. The caller then ends the outer HTTP body.
+    /// Protect END. In finite mode, call `seal_finite_body` once first, even
+    /// for an empty body. The caller then ends the outer HTTP body.
     ///
     /// # Errors
     /// Returns a state or cryptographic error.

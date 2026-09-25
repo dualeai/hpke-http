@@ -95,7 +95,8 @@ class HPKEMiddleware:
     middleware never releases plaintext before this callback accepts the
     request.
 
-    ``psk_resolver`` raises ``LookupError`` for an unknown public ID. Other
+    ``psk_resolver`` receives an untrusted public ID before START
+    authentication. It raises ``LookupError`` for an unknown ID. Other
     resolver exceptions indicate an unavailable credential source.
 
     ``transport_path`` must match the full ASGI ``scope["path"]``, including any

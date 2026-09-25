@@ -1,114 +1,34 @@
 //! HPKE requests and checked response records for HTTP.
 //!
-//! This crate defines one wire contract, [`PROTOCOL_ID`] `hpke-http/3`.
-//! It does no network I/O. Hosts must use HTTPS. The protocol does not hide
-//! endpoints, public IDs, payload size, record counts, or timing, and it does
-//! not add padding. It uses RFC 9180 HPKE PSK mode with X25519,
-//! HKDF-SHA256, and ChaCha20-Poly1305. It is not Oblivious HTTP.
+//! This crate implements `PROTOCOL_ID` hpke-http/3. The
+//! [central protocol specification](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md)
+//! gives the exact request, response, and HHKD v2 bytes; cryptographic inputs;
+//! limits; checks; and client and server steps. It links the frozen wire vectors.
+//! Package versions and `BINDING_ABI_VERSION` do not change the wire version.
 //!
-//! # Request bytes
+//! The crate does no network I/O. A host uses HTTPS, resolves PSKs, and makes
+//! one atomic replay decision shared by its workers. The public PSK ID is an
+//! untrusted lookup hint until START authentication passes. An admitted
+//! request gives one response right. The host checks the full request, END,
+//! real outer body EOF, and logical target policy before it sends clear bytes
+//! to the app.
 //!
-//! All fixed-width integers use big-endian order. Every request, including
-//! an empty one, uses this one START/DATA/END form:
+//! `Client::protect` and `Server::preparse` serve complete bounded calls.
+//! `Client::begin_stream` and `Server::preparse_stream` serve uploads. The
+//! stream path checks replay after START; the complete path checks all
+//! records before replay. Both paths withhold clear request data until the
+//! host admits replay. The host reports real outer EOF to `ResponseOpener`
+//! after END; the opener then gives a finite response. It gives each checked
+//! SSE block after that block passes its own checks.
 //!
-//! ```text
-//! "HHRQ" || 0x03 || key_id_len:u8 || psk_id_len:u8
-//! || 0x0020 || 0x0001 || 0x0003 || issued_at_unix_s:u64be
-//! || key_id || psk_id || enc[32] || records...
-//! record = ciphertext_len:u32be || ciphertext[ciphertext_len]
-//! ```
-//!
-//! Both IDs have 1 to 255 bytes. The public header ends after the PSK ID.
-//! Each ciphertext includes a 16-byte HPKE tag. The first clear record is
-//! `0x01 || method:vector || authority:vector || path:vector || fields:vector`.
-//! These four fields use shortest RFC 9292 QUIC variable-length integers.
-//! `fields` contains ordered name/value vector pairs. The scheme is HTTPS.
-//! Each DATA is `0x02 || coding:u8 || coded_body`, with a nonempty clear
-//! body of at most 64 KiB. Coding 0 means raw; 1 means one zstd frame. Rust
-//! picks zstd only when it makes that DATA record shorter. It compresses
-//! clear body bytes before HPKE encryption. A reader accepts a valid zstd
-//! frame within record limits even if it is longer than its clear bytes.
-//! END is exactly `0x03`.
-//! There is one START, zero or more DATA records, one END, and then true
-//! outer HTTP body EOF. Extra bytes, missing END, and partial frames fail.
-//!
-//! One HPKE PSK context seals all request records. Its `info` is
-//! `"message/hpke-http request\0v3\0" || public_header`. Record number
-//! `n` starts at zero. Its AAD is
-//! `"hpke-http/3 request record\0" || public_header || n:u64be ||
-//! ciphertext_len:u32be`. HPKE also advances its own nonce sequence per
-//! record. A host must check END and true outer EOF before app dispatch.
-//! A logical `Content-Length`, if present, names the sum of clear DATA bytes.
-//! [`Limits::max_request_bytes`] defaults to 1 GiB and has a 4 GiB hard cap.
-//! There can be at most 1,048,576 DATA records.
-//! Complete in-memory request helpers also use [`Limits::max_body_len`],
-//! which defaults to 8 MiB. Incremental requests use the total request cap.
-//!
-//! # Public key discovery
-//!
-//! The crate does no HTTP I/O. [`Server::public_key`] returns the advertised
-//! X25519 public key. The host key GET record is `"HHKD" || 0x02 ||
-//! id_len:u8 || id || public_key[32] || use_for_s:u32be`. The ID has 1 to
-//! 255 bytes. The service sets a positive `use_for_s` lease in seconds. The
-//! record has 43 to 297 bytes. Its format version is separate from
-//! [`PROTOCOL_ID`]. There is no HHKD v1 discovery path.
-//!
-//! A host serves the record on GET at the protected HTTPS endpoint. A valid
-//! GET reply has status 200, `Content-Type: application/octet-stream`,
-//! `Cache-Control: no-store`, and an unencoded body that holds only the record.
-//! The same URL accepts a protected POST with
-//! `Content-Type: message/hpke-http-request`. A successful POST has outer
-//! status 200, `Content-Type: message/hpke-http-response`, and an unencoded
-//! body. See the [HTTP discovery guide](https://github.com/dualeai/hpke-http#key-discovery)
-//! for client checks and host key-switch rules.
-//!
-//! [`Server::with_accepted_keys`] advertises one key and accepts other keys.
-//! To switch from A to B, first make all workers advertise A and accept B.
-//! Then make all workers advertise B and accept A. After the last A lease,
-//! the bound to deliver and parse POST START, and a worker clock margin end,
-//! make all workers advertise B alone. Each accepted pair holds a private key
-//! followed by its public key ID. Do not reuse a KID while keys overlap. The
-//! host must not replay a POST after a failed or lost reply.
-//!
-//! # Replay check
-//!
-//! The replay ID is SHA-256 of
-//! `"hpke-http/replay\0v3\0" || public_header || enc`. The server checks
-//! the request time against [`REQUEST_LIFETIME_SECS`] and [`CLOCK_SKEW_SECS`].
-//! The host must make one atomic replay decision and keep it through the
-//! authenticated deadline. The app must not see clear bytes before the host
-//! checks the full request, including END and EOF.
-//!
-//! # Response bytes
-//!
-//! The HPKE context exports 32 bytes with context
-//! `"message/hpke-http response\0v3"`. The server samples a fresh 32-byte
-//! nonce. HKDF-SHA256 uses `enc || server_nonce` as salt and that exported
-//! secret as input. It expands the key with `"hpke-http/3 response key"`
-//! and nonce with `"hpke-http/3 response nonce"`. The response is:
-//!
-//! ```text
-//! "HHRP" || 0x03 || server_nonce[32] || records...
-//! record = ciphertext_len:u32be || ciphertext[ciphertext_len]
-//! ```
-//!
-//! START is `0x01 || status:u16be || fields`, with ordered name/value
-//! vectors. DATA is `0x02 || coding:u8 || coded_body`; coding 0 is raw and
-//! 1 is one zstd frame. Rust picks zstd only when it saves bytes. Each SSE
-//! DATA holds one complete SSE block after decoding.
-//! END is exactly `0x03`. The response reader needs true outer EOF after
-//! END. The record AAD is `"hpke-http/3 response record\0" ||
-//! prefix[37] || n:u64be || ciphertext_len:u32be`. The record nonce is the
-//! derived base nonce with its last eight bytes combined with `n:u64be` by XOR.
-//!
-//! [`Limits`] also bounds each finite reply, SSE block, head, and target.
-//! Errors do not include clear or secret bytes. The crate version,
-//! [`PROTOCOL_ID`], and [`BINDING_ABI_VERSION`] are separate values.
+//! The examples below show API use. Use the linked specification to build
+//! another language implementation or to read the exact wire contract.
 //!
 //! # Complete transaction
 //!
 //! The host must make a shared atomic replay decision before it admits a
-//! request. This example accepts one request to show the API sequence.
+//! request. This example passes complete request and response bytes directly,
+//! in place of HTTP bodies, to show the API sequence.
 //!
 //! ```
 //! use hpke_http::{Client, Limits, Method, Request, Response, Server, generate_key_pair};
@@ -145,10 +65,10 @@
 //!
 //! Send the `begin_stream` bytes first, then each record from `push`, then the
 //! bytes from `finish`. End the outer HTTP body after `finish`. On the server,
-//! hold checked DATA until `finish_eof` confirms END and real outer EOF. This
-//! example accepts one replay decision and passes bytes directly between the
-//! client and server in place of an HTTP transport. A host must use a shared
-//! atomic replay store:
+//! hold checked DATA until the host observes real outer EOF and `finish_eof`
+//! checks END. This example accepts one replay decision and passes bytes
+//! directly between the client and server in place of an HTTP transport.
+//! A host must use a shared atomic replay store:
 //!
 //! ```
 //! use hpke_http::{

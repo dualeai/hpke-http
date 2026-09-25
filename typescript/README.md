@@ -1,17 +1,22 @@
 # hpke-http for TypeScript
 
 Use `@dualeai/hpke-http` to protect Fetch requests and check replies with the
-Rust engine in WebAssembly.
+Rust engine in WebAssembly. The
+[protocol specification](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md)
+holds the shared wire bytes, key record, checks, and host steps.
 
 ## Build and runtime support
 
-This guide uses the shared key source and HHKD v2 record in this checkout.
-The published 3.0.0 package does not have this API. From the repository root,
-build this checkout first:
+Install the published v4 package:
 
 ```sh
-make install-deps-typescript install-wasm-bindgen build-typescript
+npm install '@dualeai/hpke-http@^4.0.0'
 ```
+
+The v4 client does not read HHKD v1 key records. Change clients and hosts
+together, or use separate endpoints.
+
+To build this checkout, use the commands in [Development](#development).
 
 Use one explicit entry point:
 
@@ -32,6 +37,9 @@ Use the `/browser` entry point in a browser. Its `initialize()` call loads the
 WASM module.
 
 ## Send a request and read its reply
+
+Set `psk` and `pskId` as `Uint8Array` values from your app config. The PSK
+needs at least 32 bytes of entropy. Its public ID must differ from the PSK.
 
 ```ts
 import { DiscoveredEndpoint, createHpkeFetch, initialize } from "@dualeai/hpke-http/browser";
@@ -119,14 +127,13 @@ Each `value` is one checked SSE block. The caller parses fields and comments.
 
 ### Credentials and limits
 
-Recipient keys use X25519 and are 32 bytes. Recipient-key and PSK identifiers
-are public opaque values from 1 through 255 bytes. A PSK needs at least 32
-bytes of entropy, and its public identifier must not equal the PSK.
+Use the [credential rules](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#request-hpke-steps)
+when you provision recipient keys and PSKs.
 
-Names such as `serverPublicKey`, `requestEnvelope`, `resolvePsk`, and
-`replayStore` in the examples are application-provided key storage, transport,
-and replay components. The Fetch adapter can get a public key from a fixed
-HTTPS endpoint.
+Names such as `serverPublicKey`, `requestEnvelope`, `resolvePsk`,
+`replayStore`, and `enforceTargetPolicy` in the examples are host-provided key
+storage, transport, replay, and target checks. The Fetch adapter can get a
+public key from a fixed HTTPS endpoint.
 
 ```ts
 import { generateKeyPair, initialize } from "@dualeai/hpke-http/node";
@@ -145,23 +152,10 @@ their inputs. Calling `close()` clears or releases native copies, but it cannot
 clear caller-owned `Uint8Array` values. Clear secret arrays when the application
 no longer needs them.
 
-| Limit | Default | Hard maximum |
-| --- | ---: | ---: |
-| One-shot request, finite reply, or one SSE block | 8 MiB | 64 MiB |
-| Total request body across DATA records | 1 GiB | 4 GiB |
-| Combined header-name and value bytes | 16 KiB | 64 KiB |
-| Header fields per message | 64 | 256 |
-| Combined authority and path bytes | 8 KiB | 8 KiB |
-
-Pass a `Limits` object to `Client`, `Server`, or `createHpkeFetch` to change a
-limit within its hard maximum. Omitted fields use the defaults. SSE has no
-whole-stream body cap.
-
-Rust uses zstd for clear parts of at least 64 bytes when it shrinks them;
-other parts stay raw. It encrypts either form. Rust checks each record and
-restores the clear bytes on receipt. The application sees the original body.
-The protocol adds no padding; an observer can see record size, count, and
-timing.
+The [central limits and DATA rules](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#current-engine-limits)
+give each default and hard cap, and explain raw and zstd record coding.
+Pass a `Limits` object to `Client`, `Server`, or `createHpkeFetch` to
+change a limit within its hard maximum. Omitted fields use the defaults.
 
 ### Fetch behavior
 
@@ -192,25 +186,19 @@ like native Fetch. The adapter checks browser request stream support before
 it sends a large body.
 
 One `DiscoveredEndpoint` shares a key and one GET among clients for the same
-full endpoint URL. Keep Bridge and Library sources separate. It refreshes the
-key only when the service-set lease ends. The source starts the lease clock
-before GET, so a slow GET leaves less time to start POST. It checks the lease
-before POST START. It can get a new key if it can still use the request body;
-otherwise it reports `discovery_expired` before it yields POST START. The
-service's POST START delivery bound covers time after that check.
+full endpoint URL. Keep Bridge and Library sources separate. The
+[key record and lease rules](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#hhkd-v2-key-record)
+define when the source can start a protected POST.
 
 `getTimeoutMs` defaults to 10,000 milliseconds and limits only the key GET.
 It does not limit the protected POST. Pass a Fetch abort signal with a deadline
 when a caller needs to limit the full GET, upload, and reply. One caller's
 abort does not stop a shared GET needed by other callers.
 
-Discovery GET sends no logical authorization, cookies, or PSK ID. It uses
-`credentials: "omit"`, `redirect: "error"`, and `cache: "no-store"`. It accepts
-only status 200, `application/octet-stream`, identity coding, and an exact
-HHKD v2 key record of at most 297 bytes. See
-[key discovery](../README.md#key-discovery) for the record bytes. A pinned key
-skips GET. `Cache-Control: no-store` controls HTTP caches; the shared source
-holds one checked key for its lease.
+Discovery GET uses `credentials: "omit"`, `redirect: "error"`, and
+`cache: "no-store"`. A pinned key skips GET. The
+[specification](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#hhkd-v2-key-record)
+gives the exact GET checks and record bytes.
 
 `getKey(signal)` returns a `DiscoveredKeyLease` with copies of `keyId` and
 `publicKey`, plus `valid()`. Its lease can end after `getKey()` returns. An
@@ -218,9 +206,7 @@ aborted caller stops waiting for a shared GET; other callers can still use
 that GET. The abort signal also covers that caller's upload and reply.
 
 The adapter does not retry a protected POST. A lost reply does not prove that
-the server skipped the operation. HHKD v1 has no fallback. A client that reads
-only HHKD v1 cannot use a v2 host, and a v2 client cannot use a v1 host.
-Switch clients and hosts together, or use separate endpoints.
+the server skipped the operation.
 
 For cross-origin browser calls, the outer endpoint must allow the public GET,
 the browser's OPTIONS check, the protected POST, and fault replies. The outer
@@ -229,7 +215,7 @@ The browser must read outer `Content-Encoding` on GET and POST replies to
 check their coding. It is [not a CORS-safelisted response header](https://fetch.spec.whatwg.org/#cors-safelisted-response-header-name).
 Set `Access-Control-Expose-Headers: Content-Encoding` on these replies.
 Configure CORS before the HPKE handler or at a proxy. See the
-[Python CORS example](../python/README.md#protect-an-asgi-app) and the
+[Python CORS example](https://github.com/dualeai/hpke-http/blob/main/python/README.md#protect-an-asgi-app) and the
 [Fetch CORS rules](https://fetch.spec.whatwg.org/#http-cors-protocol).
 
 The synthetic response represents authenticated status, headers, and body. It
@@ -299,7 +285,9 @@ early end.
 ### Low-level server and replay admission
 
 The TypeScript package does not provide a web-framework server adapter. A host
-can connect the staged `Server` API to its own HTTP stack:
+can connect the staged `Server` API to its own HTTP stack. Read the full
+bounded outer POST body through real EOF before this one-shot call. The host
+must check the authenticated logical target before it calls its app:
 
 ```ts
 import { Server, initialize } from "@dualeai/hpke-http/node";
@@ -318,6 +306,7 @@ try {
       );
       const opened = authenticated.admit({ accepted });
       try {
+        enforceTargetPolicy(opened.request);
         const logicalResponse = await dispatch(opened.request);
         const responseEnvelope = opened.protectResponse(logicalResponse);
         await sendProtectedResponse(responseEnvelope);
@@ -335,17 +324,20 @@ try {
 }
 ```
 
-For a planned key switch from A to B, first make every worker advertise A
-and accept B. Then make every worker advertise B and accept A:
+The host supplies `enforceTargetPolicy` to check the request authority and
+path against its configured logical origin and route. The engine checks the
+protected fields but does not set that host policy.
+
+Follow the [key switch order](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#hhkd-v2-key-record)
+for a planned change. Pass each other accepted private key and its public ID
+as a pair:
 
 ```ts
 const server = new Server(bPrivateKey, bKeyId, {}, [[aPrivateKey, aKeyId]]);
 ```
 
-After the last A lease, POST START delivery bound, and worker clock margin
-end, make every worker advertise B with no other accepted key. Each accepted
-pair holds a private key, then its public ID. The HTTP host serves the HHKD v2
-record for the advertised key; the Rust engine does no HTTP I/O.
+The HTTP host serves the HHKD v2 record for the advertised key; the Rust
+engine does no HTTP I/O.
 
 The replay operation must be one atomic reserve-if-absent decision shared by
 all workers that can receive the same credentials. Keep the reservation through
@@ -360,15 +352,16 @@ many bytes to `server.preparseStream(first)`. Resolve `pskId`, call
 Feed the remaining outer bytes through `opened.feed(bytes)` and store each
 checked `data` block in temporary storage. Each call accepts at most 64 KiB;
 use `consumed` until all bytes pass. After `end` and true outer EOF, call
-`opened.finishEof()`. Only then dispatch the stored body to the application.
+`opened.finishEof()`. Check the logical target before dispatching the stored
+body to the application.
 The returned right can call `protectResponse` or `startResponse`. Close each
 stage on failure. This path uses `maxRequestBytes`, not the one-shot body limit.
 
 ### HTTP boundary rules
 
-Requests use absolute HTTPS URLs without embedded credentials. Protocol headers
-are ordered lower-case token names with canonical ASCII values. Repeated fields
-remain separate in the low-level API.
+The [central specification](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md#data-coding-and-logical-http-checks)
+defines logical HTTP fields and target checks. The low-level API keeps
+ordered repeated fields; Fetch has its own header view.
 
 The Fetch adapter removes transport-only request fields: `Connection` and every
 field it names, `Content-Length`, `Expect`, `Host`, `Keep-Alive`, proxy
@@ -381,10 +374,6 @@ outside the body bound. Native zstd record coding is separate from this HTTP
 representation field. Native Fetch can decode an outer response while it keeps
 encoded response metadata, so the adapter bounds the bytes actually yielded by
 Fetch instead of trusting outer `Content-Length`.
-
-`HEAD` responses and statuses 204, 205, and 304 expose no body. A single
-authenticated `Content-Length` remains valid metadata for `HEAD` and 304, must
-be zero when present on 205, and is forbidden for 204.
 
 ### Errors and lifecycle
 

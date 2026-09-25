@@ -228,6 +228,13 @@ fn authenticated_request_time_bounds_replay_retention() -> Result<(), Error> {
     let accepted = server.authenticate_at(accepted.token, PSK, issued_at + 329)?;
     assert_eq!(accepted.replay.retain_until_exclusive, issued_at + 330);
 
+    let future_at_limit = server.preparse(&envelope)?;
+    assert!(
+        server
+            .authenticate_at(future_at_limit.token, PSK, issued_at - 30)
+            .is_ok()
+    );
+
     let expired = server.preparse(&envelope)?;
     assert_eq!(
         server

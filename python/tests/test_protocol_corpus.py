@@ -9,12 +9,13 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 import zstandard
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from hpke_http import Client, Limits, Method, Request, Response, Server
+from hpke_http import Client, Header, Limits, Method, ProtocolError, Request, Response, Server
 
 CORPUS = Path(__file__).resolve().parents[2] / "rust/hpke-http/tests/vectors/protocol-v3.json"
 KEM_SUITE = b"KEM\x00\x20"
@@ -52,7 +53,9 @@ def _vector(value: bytes) -> bytes:
         return bytes([size]) + value
     if size < 16384:
         return (size | 0x4000).to_bytes(2, "big") + value
-    raise ValueError("corpus vector is too long")
+    if size < 1 << 30:
+        return (size | 0x80000000).to_bytes(4, "big") + value
+    raise ValueError("vector is too long")
 
 
 def _fields(fields: list[list[str]]) -> bytes:
@@ -247,6 +250,63 @@ def test_many_small_data_records_fit_complete_request_limit() -> None:
     server.close()
 
 
+def test_independently_sealed_invalid_request_records_fail_after_valid_tags() -> None:
+    source = json.loads(CORPUS.read_text())
+    source["issued_at_unix_s"] = int(time.time())
+    parts = cast(dict[str, Any], _derive(source)["intermediates"])
+    header = _hex(parts["header"])
+    enc = _hex(parts["enc"])
+    key = _hex(parts["request_key"])
+    nonce = _hex(parts["request_base_nonce"])
+    method = _vector(b"POST")
+    authority = _vector(b"api.example.test")
+    path = _vector(b"/items")
+    valid_start = b"\x01" + method + authority + path + _vector(b"")
+    cases = {
+        "nonminimal method length": (
+            [b"\x01\x40\x04POST" + authority + path + _vector(b""), b"\x03"],
+            "malformed_envelope",
+        ),
+        "invalid path": (
+            [b"\x01" + method + authority + _vector(b"/a/../b") + _vector(b""), b"\x03"],
+            "malformed_envelope",
+        ),
+        "invalid field name": (
+            [b"\x01" + method + authority + path + _vector(_vector(b"Host") + _vector(b"x")), b"\x03"],
+            "malformed_envelope",
+        ),
+        "odd field section": (
+            [b"\x01" + method + authority + path + _vector(_vector(b"x")), b"\x03"],
+            "malformed_envelope",
+        ),
+        "DATA after END": ([valid_start, b"\x03", b"\x02\x00x"], "malformed_envelope"),
+        "Content-Length exceeds clear DATA": (
+            [b"\x01" + method + authority + path + _vector(_fields([["content-length", "2"]])), b"\x02\x00x", b"\x03"],
+            "malformed_envelope",
+        ),
+        "clear DATA exceeds Content-Length": (
+            [b"\x01" + method + authority + path + _vector(_fields([["content-length", "1"]])), b"\x02\x00xy", b"\x03"],
+            "limit_exceeded",
+        ),
+    }
+    server = Server(_hex(source["recipient_private_key"]), _hex(source["recipient_key_id"]))
+    try:
+        valid_frames, _ = _records(key, nonce, header, b"hpke-http/3 request record\x00", [valid_start, b"\x03"])
+        valid_wire = header + enc + _hex(valid_frames)[len(header) :]
+        opened = server.preparse(valid_wire).authenticate(_hex(source["psk"])).admit(accepted=True)
+        assert opened.request == Request(Method.POST, "api.example.test", "/items")
+        opened.close()
+
+        for name, (clear_records, expected_code) in cases.items():
+            framed, _ = _records(key, nonce, header, b"hpke-http/3 request record\x00", clear_records)
+            wire = header + enc + _hex(framed)[len(header) :]
+            with pytest.raises(ProtocolError) as captured:
+                server.preparse(wire).authenticate(_hex(source["psk"])).admit(accepted=True)
+            assert captured.value.code == expected_code, name
+    finally:
+        server.close()
+
+
 def test_v3_zstd_record_matches_independent_cryptography() -> None:
     source = json.loads(CORPUS.read_text())
     compressed = source["compressed_request"]
@@ -302,17 +362,44 @@ def test_v3_zstd_record_matches_independent_cryptography() -> None:
             assert actual[field] == expected[field]
 
 
-def test_native_senders_emit_zstd_that_an_independent_decoder_opens() -> None:
+def test_native_senders_emit_zstd_and_wide_vectors_that_an_independent_decoder_opens() -> None:
     source = json.loads(CORPUS.read_text())
     private_key = _hex(source["recipient_private_key"])
     public_key = _hex(source["recipient_public_key"])
     key_id = _hex(source["recipient_key_id"])
     psk = _hex(source["psk"])
     psk_id = _hex(source["psk_id"])
-    client = Client(public_key, key_id, psk, psk_id)
-    server = Server(private_key, key_id)
-    request = Request(Method.POST, "api.example.test", "/compressed", body=b"a" * 4096)
-    response = Response(200, body=b"b" * 4096)
+    limits = Limits(max_header_bytes=64 * 1024)
+    client = Client(public_key, key_id, psk, psk_id, limits=limits)
+    server = Server(private_key, key_id, limits=limits)
+    two_byte_value = "a" * 64
+    four_byte_value = "b" * 16384
+    assert _vector(two_byte_value.encode())[:2] == b"\x40\x40"
+    assert _vector(four_byte_value.encode())[:4] == b"\x80\x00\x40\x00"
+    request_fields = [
+        ["content-length", "4096"],
+        ["x-test", "value"],
+        ["x-two", two_byte_value],
+        ["x-four", four_byte_value],
+    ]
+    response_fields = [
+        ["content-type", "application/octet-stream"],
+        ["x-result", "ok"],
+        ["x-two", two_byte_value],
+        ["x-four", four_byte_value],
+    ]
+    request = Request(
+        Method.POST,
+        "api.example.test",
+        "/compressed",
+        headers=tuple(Header(name, value) for name, value in request_fields),
+        body=b"a" * 4096,
+    )
+    response = Response(
+        200,
+        headers=tuple(Header(name, value) for name, value in response_fields),
+        body=b"b" * 4096,
+    )
     try:
         protected = client.protect(request)
         request_wire = protected.envelope
@@ -341,7 +428,13 @@ def test_native_senders_emit_zstd_that_an_independent_decoder_opens() -> None:
             request_nonce,
         )
         assert len(request_plain) == 3
-        assert request_plain[0][0] == 1
+        assert request_plain[0] == (
+            b"\x01"
+            + _vector(b"POST")
+            + _vector(b"api.example.test")
+            + _vector(b"/compressed")
+            + _vector(_fields(request_fields))
+        )
         assert request_plain[1][:2] == b"\x02\x01"
         assert (
             zstandard.ZstdDecompressor().decompress(request_plain[1][2:], max_output_size=len(request.body))
@@ -363,7 +456,7 @@ def test_native_senders_emit_zstd_that_an_independent_decoder_opens() -> None:
             _expand(response_prk, b"hpke-http/3 response nonce", 12),
         )
         assert len(response_plain) == 3
-        assert response_plain[0][:3] == b"\x01\x00\xc8"
+        assert response_plain[0] == (b"\x01\x00\xc8" + _fields(response_fields))
         assert response_plain[1][:2] == b"\x02\x01"
         assert (
             zstandard.ZstdDecompressor().decompress(response_plain[1][2:], max_output_size=len(response.body))

@@ -641,6 +641,50 @@ async def test_asgi_middleware_turns_boundary_failures_into_controlled_outer_err
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("authority", "outer_status", "expected_calls"),
+    [
+        ("other.example.test", 421, 0),
+        ("API.example.test:443", 200, 1),
+    ],
+)
+async def test_explicit_authority_checks_the_authenticated_target(
+    authority: str, outer_status: int, expected_calls: int
+) -> None:
+    calls = 0
+
+    async def app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        nonlocal calls
+        calls += 1
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    keys = generate_key_pair()
+    client = Client(keys.public_key, KEY_ID, PSK, PSK_ID)
+    middleware = HPKEMiddleware(
+        app,
+        keys.private_key,
+        KEY_ID,
+        _resolve_psk,
+        _ReplayStore().admit,
+        key_use_for_s=60,
+        transport_path="/protected",
+        expected_authority="api.example.test",
+    )
+    protected = client.protect(Request(method=Method.GET, authority=authority, path="/items"))
+    try:
+        messages = await _invoke(middleware, protected.envelope)
+        assert messages[0]["status"] == outer_status
+        assert calls == expected_calls
+        if expected_calls:
+            assert protected.open_response(cast(bytes, messages[1]["body"])).status == 204
+    finally:
+        protected.close()
+        client.close()
+        middleware.close()
+
+
+@pytest.mark.asyncio
 async def test_asgi_middleware_rejects_nonidentity_authenticated_request_content() -> None:
     application_called = False
 

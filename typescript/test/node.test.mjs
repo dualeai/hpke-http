@@ -22,6 +22,13 @@ const packageMetadata = JSON.parse(
 const KEY_ID = new TextEncoder().encode("primary-2026-09");
 const PSK = new TextEncoder().encode("a 32-byte minimum test credential!");
 const PSK_ID = new TextEncoder().encode("tenant-42");
+const WIRE_CORPUS = JSON.parse(
+  await readFile(new URL("../../rust/hpke-http/tests/vectors/protocol-v3.json", import.meta.url), "utf8"),
+);
+
+function fromHex(value) {
+  return Uint8Array.from(Buffer.from(value, "hex"));
+}
 
 test("Node loader and complete hpke-http transaction", async () => {
   await initialize();
@@ -68,6 +75,28 @@ test("Node loader and complete hpke-http transaction", async () => {
 
   client.close();
   server.close();
+});
+
+test("Node binding opens the independent v3 request corpus", async (context) => {
+  await initialize();
+  // Make the fixed issue time current for the native request-time check.
+  context.mock.method(Date, "now", () => WIRE_CORPUS.issued_at_unix_s * 1000);
+  const server = new Server(fromHex(WIRE_CORPUS.recipient_private_key), fromHex(WIRE_CORPUS.recipient_key_id));
+  try {
+    const preparsed = server.preparse(fromHex(WIRE_CORPUS.request_envelope));
+    assert.deepEqual(preparsed.pskId, fromHex(WIRE_CORPUS.psk_id));
+    const authenticated = preparsed.authenticate(fromHex(WIRE_CORPUS.psk));
+    assert.equal(Buffer.from(authenticated.replayId).toString("hex"), WIRE_CORPUS.intermediates.replay_id);
+    assert.equal(authenticated.retainUntilExclusive, WIRE_CORPUS.issued_at_unix_s + 330);
+    const opened = authenticated.admit({ accepted: true });
+    assert.equal(opened.request.method, WIRE_CORPUS.request.method);
+    assert.equal(opened.request.authority, WIRE_CORPUS.request.authority);
+    assert.equal(opened.request.path, WIRE_CORPUS.request.path);
+    assert.deepEqual(opened.request.headers, WIRE_CORPUS.request.headers.map(([name, value]) => ({ name, value })));
+    assert.deepEqual(opened.request.body, fromHex(WIRE_CORPUS.request.body));
+  } finally {
+    server.close();
+  }
 });
 
 test("server accepts the old KID while it advertises a new key", async () => {
