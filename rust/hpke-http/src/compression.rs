@@ -121,4 +121,33 @@ mod tests {
         assert!(coded.len() >= clear.len());
         assert_eq!(decode(ZSTD, &coded, clear.len()), Ok(clear.to_vec()));
     }
+
+    #[test]
+    fn rejects_bad_checksum_and_oversized_window() {
+        // Python zstandard made this single frame with a checksum and 4096 'a' bytes.
+        let mut checksum_frame = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x64, 0x00, 0x0f, 0x4d, 0x00, 0x00, 0x10, 0x61, 0x61, 0x01,
+            0x00, 0xfb, 0xf7, 0x01, 0x16, 0x03, 0x16, 0x2c, 0x89,
+        ];
+        assert_eq!(decode(ZSTD, &checksum_frame, 4096), Ok(vec![b'a'; 4096]));
+        checksum_frame[22] ^= 1;
+        assert_eq!(
+            decode(ZSTD, &checksum_frame, 4096),
+            Err(Error::MalformedEnvelope)
+        );
+
+        // This valid frame declares a 2 MiB window but expands to only 4096 bytes.
+        let large_window_frame = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x58, 0x4d, 0x00, 0x00, 0x10, 0x61, 0x61, 0x01, 0x00,
+            0xfb, 0xf7, 0x01, 0x16,
+        ];
+        assert_eq!(
+            decode(ZSTD, &large_window_frame, 4096),
+            Err(Error::MalformedEnvelope)
+        );
+        assert_eq!(
+            decode(ZSTD, &large_window_frame, 2 * 1024 * 1024),
+            Ok(vec![b'a'; 4096])
+        );
+    }
 }

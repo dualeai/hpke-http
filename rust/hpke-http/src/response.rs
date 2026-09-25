@@ -589,6 +589,134 @@ const fn decode_error(error: Error) -> Error {
 mod tests {
     use super::*;
 
+    fn field(name: &[u8], value: &[u8]) -> HeaderField {
+        HeaderField {
+            name: name.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn clear_start(status: u16, headers: &[HeaderField]) -> Result<Vec<u8>, Error> {
+        let mut clear = status.to_be_bytes().to_vec();
+        clear.extend(message::encode_fields(headers)?);
+        Ok(clear)
+    }
+
+    fn assert_valid_tag_response_rejected(
+        name: &str,
+        method: Method,
+        records: Vec<(u8, Option<u8>, Vec<u8>)>,
+    ) -> Result<(), Error> {
+        // Use the record crypto directly so invalid clear bytes still have valid tags.
+        let material = ResponseMaterial {
+            secret: zeroize::Zeroizing::new([7; 32]),
+            enc: [8; 32],
+            method,
+            limits: crate::Limits::default(),
+        };
+        let mut prefix = [0; PREFIX_LEN];
+        prefix[..4].copy_from_slice(MAGIC);
+        prefix[4] = VERSION;
+        let mut writer = Crypto::new(&material, prefix)?;
+        let mut wire = prefix.to_vec();
+        for (kind, coding, body) in records {
+            wire.extend(writer.seal_record(kind, coding, &body, kind == END)?);
+        }
+        let mut reader = ResponseOpener::new(material);
+        let mut offset = 0;
+        let mut error = None;
+        while offset < wire.len() {
+            match reader.feed(&wire[offset..]) {
+                Ok((used, _)) if used > 0 => offset += used,
+                Ok(_) => return Err(Error::MalformedEnvelope),
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        assert_eq!(error, Some(Error::MalformedEnvelope), "{name}");
+        Ok(())
+    }
+
+    #[test]
+    fn opener_rejects_authenticated_invalid_clear_records() -> Result<(), Error> {
+        let duplicate_type = clear_start(
+            200,
+            &[
+                field(b"content-type", b"text/plain"),
+                field(b"content-type", b"text/event-stream"),
+            ],
+        )?;
+        let sse_type = field(b"content-type", b"text/event-stream");
+        let sse_start = clear_start(200, std::slice::from_ref(&sse_type))?;
+        let mismatched_length = clear_start(200, &[field(b"content-length", b"4")])?;
+        let nonzero_205_length = clear_start(205, &[field(b"content-length", b"1")])?;
+        let sse_bad_status = clear_start(201, std::slice::from_ref(&sse_type))?;
+        let sse_bad_coding =
+            clear_start(200, &[sse_type, field(b"content-encoding", b"identity")])?;
+        let cases = [
+            (
+                "duplicate Content-Type",
+                Method::Get,
+                vec![(START, None, duplicate_type), (END, None, vec![])],
+            ),
+            (
+                "second finite DATA",
+                Method::Get,
+                vec![
+                    (START, None, vec![0, 200]),
+                    (DATA, Some(compression::RAW), b"first".to_vec()),
+                    (DATA, Some(compression::RAW), b"second".to_vec()),
+                    (END, None, vec![]),
+                ],
+            ),
+            (
+                "incomplete SSE block",
+                Method::Get,
+                vec![
+                    (START, None, sse_start.clone()),
+                    (DATA, Some(compression::RAW), b"data: incomplete\n".to_vec()),
+                    (END, None, vec![]),
+                ],
+            ),
+            (
+                "finite Content-Length mismatch",
+                Method::Get,
+                vec![
+                    (START, None, mismatched_length),
+                    (DATA, Some(compression::RAW), b"abc".to_vec()),
+                    (END, None, vec![]),
+                ],
+            ),
+            (
+                "nonzero 205 Content-Length",
+                Method::Get,
+                vec![(START, None, nonzero_205_length), (END, None, vec![])],
+            ),
+            (
+                "SSE with wrong status",
+                Method::Get,
+                vec![(START, None, sse_bad_status), (END, None, vec![])],
+            ),
+            (
+                "SSE with Content-Encoding",
+                Method::Get,
+                vec![(START, None, sse_bad_coding), (END, None, vec![])],
+            ),
+            (
+                "SSE on HEAD",
+                Method::Head,
+                vec![(START, None, sse_start), (END, None, vec![])],
+            ),
+        ];
+
+        for (name, method, records) in cases {
+            assert_valid_tag_response_rejected(name, method, records)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn final_counter_value_is_reserved_for_end() -> Result<(), Error> {
         let material = ResponseMaterial {
