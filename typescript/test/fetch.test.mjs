@@ -440,6 +440,48 @@ test("Fetch checks origin before body read and close blocks a late key GET", asy
   } finally { release(); client.close(); }
 });
 
+test("Fetch normalizes DNS, IDNA, IPv6, and the default HTTPS port", async () => {
+  await initialize();
+  const keys = generateKeyPair();
+  const server = new Server(keys.privateKey, KEY_ID);
+  const cases = [
+    ["https://API.example.test:443", "https://api.example.test/items", "api.example.test"],
+    ["https://bücher.example", "https://xn--bcher-kva.example:443/items", "xn--bcher-kva.example"],
+    ["https://[2001:0db8::1]", "https://[2001:db8::1]:443/items", "[2001:db8::1]"],
+  ];
+  try {
+    for (const [targetOrigin, input, expectedAuthority] of cases) {
+      let calls = 0;
+      const client = createHpkeFetch({
+        endpoint: "https://api.example.test/protected",
+        targetOrigin,
+        key: { kind: "pin", publicKey: keys.publicKey, keyId: KEY_ID },
+        psk: PSK,
+        pskId: PSK_ID,
+        fetch: async (outerInput, init) => {
+          calls += 1;
+          const outer = new Request(outerInput, init);
+          const opened = server.preparse(new Uint8Array(await outer.arrayBuffer()))
+            .authenticate(PSK).admit({ accepted: true });
+          assert.equal(opened.request.authority, expectedAuthority);
+          return new Response(opened.protectResponse({ status: 204 }), {
+            status: 200,
+            headers: { "content-type": RESPONSE_MEDIA_TYPE },
+          });
+        },
+      });
+      try {
+        assert.equal((await client(input)).status, 204);
+        const otherPort = new URL(input);
+        otherPort.port = "8443";
+        await assert.rejects(client(otherPort.href),
+          (error) => error instanceof FetchTransportError && error.code === "invalid_target");
+        assert.equal(calls, 1);
+      } finally { client.close(); }
+    }
+  } finally { server.close(); }
+});
+
 test("Fetch caller abort during key GET sends no protected POST", async () => {
   await initialize();
   const controller = new AbortController();
