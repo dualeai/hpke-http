@@ -1,4 +1,4 @@
-//! HPKE requests and checked response records for HTTP.
+//! Encrypt HTTP requests and check protected replies with HPKE.
 //!
 //! This crate implements `PROTOCOL_ID` hpke-http/3. The
 //! [central protocol specification](https://github.com/dualeai/hpke-http/blob/main/PROTOCOL.md)
@@ -6,29 +6,37 @@
 //! limits; checks; and client and server steps. It links the frozen wire vectors.
 //! Package versions and `BINDING_ABI_VERSION` do not change the wire version.
 //!
-//! The crate does no network I/O. A host uses HTTPS, resolves PSKs, and makes
-//! one atomic replay decision shared by its workers. The public PSK ID is an
-//! untrusted lookup hint until START authentication passes. An admitted
-//! request gives one response right. The host checks the full request, END,
-//! real outer body EOF, and logical target policy before it sends clear bytes
-//! to the app.
+//! Supply your own HTTPS transport and pre-shared key (PSK) lookup. The crate
+//! does no network I/O. Share atomic replay decisions across all workers that
+//! accept the same credentials.
+//! Treat the public PSK ID as untrusted until START authentication passes.
+//! Before calling the app, the host checks the full request, END, the actual
+//! end of the HTTP body (EOF), and the allowed app host, port, and path.
+//! An admitted request gives one response right: an object that can encrypt
+//! one reply.
 //!
-//! `Client::protect` and `Server::preparse` serve complete bounded calls.
-//! `Client::begin_stream` and `Server::preparse_stream` serve uploads. The
-//! stream path checks replay after START; the complete path checks all
-//! records before replay. Both paths withhold clear request data until the
-//! host admits replay. The host reports real outer EOF to `ResponseOpener`
-//! after END; the opener then gives a finite response. It gives each checked
-//! SSE block after that block passes its own checks.
+//! Choose the API for your body source:
 //!
-//! The examples below show API use. Use the linked specification to build
-//! another language implementation or to read the exact wire contract.
+//! - `Client::protect` and `Server::preparse` work with complete messages in memory.
+//! - `Client::begin_stream` and `Server::preparse_stream` process uploads in parts.
+//!
+//! The stream path checks replay after START; the complete path checks all
+//! records before replay. Both keep clear request data from the app until the
+//! host admits replay. The host reports actual HTTP body EOF to `ResponseOpener`
+//! after END. For server-sent events (SSE), the opener returns each checked block
+//! as it arrives. For a finite reply (any other response), it returns the complete
+//! reply only after EOF.
 //!
 //! # Complete transaction
 //!
 //! The host must make a shared atomic replay decision before it admits a
 //! request. This example passes complete request and response bytes directly,
 //! in place of HTTP bodies, to show the API sequence.
+//! The fixed PSK and `decision(true)` are example data. In a service, use a PSK
+//! with at least 32 bytes of entropy and the real shared replay-store result.
+//! A new client call has a new replay ID. Follow the
+//! [retry rules](https://github.com/dualeai/hpke-http/blob/main/README.md#retry-safety)
+//! before repeating an operation after a lost reply.
 //!
 //! ```
 //! use hpke_http::{Client, Limits, Method, Request, Response, Server, generate_key_pair};
@@ -63,12 +71,17 @@
 //!
 //! # Streamed upload
 //!
-//! Send the `begin_stream` bytes first, then each record from `push`, then the
-//! bytes from `finish`. End the outer HTTP body after `finish`. On the server,
-//! hold checked DATA until the host observes real outer EOF and `finish_eof`
-//! checks END. This example accepts one replay decision and passes bytes
-//! directly between the client and server in place of an HTTP transport.
-//! A host must use a shared atomic replay store:
+//! Send the request in this order:
+//!
+//! 1. Send the bytes from `begin_stream`.
+//! 2. Send each record from `push`.
+//! 3. Send the bytes from `finish`, then end the outer HTTP body.
+//!
+//! On the server, hold checked DATA until the HTTP body ends and `finish_eof`
+//! checks END. This example passes bytes directly between client and server
+//! in place of an HTTP transport. It accepts one replay decision.
+//! The fixed PSK is example data. A host must provision a secret PSK and use
+//! a shared atomic replay store:
 //!
 //! ```
 //! use hpke_http::{
